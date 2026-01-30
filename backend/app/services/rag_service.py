@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from math import sqrt
 from typing import Dict, Iterable, List, Optional
 
@@ -26,6 +27,7 @@ class RAGService:
         self._documents: List[SourceDocument] = []
         self._storage = storage
         self._vector_store = vector_store
+        self._logger = logging.getLogger("app.rag")
 
     def add_documents(self, docs: Iterable[UploadedDocument]) -> List[SourceDocument]:
         added: List[SourceDocument] = []
@@ -43,7 +45,10 @@ class RAGService:
         else:
             self._documents.extend(added)
         if self._vector_store:
-            self._vector_store.upsert(added)
+            try:
+                self._vector_store.upsert(added)
+            except Exception as exc:
+                self._logger.warning("Vector upsert failed, falling back to SQLite-only: %s", exc)
         return added
 
     def list_documents(self) -> List[SourceDocument]:
@@ -62,10 +67,13 @@ class RAGService:
 
     def search(self, query: str, top_k: int = 5) -> List[SourceDocument]:
         if self._vector_store and self._storage and query:
-            matches = self._vector_store.search(query, top_k=top_k)
-            resolved = self._resolve_matches(matches)
-            if resolved:
-                return resolved
+            try:
+                matches = self._vector_store.search(query, top_k=top_k)
+                resolved = self._resolve_matches(matches)
+                if resolved:
+                    return resolved
+            except Exception as exc:
+                self._logger.warning("Vector search failed, falling back to keyword search: %s", exc)
         if self._storage:
             stored = self._storage.list_documents()
             candidates = [

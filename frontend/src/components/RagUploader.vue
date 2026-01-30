@@ -42,13 +42,24 @@ const loading = reactive({
 
 const fileNames = computed(() => files.value.map((f) => f.name).join(", "));
 
+const createDocId = () => {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16;
+    const v = c === "x" ? r : (r % 4) + 8;
+    return Math.floor(v).toString(16);
+  });
+};
+
 const handleTextUpload = async () => {
   try {
     loading.uploadText = true;
     await uploadDocuments({
       documents: [
         {
-          doc_id: `${Date.now()}`,
+          doc_id: createDocId(),
           title: doc.title || "untitled",
           content: doc.content,
           url: "",

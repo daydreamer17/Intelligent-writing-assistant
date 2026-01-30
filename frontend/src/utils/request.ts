@@ -6,8 +6,6 @@ export const apiClient = () => {
   return axios.create({
     baseURL: store.apiBase,
     timeout: 120000,
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: {},
   });
 };

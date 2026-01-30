@@ -171,6 +171,9 @@ export const validateFileType = (file: File, allowedTypes: string[]): string | n
 export const validateFiles = (files: File[]): ValidationResult => {
   const errors: string[] = [];
   const allowedTypes = ['txt', 'pdf', 'docx'];
+  if (!files.length) {
+    errors.push('请先选择文件');
+  }
 
   for (const file of files) {
     const sizeError = validateFileSize(file);

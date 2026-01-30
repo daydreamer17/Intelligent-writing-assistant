@@ -6,11 +6,11 @@
       <input v-model="query" />
     </div>
     <button class="btn ghost" @click="handleSearch" :disabled="loading">搜索</button>
-    <div class="grid-2" v-if="pagedResults.length">
-      <div class="card" v-for="item in pagedResults" :key="item.doc_id">
+    <div class="grid-2 results" v-if="pagedResults.length">
+      <div class="card result-card" v-for="item in pagedResults" :key="item.doc_id">
         <h4>{{ item.title }}</h4>
-        <p class="muted">{{ item.url }}</p>
-        <pre v-html="highlight(item.content)"></pre>
+        <p class="muted url">{{ item.url }}</p>
+        <pre class="snippet" v-html="highlight(item.content)"></pre>
         <button class="btn ghost" @click="useSnippet(item.content)">加入工作台</button>
       </div>
     </div>
@@ -87,3 +87,38 @@ const highlight = (text: string) => {
   return safe.replace(pattern, (match) => `<mark>${match}</mark>`);
 };
 </script>
+
+<style scoped>
+.results {
+  align-items: start;
+}
+.result-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.result-card h4 {
+  margin: 0;
+  font-size: 15px;
+}
+.url {
+  margin: 0;
+  font-size: 12px;
+  word-break: break-all;
+}
+.snippet {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+  font-size: 13px;
+  max-height: 220px;
+  overflow: auto;
+  padding-right: 4px;
+}
+mark {
+  background: rgba(180, 83, 9, 0.2);
+  color: inherit;
+}
+</style>

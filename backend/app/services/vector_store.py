@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import blake2b
+from uuid import UUID
 from math import sqrt
 from typing import Iterable, List, Protocol
 
@@ -131,7 +132,7 @@ class QdrantVectorStore:
             vector = self.embedder.embed_one(doc.title + " " + doc.content)
             points.append(
                 qmodels.PointStruct(
-                    id=doc.doc_id,
+                    id=_normalize_point_id(doc.doc_id),
                     vector=vector,
                     payload={"title": doc.title, "url": doc.url},
                 )
@@ -141,9 +142,43 @@ class QdrantVectorStore:
 
     def search(self, query: str, top_k: int = 5) -> List[VectorMatch]:
         vector = self.embedder.embed_one(query)
-        results = self.client.search(
-            collection_name=self.collection,
-            query_vector=vector,
-            limit=top_k,
-        )
+        results = self._search_points(vector, top_k)
         return [VectorMatch(doc_id=str(item.id), score=float(item.score)) for item in results]
+
+    def _search_points(self, vector: List[float], top_k: int):
+        if hasattr(self.client, "search"):
+            return self.client.search(
+                collection_name=self.collection,
+                query_vector=vector,
+                limit=top_k,
+            )
+        if hasattr(self.client, "search_points"):
+            fn = getattr(self.client, "search_points")
+            try:
+                response = fn(
+                    collection_name=self.collection,
+                    query_vector=vector,
+                    limit=top_k,
+                )
+            except TypeError:
+                response = fn(
+                    collection_name=self.collection,
+                    vector=vector,
+                    limit=top_k,
+                )
+            return getattr(response, "result", response)
+        raise AttributeError("QdrantClient has no search method")
+
+
+def _normalize_point_id(doc_id: str) -> int | str:
+    raw = (doc_id or "").strip()
+    if raw.isdigit():
+        try:
+            return int(raw)
+        except ValueError:
+            return raw
+    try:
+        UUID(raw)
+        return raw
+    except Exception:
+        return raw

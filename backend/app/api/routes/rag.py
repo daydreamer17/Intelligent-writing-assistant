@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from io import BytesIO
-from uuid import uuid4
+from uuid import UUID, uuid4
+
+import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
@@ -16,6 +18,7 @@ from ...services.rag_service import UploadedDocument
 from ..deps import AppServices, get_services
 
 router = APIRouter(tags=["rag"])
+logger = logging.getLogger("app.rag")
 
 
 @router.post("/rag/upload", response_model=UploadDocumentsResponse)
@@ -27,7 +30,7 @@ def upload_documents(
         max_bytes = services.upload_max_bytes
         docs = [
             UploadedDocument(
-                doc_id=item.doc_id,
+                doc_id=_normalize_doc_id(item.doc_id),
                 title=item.title,
                 content=item.content,
                 url=item.url,
@@ -48,8 +51,11 @@ def upload_documents(
             for doc in added
         ]
         return UploadDocumentsResponse(documents=response_docs)
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail="Upload failed") from exc
+        logger.exception("RAG upload failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/rag/search", response_model=SearchDocumentsResponse)
@@ -69,16 +75,21 @@ def search_documents(
             for doc in results
         ]
         return SearchDocumentsResponse(documents=response_docs)
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail="Search failed") from exc
+        logger.exception("RAG search failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/rag/upload-file", response_model=UploadDocumentsResponse)
 async def upload_files(
-    files: list[UploadFile] = File(..., description="上传文本文件"),
+    files: list[UploadFile] | None = File(default=None, description="上传文本文件"),
     services: AppServices = Depends(get_services),
 ) -> UploadDocumentsResponse:
     try:
+        if not files:
+            raise HTTPException(status_code=422, detail="No files provided")
         max_bytes = services.upload_max_bytes
         documents: list[UploadedDocument] = []
         for file in files:
@@ -105,8 +116,11 @@ async def upload_files(
             for doc in added
         ]
         return UploadDocumentsResponse(documents=response_docs)
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail="File upload failed") from exc
+        logger.exception("RAG file upload failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 def _extract_text(filename: str, content_bytes: bytes) -> str:
@@ -116,6 +130,19 @@ def _extract_text(filename: str, content_bytes: bytes) -> str:
     if name.endswith(".docx"):
         return _extract_docx_text(content_bytes)
     return content_bytes.decode("utf-8", errors="ignore")
+
+
+def _normalize_doc_id(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return str(uuid4())
+    if raw.isdigit():
+        return raw
+    try:
+        UUID(raw)
+        return raw
+    except Exception:
+        return str(uuid4())
 
 
 def _extract_pdf_text(content_bytes: bytes) -> str:

@@ -18,9 +18,7 @@ export const searchDocuments = async (payload: SearchDocumentsRequest) => {
 
 export const uploadFiles = async (files: File[]) => {
   const form = new FormData();
-  files.forEach((file) => form.append("files", file));
-  const { data } = await getApi().post<UploadDocumentsResponse>("/api/rag/upload-file", form, {
-    headers: { "Content-Type": "multipart/form-data" },
-  });
+  files.forEach((file) => form.append("files", file, file.name));
+  const { data } = await getApi().post<UploadDocumentsResponse>("/api/rag/upload-file", form);
   return data;
 };

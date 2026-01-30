@@ -33,7 +33,11 @@ class EmbeddingService:
         if self._config.api_key:
             headers["Authorization"] = f"Bearer {self._config.api_key}"
 
-        url = self._config.base_url.rstrip("/") + "/v1/embeddings"
+        base_url = self._config.base_url.rstrip("/")
+        if base_url.endswith("/v1"):
+            url = base_url + "/embeddings"
+        else:
+            url = base_url + "/v1/embeddings"
         resp = self._client.post(url, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
