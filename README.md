@@ -1,6 +1,6 @@
 # 智能写作助手 (Intelligent Writing Assistant)
 
-基于 Hello-Agents 框架开发的多智能体协作写作系统，通过多个专业 Agent 协同工作，提供从内容创作、审核到优化的完整写作流程。
+基于[Datawhale社区](https://www.datawhale.cn/home)自研的 [Hello-Agents 框架](https://github.com/jjyaoao/HelloAgents.git)开发的多智能体协作写作系统，通过多个专业 Agent 协同工作，提供从内容创作、审核到优化的完整写作流程。
 
 ## ✨ 功能特性
 
