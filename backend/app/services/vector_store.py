@@ -167,6 +167,13 @@ class QdrantVectorStore:
                     limit=top_k,
                 )
             return getattr(response, "result", response)
+        if hasattr(self.client, "query_points"):
+            response = self.client.query_points(
+                collection_name=self.collection,
+                query=vector,
+                limit=top_k,
+            )
+            return getattr(response, "points", response)
         raise AttributeError("QdrantClient has no search method")
 
 
