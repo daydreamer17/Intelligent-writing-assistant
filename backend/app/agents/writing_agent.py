@@ -68,6 +68,77 @@ class WritingAgent(BaseWritingAgent):
         )
         return self.run(prompt)
 
+    def draft_stream(
+        self,
+        *,
+        topic: str,
+        outline: str,
+        constraints: str = "",
+        style: str = "",
+        target_length: str = "",
+    ):
+        sections = self._split_outline(outline)
+        if len(sections) <= 1:
+            parts = [
+                f"Topic:\n{topic}",
+                f"Outline:\n{outline}",
+            ]
+            if constraints:
+                parts.append(f"Constraints:\n{constraints}")
+            if style:
+                parts.append(f"Style:\n{style}")
+            if target_length:
+                parts.append(f"Target length:\n{target_length}")
+
+            prompt = "Write a complete draft based on the information below.\n\n" + "\n\n".join(parts)
+            yield from self.stream(prompt)
+            return
+
+        target_len = self._parse_target_length(target_length) or 0
+        per_section_len = max(300, int(target_len / max(len(sections), 1))) if target_len else 0
+        context_tail = ""
+        first_section = True
+
+        for index, section in enumerate(sections, start=1):
+            instructions = [
+                f"Section {index}/{len(sections)}: {section}",
+                "Write only this section. Do not include other sections.",
+                "Keep continuity with previous content and avoid repetition.",
+            ]
+            if per_section_len:
+                instructions.append(f"Target length for this section: ~{per_section_len} Chinese characters.")
+
+            parts = [
+                f"Topic:\n{topic}",
+                f"Outline:\n{outline}",
+                "Instructions:\n" + "\n".join(instructions),
+            ]
+            if constraints:
+                parts.append(f"Constraints:\n{constraints}")
+            if style:
+                parts.append(f"Style:\n{style}")
+            if context_tail:
+                parts.append(f"Previous context (do not repeat):\n{context_tail}")
+
+            prompt = "Write the next section based on the information below.\n\n" + "\n\n".join(parts)
+
+            max_tokens = int(per_section_len * 1.2) if per_section_len else None
+            section_chunks = []
+            for chunk in self.stream(prompt, max_tokens=max_tokens):
+                section_chunks.append(chunk)
+                yield chunk
+
+            section_text = "".join(section_chunks).strip()
+            if section_text:
+                context_tail = (context_tail + "\n\n" + section_text).strip()
+                if len(context_tail) > 1200:
+                    context_tail = context_tail[-1200:]
+
+            if first_section:
+                first_section = False
+            else:
+                yield "\n\n"
+
     @staticmethod
     def _split_outline(outline: str) -> list[str]:
         lines = [line.strip() for line in outline.splitlines() if line.strip()]

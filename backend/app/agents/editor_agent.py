@@ -65,3 +65,27 @@ class EditorAgent(BaseWritingAgent):
             + "\n\n".join(parts)
         )
         return self.run(prompt, max_tokens=max_tokens)
+
+    def rewrite_stream(
+        self,
+        *,
+        draft: str,
+        guidance: str = "",
+        style: str = "",
+        target_length: str = "",
+        max_tokens: Optional[int] = None,
+    ):
+        parts = [f"Draft:\n{draft}"]
+        if guidance:
+            parts.append(f"Editing guidance:\n{guidance}")
+        if style:
+            parts.append(f"Style:\n{style}")
+        if target_length:
+            parts.append(f"Target length:\n{target_length}")
+
+        prompt = (
+            "Rewrite the draft based on the guidance below. "
+            "Keep structure when possible.\n\n"
+            + "\n\n".join(parts)
+        )
+        yield from self.stream(prompt, max_tokens=max_tokens)

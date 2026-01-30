@@ -76,14 +76,19 @@ def create_draft_stream(
 
     def worker() -> None:
         try:
-            draft = services.drafter.create_draft(
+            chunks: list[str] = []
+            for chunk in services.drafter.writing_agent.draft_stream(
                 topic=payload.topic,
                 outline=payload.outline,
-                research_notes=payload.research_notes,
                 constraints=payload.constraints,
                 style=payload.style,
                 target_length=payload.target_length,
-            )
+            ):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                q.put({"type": "delta", "content": chunk})
+            draft = "".join(chunks)
             q.put({"type": "result", "payload": {"draft": draft}})
         except Exception as exc:  # pragma: no cover
             q.put({"type": "error", "detail": str(exc)})
@@ -144,13 +149,19 @@ def review_draft_stream(
 
     def worker() -> None:
         try:
-            review = services.reviewer.review(
+            chunks: list[str] = []
+            for chunk in services.reviewer.agent.review_stream(
                 draft=payload.draft,
                 criteria=payload.criteria,
                 sources=payload.sources,
                 audience=payload.audience,
-            )
-            q.put({"type": "result", "payload": {"review": review.review}})
+            ):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                q.put({"type": "delta", "content": chunk})
+            review_text = "".join(chunks)
+            q.put({"type": "result", "payload": {"review": review_text}})
         except Exception as exc:  # pragma: no cover
             q.put({"type": "error", "detail": str(exc)})
         finally:
@@ -210,13 +221,19 @@ def rewrite_draft_stream(
 
     def worker() -> None:
         try:
-            revised = services.rewriter.rewrite(
+            chunks: list[str] = []
+            for chunk in services.rewriter.agent.rewrite_stream(
                 draft=payload.draft,
                 guidance=payload.guidance,
                 style=payload.style,
                 target_length=payload.target_length,
-            )
-            q.put({"type": "result", "payload": {"revised": revised.revised}})
+            ):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                q.put({"type": "delta", "content": chunk})
+            revised_text = "".join(chunks)
+            q.put({"type": "result", "payload": {"revised": revised_text}})
         except Exception as exc:  # pragma: no cover
             q.put({"type": "error", "detail": str(exc)})
         finally:

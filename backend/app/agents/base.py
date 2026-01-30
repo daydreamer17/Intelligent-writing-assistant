@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 import logging
 import time
 
@@ -101,8 +101,8 @@ class BaseWritingAgent:
             )
 
     def run(self, input_text: str, **kwargs: Any) -> str:
-        max_retries = _parse_int_env("LLM_RETRY_MAX", default=2)
-        backoff_base = _parse_float_env("LLM_RETRY_BACKOFF", default=2.0)
+        max_retries = _parse_int_env("LLM_RETRY_MAX", default=5)
+        backoff_base = _parse_float_env("LLM_RETRY_BACKOFF", default=10.0)
         attempt = 0
         while True:
             try:
@@ -112,7 +112,8 @@ class BaseWritingAgent:
                 return response
             except Exception as exc:
                 if _is_rate_limit_error(exc) and attempt < max_retries:
-                    delay = max(0.5, backoff_base) * (2 ** attempt)
+                    # 指数退避：10s, 20s, 40s, 80s, 160s
+                    delay = backoff_base * (2 ** attempt)
                     logger.warning(
                         "LLM rate limited. Retrying in %.1fs (attempt %s/%s).",
                         delay,
@@ -123,6 +124,36 @@ class BaseWritingAgent:
                     attempt += 1
                     continue
                 logger.error("LLM call failed: %s", exc, exc_info=True)
+                raise
+
+    def stream(self, input_text: str, **kwargs: Any) -> Iterator[str]:
+        max_retries = _parse_int_env("LLM_RETRY_MAX", default=5)
+        backoff_base = _parse_float_env("LLM_RETRY_BACKOFF", default=10.0)
+        attempt = 0
+        while True:
+            emitted = False
+            try:
+                for chunk in self.agent.stream_run(input_text, **kwargs):
+                    if not chunk:
+                        continue
+                    emitted = True
+                    yield chunk
+                _cooldown_after_call()
+                return
+            except Exception as exc:
+                if _is_rate_limit_error(exc) and attempt < max_retries and not emitted:
+                    # 指数退避：10s, 20s, 40s, 80s, 160s (最长2.6分钟)
+                    delay = backoff_base * (2 ** attempt)
+                    logger.warning(
+                        "LLM stream rate limited. Retrying in %.1fs (attempt %s/%s).",
+                        delay,
+                        attempt + 1,
+                        max_retries,
+                    )
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+                logger.error("LLM stream failed: %s", exc, exc_info=True)
                 raise
 
 

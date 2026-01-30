@@ -161,32 +161,49 @@ def run_pipeline_stream(
             )
 
             q.put({"type": "status", "step": "draft"})
-            draft = services.drafter.create_draft(
+            draft_chunks: list[str] = []
+            for chunk in services.drafter.writing_agent.draft_stream(
                 topic=payload.topic,
                 outline=outline.outline,
-                research_notes=notes_text,
                 constraints=payload.constraints,
                 style=payload.style,
                 target_length=payload.target_length,
-            )
+            ):
+                if not chunk:
+                    continue
+                draft_chunks.append(chunk)
+                q.put({"type": "delta", "stage": "draft", "content": chunk})
+            draft = "".join(draft_chunks)
             q.put({"type": "draft", "payload": {"draft": draft}})
 
             q.put({"type": "status", "step": "review"})
-            review = services.drafter.review_draft(
+            review_chunks: list[str] = []
+            for chunk in services.reviewer.agent.review_stream(
                 draft=draft,
                 criteria=payload.review_criteria,
                 sources=notes_text,
                 audience=payload.audience,
-            )
+            ):
+                if not chunk:
+                    continue
+                review_chunks.append(chunk)
+                q.put({"type": "delta", "stage": "review", "content": chunk})
+            review = "".join(review_chunks)
             q.put({"type": "review", "payload": {"review": review}})
 
             q.put({"type": "status", "step": "rewrite"})
-            revised = services.drafter.revise_draft(
+            rewrite_chunks: list[str] = []
+            for chunk in services.rewriter.agent.rewrite_stream(
                 draft=draft,
                 guidance=review,
                 style=payload.style,
                 target_length=payload.target_length,
-            )
+            ):
+                if not chunk:
+                    continue
+                rewrite_chunks.append(chunk)
+                q.put({"type": "delta", "stage": "rewrite", "content": chunk})
+            revised = "".join(rewrite_chunks)
             q.put({"type": "rewrite", "payload": {"revised": revised}})
 
             q.put({"type": "status", "step": "citations"})

@@ -82,6 +82,32 @@ def search_documents(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.get("/rag/documents", response_model=SearchDocumentsResponse)
+def list_documents(
+    limit: int = 100,
+    services: AppServices = Depends(get_services),
+) -> SearchDocumentsResponse:
+    try:
+        docs = services.rag.list_documents()
+        if limit:
+            docs = docs[: max(1, limit)]
+        response_docs = [
+            SourceDocumentResponse(
+                doc_id=doc.doc_id,
+                title=doc.title,
+                content=doc.content,
+                url=doc.url,
+            )
+            for doc in docs
+        ]
+        return SearchDocumentsResponse(documents=response_docs)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("RAG list failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.post("/rag/upload-file", response_model=UploadDocumentsResponse)
 async def upload_files(
     files: list[UploadFile] | None = File(default=None, description="上传文本文件"),

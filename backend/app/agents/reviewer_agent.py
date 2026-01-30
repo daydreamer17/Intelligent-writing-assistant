@@ -64,3 +64,26 @@ class ReviewerAgent(BaseWritingAgent):
             + "\n\n".join(parts)
         )
         return self.run(prompt)
+
+    def review_stream(
+        self,
+        *,
+        draft: str,
+        criteria: str = "",
+        sources: str = "",
+        audience: str = "",
+    ):
+        parts = [f"Draft:\n{draft}"]
+        if criteria:
+            parts.append(f"Review criteria:\n{criteria}")
+        if sources:
+            parts.append(f"Available sources:\n{sources}")
+        if audience:
+            parts.append(f"Audience:\n{audience}")
+
+        prompt = (
+            "Review the draft and provide feedback grouped by severity. "
+            "Highlight factual claims that need citations.\n\n"
+            + "\n\n".join(parts)
+        )
+        yield from self.stream(prompt)
