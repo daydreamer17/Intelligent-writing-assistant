@@ -78,6 +78,8 @@
       <RewritePanel :revised="output.revised" />
     </div>
 
+    <ResearchNotesPanel :notes="output.research_notes" />
+
     <CitationPanel
       :bibliography="output.bibliography"
       :version-id="output.version_id"
@@ -110,6 +112,7 @@ import DraftEditor from "../components/DraftEditor.vue";
 import ReviewPanel from "../components/ReviewPanel.vue";
 import RewritePanel from "../components/RewritePanel.vue";
 import CitationPanel from "../components/CitationPanel.vue";
+import ResearchNotesPanel from "../components/ResearchNotesPanel.vue";
 import StatusBar from "../components/StatusBar.vue";
 import LoadingOverlay from "../components/LoadingOverlay.vue";
 import ProgressIndicator from "../components/ProgressIndicator.vue";
@@ -131,6 +134,7 @@ const output = reactive({
   outline: "",
   assumptions: "",
   open_questions: "",
+  research_notes: [] as { doc_id: string; title: string; summary: string; url?: string }[],
   draft: "",
   review: "",
   revised: "",
@@ -215,6 +219,9 @@ const handleDraft = async () => {
         target_length: form.target_length,
       },
       (evt) => {
+        if (evt.type === "delta") {
+          output.draft += evt.content || "";
+        }
         if (evt.type === "result") {
           output.draft = evt.payload?.draft || "";
           showToast("草稿已生成");
@@ -252,6 +259,9 @@ const handleReview = async () => {
         audience: form.audience,
       },
       (evt) => {
+        if (evt.type === "delta") {
+          output.review += evt.content || "";
+        }
         if (evt.type === "result") {
           output.review = evt.payload?.review || "";
           showToast("审校完成");
@@ -289,6 +299,9 @@ const handleRewrite = async () => {
         target_length: form.target_length,
       },
       (evt) => {
+        if (evt.type === "delta") {
+          output.revised += evt.content || "";
+        }
         if (evt.type === "result") {
           output.revised = evt.payload?.revised || "";
           showToast("改写完成");
@@ -356,18 +369,30 @@ const handlePipeline = async () => {
         if (!form.research_notes) {
           form.research_notes = evt.payload?.notes_text || "";
         }
+        if (evt.payload?.notes) {
+          output.research_notes = evt.payload.notes;
+        }
       }
       if (evt.type === "draft") {
         currentPipelineStep.value = 3;
         output.draft = evt.payload?.draft || "";
       }
+      if (evt.type === "delta" && evt.stage === "draft") {
+        output.draft += evt.content || "";
+      }
       if (evt.type === "review") {
         currentPipelineStep.value = 4;
         output.review = evt.payload?.review || "";
       }
+      if (evt.type === "delta" && evt.stage === "review") {
+        output.review += evt.content || "";
+      }
       if (evt.type === "rewrite") {
         currentPipelineStep.value = 5;
         output.revised = evt.payload?.revised || "";
+      }
+      if (evt.type === "delta" && evt.stage === "rewrite") {
+        output.revised += evt.content || "";
       }
       if (evt.type === "error") {
         error.value = evt.detail || "Pipeline failed";
@@ -378,6 +403,7 @@ const handlePipeline = async () => {
         output.outline = res.outline;
         output.assumptions = res.assumptions;
         output.open_questions = res.open_questions;
+        output.research_notes = res.research_notes || [];
         output.draft = res.draft;
         output.review = res.review;
         output.revised = res.revised;

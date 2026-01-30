@@ -16,6 +16,13 @@ export const searchDocuments = async (payload: SearchDocumentsRequest) => {
   return data;
 };
 
+export const listDocuments = async (limit: number = 100) => {
+  const { data } = await getApi().get<SearchDocumentsResponse>("/api/rag/documents", {
+    params: { limit },
+  });
+  return data;
+};
+
 export const uploadFiles = async (files: File[]) => {
   const form = new FormData();
   files.forEach((file) => form.append("files", file, file.name));
