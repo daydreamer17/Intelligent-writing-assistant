@@ -33,6 +33,9 @@ class VectorStore(Protocol):
     def search(self, query: str, top_k: int = 5) -> List[VectorMatch]:
         ...
 
+    def delete(self, doc_ids: Iterable[str]) -> None:
+        ...
+
 
 class HashEmbedding:
     def __init__(self, dim: int = 256) -> None:
@@ -144,6 +147,20 @@ class QdrantVectorStore:
         vector = self.embedder.embed_one(query)
         results = self._search_points(vector, top_k)
         return [VectorMatch(doc_id=str(item.id), score=float(item.score)) for item in results]
+
+    def delete(self, doc_ids: Iterable[str]) -> None:
+        ids = []
+        for doc_id in doc_ids:
+            ids.append(_normalize_point_id(doc_id))
+        if not ids:
+            return
+        selector = qmodels.PointIdsList(points=ids)
+        if hasattr(self.client, "delete"):
+            self.client.delete(collection_name=self.collection, points_selector=selector)
+            return
+        if hasattr(self.client, "delete_points"):
+            self.client.delete_points(collection_name=self.collection, points_selector=selector)
+            return
 
     def _search_points(self, vector: List[float], top_k: int):
         if hasattr(self.client, "search"):

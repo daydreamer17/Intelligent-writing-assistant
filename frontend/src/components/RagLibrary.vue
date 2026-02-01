@@ -9,7 +9,10 @@
         <h4>{{ item.title }}</h4>
         <p class="muted url">{{ item.url }}</p>
         <pre class="snippet">{{ item.content }}</pre>
-        <button class="btn ghost" @click="useSnippet(item.content)">加入工作台</button>
+        <div class="actions">
+          <button class="btn ghost" @click="useSnippet(item.content)">加入工作台</button>
+          <button class="btn ghost danger" @click="handleDelete(item.doc_id)">移除</button>
+        </div>
       </div>
     </div>
     <EmptyState v-else text="暂无上传内容" />
@@ -18,7 +21,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { listDocuments } from "../services/rag";
+import { deleteDocument, listDocuments } from "../services/rag";
 import { useAppStore } from "../store";
 import { handleApiError } from "../utils/errorHandler";
 import type { SourceDocumentResponse } from "../types";
@@ -58,6 +61,15 @@ const uniqueDocuments = computed(() => {
 
 const useSnippet = (text: string) => {
   store.addSnippet(text);
+};
+
+const handleDelete = async (docId: string) => {
+  try {
+    await deleteDocument(docId);
+    documents.value = documents.value.filter((doc) => doc.doc_id !== docId);
+  } catch (err) {
+    emit("error", handleApiError(err));
+  }
 };
 
 onMounted(() => {
@@ -104,5 +116,14 @@ defineExpose({ refresh });
   max-height: 200px;
   overflow: auto;
   padding-right: 4px;
+}
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.danger {
+  border-color: #fca5a5;
+  color: #b91c1c;
 }
 </style>

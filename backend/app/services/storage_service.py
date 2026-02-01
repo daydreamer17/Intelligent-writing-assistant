@@ -149,6 +149,12 @@ class StorageService:
             for row in rows
         ]
 
+    def delete_document(self, doc_id: str) -> bool:
+        cur = self._conn.cursor()
+        cur.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
     def save_draft_version(
         self,
         *,

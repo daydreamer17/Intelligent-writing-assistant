@@ -115,6 +115,10 @@ class SearchDocumentsResponse(BaseModel):
     documents: list[SourceDocumentResponse] = Field(default_factory=list)
 
 
+class DeleteDocumentResponse(BaseModel):
+    deleted: bool
+
+
 class CitationNoteInput(BaseModel):
     doc_id: str = Field(..., description="文档ID")
     title: str = Field(..., description="文档标题")

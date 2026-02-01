@@ -28,3 +28,7 @@ export interface SearchDocumentsRequest {
 export interface SearchDocumentsResponse {
   documents: SourceDocumentResponse[];
 }
+
+export interface DeleteDocumentResponse {
+  deleted: boolean;
+}

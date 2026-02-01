@@ -8,6 +8,7 @@ import logging
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from ...models.schemas import (
+    DeleteDocumentResponse,
     SearchDocumentsRequest,
     SearchDocumentsResponse,
     SourceDocumentResponse,
@@ -105,6 +106,21 @@ def list_documents(
         raise
     except Exception as exc:
         logger.exception("RAG list failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.delete("/rag/documents/{doc_id}", response_model=DeleteDocumentResponse)
+def delete_document(
+    doc_id: str,
+    services: AppServices = Depends(get_services),
+) -> DeleteDocumentResponse:
+    try:
+        deleted = services.rag.delete_document(doc_id)
+        return DeleteDocumentResponse(deleted=deleted)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("RAG delete failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

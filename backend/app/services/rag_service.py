@@ -51,6 +51,17 @@ class RAGService:
                 self._logger.warning("Vector upsert failed, falling back to SQLite-only: %s", exc)
         return added
 
+    def delete_document(self, doc_id: str) -> bool:
+        deleted = False
+        if self._storage:
+            deleted = self._storage.delete_document(doc_id)
+        if self._vector_store:
+            try:
+                self._vector_store.delete([doc_id])
+            except Exception as exc:
+                self._logger.warning("Vector delete failed: %s", exc)
+        return deleted
+
     def list_documents(self) -> List[SourceDocument]:
         if self._storage:
             stored = self._storage.list_documents()

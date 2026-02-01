@@ -4,6 +4,7 @@ import type {
   SearchDocumentsResponse,
   UploadDocumentsRequest,
   UploadDocumentsResponse,
+  DeleteDocumentResponse,
 } from "../types";
 
 export const uploadDocuments = async (payload: UploadDocumentsRequest) => {
@@ -20,6 +21,11 @@ export const listDocuments = async (limit: number = 100) => {
   const { data } = await getApi().get<SearchDocumentsResponse>("/api/rag/documents", {
     params: { limit },
   });
+  return data;
+};
+
+export const deleteDocument = async (docId: string) => {
+  const { data } = await getApi().delete<DeleteDocumentResponse>(`/api/rag/documents/${docId}`);
   return data;
 };
 
