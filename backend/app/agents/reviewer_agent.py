@@ -50,6 +50,16 @@ class ReviewerAgent(BaseWritingAgent):
         sources: str = "",
         audience: str = "",
     ) -> str:
+        # 截断过长的内容以避免超过模型限制
+        max_draft_chars = 15000  # 约 6000 tokens
+        max_sources_chars = 8000  # 约 3200 tokens
+
+        if len(draft) > max_draft_chars:
+            draft = draft[:max_draft_chars] + "\n...(内容过长已截断)"
+
+        if len(sources) > max_sources_chars:
+            sources = sources[:max_sources_chars] + "\n...(来源过长已截断)"
+
         parts = [f"Draft:\n{draft}"]
         if criteria:
             parts.append(f"Review criteria:\n{criteria}")
@@ -73,6 +83,16 @@ class ReviewerAgent(BaseWritingAgent):
         sources: str = "",
         audience: str = "",
     ):
+        # 截断过长的内容以避免超过模型限制
+        max_draft_chars = 15000  # 约 6000 tokens
+        max_sources_chars = 8000  # 约 3200 tokens
+
+        if len(draft) > max_draft_chars:
+            draft = draft[:max_draft_chars] + "\n...(内容过长已截断)"
+
+        if len(sources) > max_sources_chars:
+            sources = sources[:max_sources_chars] + "\n...(来源过长已截断)"
+
         parts = [f"Draft:\n{draft}"]
         if criteria:
             parts.append(f"Review criteria:\n{criteria}")

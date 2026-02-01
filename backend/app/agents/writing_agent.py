@@ -77,6 +77,12 @@ class WritingAgent(BaseWritingAgent):
         style: str = "",
         target_length: str = "",
     ):
+        # 截断过长的 outline 以避免超过模型限制
+        max_outline_chars = 10000  # 约 4000 tokens
+
+        if len(outline) > max_outline_chars:
+            outline = outline[:max_outline_chars] + "\n...(大纲过长已截断)"
+
         sections = self._split_outline(outline)
         if len(sections) <= 1:
             parts = [

@@ -51,6 +51,16 @@ class EditorAgent(BaseWritingAgent):
         target_length: str = "",
         max_tokens: Optional[int] = None,
     ) -> str:
+        # 截断过长的内容以避免超过模型限制
+        max_draft_chars = 20000  # 约 8000 tokens
+        max_guidance_chars = 5000  # 约 2000 tokens
+
+        if len(draft) > max_draft_chars:
+            draft = draft[:max_draft_chars] + "\n...(内容过长已截断)"
+
+        if len(guidance) > max_guidance_chars:
+            guidance = guidance[:max_guidance_chars] + "\n...(指导意见过长已截断)"
+
         parts = [f"Draft:\n{draft}"]
         if guidance:
             parts.append(f"Editing guidance:\n{guidance}")
@@ -75,6 +85,16 @@ class EditorAgent(BaseWritingAgent):
         target_length: str = "",
         max_tokens: Optional[int] = None,
     ):
+        # 截断过长的内容以避免超过模型限制
+        max_draft_chars = 20000  # 约 8000 tokens
+        max_guidance_chars = 5000  # 约 2000 tokens
+
+        if len(draft) > max_draft_chars:
+            draft = draft[:max_draft_chars] + "\n...(内容过长已截断)"
+
+        if len(guidance) > max_guidance_chars:
+            guidance = guidance[:max_guidance_chars] + "\n...(指导意见过长已截断)"
+
         parts = [f"Draft:\n{draft}"]
         if guidance:
             parts.append(f"Editing guidance:\n{guidance}")

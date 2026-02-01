@@ -60,6 +60,7 @@
         <button class="btn ghost" @click="handleDraft" :disabled="loading.draft">生成草稿</button>
         <button class="btn ghost" @click="handleReview" :disabled="loading.review">审校</button>
         <button class="btn ghost" @click="handleRewrite" :disabled="loading.rewrite">改写</button>
+        <button class="btn ghost" @click="clearGenerated" :disabled="loading.pipeline || loading.draft || loading.review || loading.rewrite">清空生成内容</button>
         <button class="btn ghost" @click="exportText">导出 TXT</button>
         <button class="btn ghost" @click="exportMarkdown">导出 MD</button>
         <button class="btn ghost" @click="exportHtml">导出 HTML</button>
@@ -163,6 +164,20 @@ const currentPipelineStep = ref(0);
 
 const resetError = () => {
   error.value = "";
+};
+
+const clearGenerated = () => {
+  output.outline = "";
+  output.assumptions = "";
+  output.open_questions = "";
+  output.research_notes = [];
+  output.draft = "";
+  output.review = "";
+  output.revised = "";
+  output.bibliography = "";
+  output.citations = [];
+  output.version_id = undefined;
+  showToast("已清空生成内容");
 };
 
 const handlePlan = async () => {

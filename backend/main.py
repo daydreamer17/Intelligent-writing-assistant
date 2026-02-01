@@ -15,7 +15,7 @@ def main() -> None:
         port=8000,
         reload=reload_enabled,
         log_level="info",
-        timeout_keep_alive=600,  # 10分钟保持连接
+        timeout_keep_alive=900,  # 10分钟保持连接
     )
 
 

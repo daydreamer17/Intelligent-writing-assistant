@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Optional
 import logging
 import time
+import threading
 
 from hello_agents import HelloAgentsLLM, SimpleAgent, ToolAwareSimpleAgent
 from hello_agents.tools import ToolRegistry
@@ -84,7 +85,10 @@ class BaseWritingAgent:
     def __init__(self, config: AgentRuntimeConfig, tool_registry: ToolRegistry | None = None) -> None:
         self.config = config
         self.llm = build_llm(config)
+        self._lock = threading.Lock()
 
+        # Keep a persistent agent instance to preserve conversation memory across calls.
+        # We prune history to a bounded window to avoid hitting provider max_seq_len.
         if tool_registry is not None:
             self.agent = ToolAwareSimpleAgent(
                 name=config.name,
@@ -101,21 +105,47 @@ class BaseWritingAgent:
             )
 
     def run(self, input_text: str, **kwargs: Any) -> str:
+        input_text = _truncate_input(input_text)
         max_retries = _parse_int_env("LLM_RETRY_MAX", default=5)
         backoff_base = _parse_float_env("LLM_RETRY_BACKOFF", default=10.0)
         attempt = 0
         while True:
+            with self._lock:
+                _prune_agent_history(self.agent, upcoming_user_chars=len(input_text))
             try:
-                response = self.agent.run(input_text, **kwargs)
+                with self._lock:
+                    response = self.agent.run(input_text, **kwargs)
                 logger.info("LLM call success. Output:\n%s", response)
                 _cooldown_after_call()
                 return response
             except Exception as exc:
+                # 上下文超限：缩短输入并重试（避免 max_total_tokens > max_seq_len）
+                if _is_context_overflow_error(exc) and attempt < max_retries:
+                    input_text = _shrink_text(input_text, factor=0.8)
+                    logger.warning(
+                        "LLM context overflow. Shrinking input and retrying (attempt %s/%s).",
+                        attempt + 1,
+                        max_retries,
+                    )
+                    attempt += 1
+                    continue
+                # 速率限制错误
                 if _is_rate_limit_error(exc) and attempt < max_retries:
-                    # 指数退避：10s, 20s, 40s, 80s, 160s
                     delay = backoff_base * (2 ** attempt)
                     logger.warning(
                         "LLM rate limited. Retrying in %.1fs (attempt %s/%s).",
+                        delay,
+                        attempt + 1,
+                        max_retries,
+                    )
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+                # 连接中断错误
+                if _is_connection_error(exc) and attempt < max_retries:
+                    delay = min(5.0, backoff_base * 0.5) * (2 ** attempt)
+                    logger.warning(
+                        "LLM connection error. Retrying in %.1fs (attempt %s/%s).",
                         delay,
                         attempt + 1,
                         max_retries,
@@ -127,28 +157,57 @@ class BaseWritingAgent:
                 raise
 
     def stream(self, input_text: str, **kwargs: Any) -> Iterator[str]:
+        input_text = _truncate_input(input_text)
         max_retries = _parse_int_env("LLM_RETRY_MAX", default=5)
         backoff_base = _parse_float_env("LLM_RETRY_BACKOFF", default=10.0)
         attempt = 0
         while True:
             emitted = False
+            with self._lock:
+                _prune_agent_history(self.agent, upcoming_user_chars=len(input_text))
             try:
-                for chunk in self.agent.stream_run(input_text, **kwargs):
-                    if not chunk:
-                        continue
-                    emitted = True
-                    yield chunk
+                # Hold the lock during the whole stream so concurrent requests don't
+                # interleave and corrupt the shared conversation history.
+                with self._lock:
+                    for chunk in self.agent.stream_run(input_text, **kwargs):
+                        if not chunk:
+                            continue
+                        emitted = True
+                        yield chunk
                 _cooldown_after_call()
                 return
             except Exception as exc:
+                # 上下文超限：只在未发送数据时重试，避免前端拼接重复/断裂
+                if _is_context_overflow_error(exc) and attempt < max_retries and not emitted:
+                    input_text = _shrink_text(input_text, factor=0.8)
+                    logger.warning(
+                        "LLM stream context overflow. Shrinking input and retrying (attempt %s/%s).",
+                        attempt + 1,
+                        max_retries,
+                    )
+                    attempt += 1
+                    continue
+                # 速率限制错误：只在未发送数据时重试
                 if _is_rate_limit_error(exc) and attempt < max_retries and not emitted:
-                    # 指数退避：10s, 20s, 40s, 80s, 160s (最长2.6分钟)
                     delay = backoff_base * (2 ** attempt)
                     logger.warning(
                         "LLM stream rate limited. Retrying in %.1fs (attempt %s/%s).",
                         delay,
                         attempt + 1,
                         max_retries,
+                    )
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+                # 连接中断错误：即使已发送部分数据也重试（但会丢失已发送的部分）
+                if _is_connection_error(exc) and attempt < max_retries:
+                    delay = min(5.0, backoff_base * 0.5) * (2 ** attempt)  # 更短的重试间隔
+                    logger.warning(
+                        "LLM stream connection error. Retrying in %.1fs (attempt %s/%s). %s",
+                        delay,
+                        attempt + 1,
+                        max_retries,
+                        "Partial output may be lost." if emitted else "",
                     )
                     time.sleep(delay)
                     attempt += 1
@@ -165,6 +224,33 @@ def _is_rate_limit_error(exc: Exception) -> bool:
         or "tpm limit" in message
         or "too many requests" in message
         or "429" in message
+    )
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    """检测连接中断错误，这些错误可以重试"""
+    message = str(exc).lower()
+    return (
+        "peer closed connection" in message
+        or "incomplete chunked read" in message
+        or "connection reset" in message
+        or "connection aborted" in message
+        or "broken pipe" in message
+        or "remotedisconnected" in message
+        or "connection error" in message
+        or "timeout" in message
+    )
+
+
+def _is_context_overflow_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    # Common providers return an error like:
+    # "max_total_tokens (...) must be less than or equal to max_seq_len (...)"
+    return (
+        ("max_total_tokens" in message and "max_seq_len" in message)
+        or "context length" in message
+        or "maximum context" in message
+        or "prompt is too long" in message
     )
 
 
@@ -186,6 +272,164 @@ def _parse_float_env(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _truncate_input(text: str) -> str:
+    max_chars = _parse_int_env("LLM_MAX_INPUT_CHARS", default=0)
+    max_context = _parse_int_env("LLM_MAX_CONTEXT_TOKENS", default=0)
+    max_output = _parse_int_env("LLM_MAX_TOKENS", default=0)
+    safety_margin = _parse_int_env("LLM_INPUT_SAFETY_MARGIN", default=4000)
+    # Rough heuristic: with CJK text 1 token is often ~1 char, but prompts can contain
+    # JSON/markdown/URLs; default to a conservative ratio to avoid context overflow.
+    chars_per_token = _parse_float_env("LLM_CHARS_PER_TOKEN", default=0.5)
+    if max_context > 0:
+        budget = max_context - max_output - safety_margin
+        if budget <= 0:
+            fallback = 4000
+            max_chars = min(max_chars, fallback) if max_chars > 0 else fallback
+        else:
+            budget_chars = int(budget * chars_per_token)
+            if budget_chars > 0:
+                max_chars = budget_chars if max_chars <= 0 else min(max_chars, budget_chars)
+        logger.info(
+            "LLM context budget: max_context=%s max_output=%s safety_margin=%s chars_per_token=%.3f => max_input_chars=%s",
+            max_context,
+            max_output,
+            safety_margin,
+            chars_per_token,
+            max_chars if max_chars > 0 else "unset",
+        )
+    if max_chars <= 0:
+        return text
+    if len(text) <= max_chars:
+        return text
+    head = int(max_chars * 0.6)
+    tail = max_chars - head
+    truncated = text[:head].rstrip() + "\n...\n" + text[-tail:].lstrip()
+    logger.warning(
+        "Input truncated from %s to %s chars to respect LLM_MAX_INPUT_CHARS.",
+        len(text),
+        len(truncated),
+    )
+    return truncated
+
+
+def _shrink_text(text: str, factor: float = 0.8) -> str:
+    # Emergency shrink for provider-side context overflow errors. Keep head+tail to
+    # preserve instruction + recent content.
+    if not text:
+        return text
+    if factor <= 0 or factor >= 1:
+        factor = 0.8
+    max_chars = max(2000, int(len(text) * factor))
+    if len(text) <= max_chars:
+        return text
+    head = int(max_chars * 0.6)
+    tail = max_chars - head
+    truncated = text[:head].rstrip() + "\n...\n" + text[-tail:].lstrip()
+    logger.warning("Emergency shrink input from %s to %s chars.", len(text), len(truncated))
+    return truncated
+
+
+def _prune_agent_history(agent: Any, *, upcoming_user_chars: int) -> None:
+    """
+    Keep conversation memory, but bound it so the provider context window isn't exceeded.
+
+    hello_agents SimpleAgent stores history in-memory; since our services are singletons,
+    this history can grow across requests and eventually hit max_seq_len.
+    """
+    max_context = _parse_int_env("LLM_MAX_CONTEXT_TOKENS", default=0)
+    max_output = _parse_int_env("LLM_MAX_TOKENS", default=0)
+    safety_margin = _parse_int_env("LLM_INPUT_SAFETY_MARGIN", default=4000)
+    chars_per_token = _parse_float_env("LLM_CHARS_PER_TOKEN", default=0.5)
+
+    # Optional hard cap for history size (chars). If unset, derive from context budget.
+    history_cap = _parse_int_env("LLM_HISTORY_MAX_CHARS", default=0)
+
+    if max_context <= 0:
+        return
+    budget_tokens = max_context - max_output - safety_margin
+    if budget_tokens <= 0:
+        # Too risky: drop history entirely.
+        if hasattr(agent, "clear_history"):
+            agent.clear_history()
+        return
+
+    budget_chars = int(budget_tokens * chars_per_token)
+    allowed_history_chars = max(0, budget_chars - upcoming_user_chars)
+    if history_cap > 0:
+        allowed_history_chars = min(allowed_history_chars, history_cap)
+
+    if allowed_history_chars <= 0:
+        if hasattr(agent, "clear_history"):
+            agent.clear_history()
+        logger.warning("Cleared agent history due to tight context budget.")
+        return
+
+    if not hasattr(agent, "get_history") or not hasattr(agent, "clear_history") or not hasattr(agent, "add_message"):
+        return
+
+    history = agent.get_history()
+    if not history:
+        return
+
+    kept: list[Any] = []
+    total = 0
+    for msg in reversed(history):
+        content = getattr(msg, "content", "") or ""
+        msg_len = len(content)
+        if kept and total + msg_len > allowed_history_chars:
+            break
+        if not kept and msg_len > allowed_history_chars:
+            # Keep at least the last message, but truncate it to fit the cap.
+            truncated = _truncate_text_tail(content, allowed_history_chars)
+            kept = [_clone_message(msg, truncated)]
+            total = len(truncated)
+            break
+        kept.append(msg)
+        total += msg_len
+    kept.reverse()
+
+    if len(kept) == len(history):
+        return
+
+    agent.clear_history()
+    for msg in kept:
+        agent.add_message(msg)
+    logger.info(
+        "Pruned agent history: kept %s/%s messages (%s/%s chars allowed=%s).",
+        len(kept),
+        len(history),
+        total,
+        sum(len(getattr(m, "content", "") or "") for m in history),
+        allowed_history_chars,
+    )
+
+
+def _truncate_text_tail(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars < 32:
+        return text[-max_chars:]
+    return "...\n" + text[-(max_chars - 4):]
+
+
+def _clone_message(msg: Any, new_content: str) -> Any:
+    role = getattr(msg, "role", "assistant")
+    metadata = getattr(msg, "metadata", None)
+    timestamp = getattr(msg, "timestamp", None)
+    try:
+        # hello_agents Message signature is (content, role, **kwargs)
+        kwargs: dict[str, Any] = {}
+        if timestamp is not None:
+            kwargs["timestamp"] = timestamp
+        if metadata is not None:
+            kwargs["metadata"] = metadata
+        return msg.__class__(new_content, role, **kwargs)
+    except Exception:
+        return msg
 
 
 def _cooldown_after_call() -> None:
