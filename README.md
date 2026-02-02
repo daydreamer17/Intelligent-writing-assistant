@@ -190,7 +190,7 @@ STORAGE_PATH=./data/app.db
 - [x] 文案审计功能（ReviewerAgent）
 - [x] 文案改进功能（EditorAgent）
 - [x] 完整的三阶段写作流程
-- [x] 长文本写作导致上下文窗口爆炸功能
+- [x] 长文本写作导致上下文窗口爆炸
 - [x] RAG 知识检索功能
 - [x] 历史记录管理
 
