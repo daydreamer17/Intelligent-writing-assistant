@@ -137,20 +137,39 @@ npm run dev
 **后端 `.env` 文件示例：**
 ```env
 # LLM 配置
+LLM_PROVIDER=openai
+LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
 LLM_API_KEY=your_api_key_here
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=gpt-4
+LLM_API_BASE=https://api.siliconflow.cn/v1
+LLM_TIMEOUT=300
+LLM_MAX_TOKENS=1200
 
-# 嵌入模型配置
-EMBEDDING_PROVIDER=local  # 或 api
-EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+# 上下文控制
+LLM_MAX_INPUT_CHARS=12000
+LLM_MAX_CONTEXT_TOKENS=32768
+LLM_INPUT_SAFETY_MARGIN=8000
+LLM_CHARS_PER_TOKEN=0.6
+LLM_HISTORY_MAX_CHARS=8000
+
+# 速率与稳定性
+LLM_RETRY_MAX=5
+LLM_RETRY_BACKOFF=20
+LLM_COOLDOWN_SECONDS=15
+PIPELINE_STAGE_SLEEP=3
+
+# 嵌入模型配置（RAG）
+EMBEDDING_PROVIDER=openai_compatible
+EMBEDDING_MODEL=text-embedding-v3
+EMBEDDING_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
+EMBEDDING_API_KEY=your_api_key_here
 
 # Qdrant 配置（可选）
 QDRANT_URL=http://localhost:6333
 QDRANT_COLLECTION=writing_assistant
+QDRANT_EMBED_DIM=1024
 
 # 存储配置
-STORAGE_PATH=./data/storage.db
+STORAGE_PATH=./data/app.db
 ```
 
 ## 📊 当前进度
@@ -197,14 +216,17 @@ STORAGE_PATH=./data/storage.db
 ### 主要 API 端点
 
 #### 写作流程
-- `POST /api/pipeline/run` - 执行完整写作流程
-- `GET /api/pipeline/health` - 检查系统健康状态
+- `POST /api/plan` - 生成大纲
+- `POST /api/draft` / `POST /api/draft/stream` - 生成草稿
+- `POST /api/review` / `POST /api/review/stream` - 审校
+- `POST /api/rewrite` / `POST /api/rewrite/stream` - 改写
+- `POST /api/pipeline` / `POST /api/pipeline/stream` - 一键流水线
 
 #### RAG 管理
-- `POST /api/rag/upload-files` - 上传文档文件
-- `POST /api/rag/upload-documents` - 上传文本内容
+- `POST /api/rag/upload` - 上传文本内容
+- `POST /api/rag/upload-file` - 上传文档文件
 - `POST /api/rag/search` - 检索相关文档
-- `GET /api/rag/list` - 列出所有文档
+- `GET /api/rag/documents` - 列出所有文档
 - `DELETE /api/rag/documents/{doc_id}` - 删除文档
 
 #### 版本管理

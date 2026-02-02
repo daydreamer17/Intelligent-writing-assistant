@@ -43,13 +43,30 @@ Create a `.env` file in `backend/` (or copy from `.env.example` if you have one)
 - `LLM_MODEL`
 - `LLM_API_KEY`
 - `LLM_API_BASE`
-- `LLM_TIMEOUT` (seconds, default 60)
-- `LLM_MAX_TOKENS` (optional)
+- `LLM_TIMEOUT` (seconds)
+- `LLM_MAX_TOKENS` (max output tokens)
 
 ### LLM reliability (optional)
-- `LLM_RETRY_MAX` (default 2)
-- `LLM_RETRY_BACKOFF` (seconds, default 2.0)
-- `LLM_COOLDOWN_SECONDS` (default 0)
+- `LLM_RETRY_MAX`
+- `LLM_RETRY_BACKOFF` (seconds)
+- `LLM_COOLDOWN_SECONDS` (seconds)
+
+### LLM context control (recommended)
+- `LLM_MAX_INPUT_CHARS` (hard cap for prompt input)
+- `LLM_MAX_CONTEXT_TOKENS` (model context window)
+- `LLM_INPUT_SAFETY_MARGIN` (reserved tokens to avoid overflow)
+- `LLM_CHARS_PER_TOKEN` (heuristic, e.g. 0.6)
+- `LLM_HISTORY_MAX_CHARS` (cap in-memory history)
+
+### LLM context compression (optional)
+- `LLM_CONTEXT_COMPRESS_ENABLED=true|false`
+- `LLM_CONTEXT_COMPRESS_THRESHOLD` (trigger ratio, e.g. 0.85)
+- `LLM_CONTEXT_COMPRESS_TARGET` (target ratio after compression, e.g. 0.5)
+- `LLM_CONTEXT_COMPRESS_KEEP_LAST` (keep last N messages verbatim)
+- `LLM_CONTEXT_COMPRESS_MAX_TOKENS` (summary max tokens)
+- `LLM_CONTEXT_COMPRESS_INPUT_CHARS` (summary input cap)
+- `LLM_CONTEXT_COMPRESS_MERGE_THRESHOLD` (merge summaries ratio)
+- `LLM_CONTEXT_COMPRESS_MERGE_TARGET` (merged summary target ratio)
 
 ### Storage
 - `STORAGE_PATH` (default `data/app.db`)
@@ -78,12 +95,21 @@ Embeddings (used by Qdrant when `EMBEDDING_PROVIDER` is not `hash`):
 ### Upload limits
 - `UPLOAD_MAX_MB` (default 10)
 
+### Pipeline throttling (optional)
+- `PIPELINE_STAGE_SLEEP` (seconds between stages)
+
 ### Example `.env`
 ```env
 LLM_PROVIDER=openai
 LLM_MODEL=gpt-4
 LLM_API_KEY=your_key
 LLM_API_BASE=https://api.openai.com/v1
+LLM_TIMEOUT=300
+LLM_MAX_TOKENS=1200
+LLM_MAX_INPUT_CHARS=12000
+LLM_MAX_CONTEXT_TOKENS=32768
+LLM_INPUT_SAFETY_MARGIN=8000
+LLM_CHARS_PER_TOKEN=0.6
 
 MEMORY_MODE=long_term
 QDRANT_URL=http://localhost:6333
@@ -94,6 +120,7 @@ EMBEDDING_PROVIDER=openai_compatible
 EMBEDDING_MODEL=text-embedding-3-large
 EMBEDDING_API_BASE=https://api.openai.com/v1
 EMBEDDING_API_KEY=your_key
+PIPELINE_STAGE_SLEEP=3
 ```
 
 ## Run
@@ -126,6 +153,8 @@ All routes are prefixed with `/api`.
 - `POST /api/rag/upload` (JSON documents)
 - `POST /api/rag/upload-file` (files: .txt / .pdf / .docx)
 - `POST /api/rag/search`
+- `GET /api/rag/documents`
+- `DELETE /api/rag/documents/{doc_id}`
 
 ### Citations
 - `POST /api/citations`
