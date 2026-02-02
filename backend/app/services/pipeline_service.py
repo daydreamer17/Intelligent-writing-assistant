@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
+import os
 from typing import Iterable, List
 
 from .drafting_service import DraftResult, DraftingService
@@ -48,8 +50,12 @@ class WritingPipeline:
             key_points=key_points,
         )
 
+        _pipeline_throttle()
+
         notes = self._collect_research_notes(topic, outline, sources)
         notes_text = self.researcher.format_notes(notes)
+
+        _pipeline_throttle()
 
         draft_result = self.drafter.run_full(
             topic=topic,
@@ -74,3 +80,14 @@ class WritingPipeline:
             return []
         query = f"{topic}\n{outline.outline}"
         return self.researcher.collect_notes(query=query, sources=sources)
+
+
+def _pipeline_throttle() -> None:
+    """Sleep between pipeline stages to avoid hitting TPM limits."""
+    raw = os.getenv("PIPELINE_STAGE_SLEEP", "0")
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = 0.0
+    if seconds > 0:
+        time.sleep(seconds)

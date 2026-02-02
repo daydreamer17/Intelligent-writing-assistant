@@ -8,6 +8,7 @@ import time
 import threading
 
 from hello_agents import HelloAgentsLLM, SimpleAgent, ToolAwareSimpleAgent
+from hello_agents.core.message import Message
 from hello_agents.tools import ToolRegistry
 
 logger = logging.getLogger("app.llm")
@@ -111,6 +112,7 @@ class BaseWritingAgent:
         attempt = 0
         while True:
             with self._lock:
+                _maybe_compress_history(self.agent, self.llm)
                 _prune_agent_history(self.agent, upcoming_user_chars=len(input_text))
             try:
                 with self._lock:
@@ -164,6 +166,7 @@ class BaseWritingAgent:
         while True:
             emitted = False
             with self._lock:
+                _maybe_compress_history(self.agent, self.llm)
                 _prune_agent_history(self.agent, upcoming_user_chars=len(input_text))
             try:
                 # Hold the lock during the whole stream so concurrent requests don't
@@ -432,7 +435,147 @@ def _clone_message(msg: Any, new_content: str) -> Any:
         return msg
 
 
+def _maybe_compress_history(agent: Any, llm: HelloAgentsLLM) -> None:
+    """
+    When history is close to context limit, summarize older messages into a compact
+    memory block to keep continuity without exceeding max_seq_len.
+    """
+    enabled = os.getenv("LLM_CONTEXT_COMPRESS_ENABLED", "false").lower() in ("1", "true", "yes")
+    if not enabled:
+        return
+    if not hasattr(agent, "get_history") or not hasattr(agent, "clear_history") or not hasattr(agent, "add_message"):
+        return
+
+    max_context = _parse_int_env("LLM_MAX_CONTEXT_TOKENS", default=0)
+    max_output = _parse_int_env("LLM_MAX_TOKENS", default=0)
+    safety_margin = _parse_int_env("LLM_INPUT_SAFETY_MARGIN", default=4000)
+    chars_per_token = _parse_float_env("LLM_CHARS_PER_TOKEN", default=0.5)
+    threshold_ratio = _parse_float_env("LLM_CONTEXT_COMPRESS_THRESHOLD", default=0.85)
+    target_ratio = _parse_float_env("LLM_CONTEXT_COMPRESS_TARGET", default=0.5)
+    keep_last = _parse_int_env("LLM_CONTEXT_COMPRESS_KEEP_LAST", default=4)
+    max_summary_tokens = _parse_int_env("LLM_CONTEXT_COMPRESS_MAX_TOKENS", default=600)
+    max_summary_chars = _parse_int_env("LLM_CONTEXT_COMPRESS_INPUT_CHARS", default=12000)
+
+    if max_context <= 0:
+        return
+
+    budget_tokens = max_context - max_output - safety_margin
+    if budget_tokens <= 0:
+        return
+    budget_chars = int(budget_tokens * chars_per_token)
+
+    history = agent.get_history()
+    if not history:
+        return
+
+    total_chars = sum(len(getattr(m, "content", "") or "") for m in history)
+    if total_chars <= int(budget_chars * threshold_ratio):
+        return
+
+    # Layered memory: keep (1) long-term summary, (2) recent summary, (3) last N messages.
+    keep_last = max(0, keep_last)
+    summary_tags = ("[LONG_TERM_SUMMARY]", "[RECENT_SUMMARY]")
+    long_summary, recent_summary, normal_msgs = _extract_layered_memory(history, summary_tags)
+
+    # Compose transcript from normal messages only (exclude existing summaries).
+    head = normal_msgs[:-keep_last] if keep_last else normal_msgs
+    tail = normal_msgs[-keep_last:] if keep_last else []
+    if not head:
+        return
+
+    transcript = _build_transcript(head, max_summary_chars)
+
+    summary_prompt = (
+        "You are compressing a conversation for a writing assistant.\n"
+        "Summarize the key facts, constraints, decisions, and user preferences.\n"
+        "Keep it concise, bullet points preferred. Do not add new facts.\n\n"
+        f"Conversation:\n{transcript}\n\nSummary:"
+    )
+
+    compressor = SimpleAgent(
+        name="Context Compressor",
+        llm=llm,
+        system_prompt="You summarize conversations without adding new information.",
+    )
+    try:
+        recent_summary_text = compressor.run(summary_prompt, max_tokens=max_summary_tokens)
+    except Exception as exc:
+        logger.warning("Context compression failed: %s", exc)
+        return
+
+    target_chars = int(budget_chars * target_ratio)
+    if len(recent_summary_text) > target_chars:
+        recent_summary_text = _truncate_text_tail(recent_summary_text, target_chars)
+
+    # Merge into long-term summary if we already have one and recent summary grows too big.
+    merge_threshold = _parse_float_env("LLM_CONTEXT_COMPRESS_MERGE_THRESHOLD", default=0.6)
+    merge_target = _parse_float_env("LLM_CONTEXT_COMPRESS_MERGE_TARGET", default=0.35)
+    long_summary_text = long_summary or ""
+    if long_summary_text and recent_summary_text:
+        combined_len = len(long_summary_text) + len(recent_summary_text)
+        if combined_len > int(budget_chars * merge_threshold):
+            merge_prompt = (
+                "You are consolidating two memory summaries for a writing assistant.\n"
+                "Merge them into one compact summary. Keep key constraints and decisions.\n"
+                "Do not add new facts.\n\n"
+                f"Summary A:\n{long_summary_text}\n\n"
+                f"Summary B:\n{recent_summary_text}\n\nMerged Summary:"
+            )
+            try:
+                long_summary_text = compressor.run(merge_prompt, max_tokens=max_summary_tokens)
+            except Exception as exc:
+                logger.warning("Summary merge failed: %s", exc)
+            if len(long_summary_text) > int(budget_chars * merge_target):
+                long_summary_text = _truncate_text_tail(long_summary_text, int(budget_chars * merge_target))
+            recent_summary_text = ""
+
+    # Rebuild history with layered summaries + tail messages.
+    agent.clear_history()
+    if long_summary_text:
+        agent.add_message(Message(f"[LONG_TERM_SUMMARY]\n{long_summary_text}", "assistant"))
+    if recent_summary_text:
+        agent.add_message(Message(f"[RECENT_SUMMARY]\n{recent_summary_text}", "assistant"))
+    for msg in tail:
+        agent.add_message(msg)
+
+    logger.info(
+        "Layered compression: total=%s chars, long=%s, recent=%s, kept_tail=%s msgs.",
+        total_chars,
+        len(long_summary_text),
+        len(recent_summary_text),
+        len(tail),
+    )
+
+
 def _cooldown_after_call() -> None:
     cooldown = _parse_float_env("LLM_COOLDOWN_SECONDS", default=0.0)
     if cooldown > 0:
         time.sleep(cooldown)
+
+
+def _extract_layered_memory(history: list[Any], summary_tags: tuple[str, str]) -> tuple[str | None, str | None, list[Any]]:
+    long_summary = None
+    recent_summary = None
+    normal_msgs: list[Any] = []
+    for msg in history:
+        content = getattr(msg, "content", "") or ""
+        if content.startswith(summary_tags[0]):
+            long_summary = content[len(summary_tags[0]):].lstrip()
+            continue
+        if content.startswith(summary_tags[1]):
+            recent_summary = content[len(summary_tags[1]):].lstrip()
+            continue
+        normal_msgs.append(msg)
+    return long_summary, recent_summary, normal_msgs
+
+
+def _build_transcript(messages: list[Any], max_chars: int) -> str:
+    lines: list[str] = []
+    for msg in messages:
+        role = getattr(msg, "role", "assistant")
+        content = getattr(msg, "content", "") or ""
+        lines.append(f"[{role}] {content}")
+    transcript = "\n".join(lines)
+    if len(transcript) > max_chars:
+        transcript = _truncate_text_tail(transcript, max_chars)
+    return transcript
