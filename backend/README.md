@@ -75,6 +75,11 @@ Create a `.env` file in `backend/` (or copy from `.env.example` if you have one)
 - `MEMORY_MODE=short_term` (SQLite only)
 - `MEMORY_MODE=long_term` (SQLite + Qdrant if configured)
 
+**RAG storage behavior**
+- SQLite always stores the document text, titles, metadata, and version history.
+- Qdrant is used only for vector search when `MEMORY_MODE=long_term` and `QDRANT_URL` is set.
+- If Qdrant is unavailable, the system falls back to SQLite keyword search, but still stores all documents in SQLite.
+
 Qdrant (enabled when `MEMORY_MODE=long_term` and `QDRANT_URL` is set):
 - `QDRANT_URL`
 - `QDRANT_API_KEY` (optional)

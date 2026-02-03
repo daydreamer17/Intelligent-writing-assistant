@@ -469,7 +469,19 @@ def _maybe_compress_history(agent: Any, llm: HelloAgentsLLM) -> None:
         return
 
     total_chars = sum(len(getattr(m, "content", "") or "") for m in history)
-    if total_chars <= int(budget_chars * threshold_ratio):
+    history_tokens_est = _estimate_tokens(total_chars, chars_per_token)
+    budget_tokens_est = _estimate_tokens(budget_chars, chars_per_token)
+    trigger_tokens_est = int(budget_tokens_est * threshold_ratio)
+    logger.debug(
+        "History size: msgs=%s chars=%s est_tokens=%s budget_chars=%s est_budget_tokens=%s trigger_tokens=%s",
+        len(history),
+        total_chars,
+        history_tokens_est,
+        budget_chars,
+        budget_tokens_est,
+        trigger_tokens_est,
+    )
+    if history_tokens_est <= trigger_tokens_est:
         return
 
     # Layered memory: keep (1) long-term summary, (2) recent summary, (3) last N messages.
@@ -539,8 +551,9 @@ def _maybe_compress_history(agent: Any, llm: HelloAgentsLLM) -> None:
         agent.add_message(msg)
 
     logger.info(
-        "Layered compression: total=%s chars, long=%s, recent=%s, kept_tail=%s msgs.",
+        "Layered compression: total=%s chars (est_tokens=%s). long=%s recent=%s kept_tail=%s msgs.",
         total_chars,
+        history_tokens_est,
         len(long_summary_text),
         len(recent_summary_text),
         len(tail),
@@ -579,3 +592,11 @@ def _build_transcript(messages: list[Any], max_chars: int) -> str:
     if len(transcript) > max_chars:
         transcript = _truncate_text_tail(transcript, max_chars)
     return transcript
+
+
+def _estimate_tokens(chars: int, chars_per_token: float) -> int:
+    if chars <= 0:
+        return 0
+    if chars_per_token <= 0:
+        chars_per_token = 0.5
+    return int(chars / chars_per_token)
