@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import time
+import logging
+import os
 from queue import Empty, Queue
 from threading import Thread
 
@@ -20,6 +22,39 @@ from ...services.research_service import SourceDocument
 from ..deps import AppServices, get_services
 
 router = APIRouter(tags=["pipeline"])
+logger = logging.getLogger("app.pipeline")
+
+
+def _min_effective_chars() -> int:
+    raw = os.getenv("PIPELINE_EFFECTIVE_OUTPUT_MIN_CHARS", "200")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 200
+
+
+def _is_effective(text: str) -> bool:
+    return len((text or "").strip()) >= _min_effective_chars()
+
+
+def _log_task_success_rate(
+    task_status: dict[str, bool | None],
+    *,
+    terminate_ok: bool,
+    effective_output: bool | None,
+) -> None:
+    statuses = [v for v in task_status.values() if v is not None]
+    total = len(statuses)
+    success = sum(1 for v in statuses if v)
+    rate = (success / total) * 100 if total else 0.0
+    logger.info(
+        "Task Success Rate: %s/%s = %.1f%% | terminate=%s | effective_output=%s",
+        success,
+        total,
+        rate,
+        terminate_ok,
+        effective_output,
+    )
 
 
 def _serialize_pipeline_result(
@@ -69,6 +104,15 @@ def run_pipeline(
     payload: PipelineRequest,
     services: AppServices = Depends(get_services),
 ) -> PipelineResponse:
+    task_status: dict[str, bool | None] = {
+        "plan": None,
+        "research": None,
+        "draft": None,
+        "review": None,
+        "rewrite": None,
+        "citations": None,
+    }
+    succeeded = False
     try:
         sources = [
             SourceDocument(
@@ -89,9 +133,28 @@ def run_pipeline(
             sources=sources,
             review_criteria=payload.review_criteria,
         )
+        task_status["plan"] = bool(result.outline.outline.strip())
+        task_status["research"] = None if not sources else bool(result.research_notes)
+        task_status["draft"] = _is_effective(result.draft_result.draft)
+        task_status["review"] = bool(result.draft_result.review.strip())
+        task_status["rewrite"] = _is_effective(result.draft_result.revised)
+        task_status["citations"] = True
+        succeeded = True
         return _serialize_pipeline_result(payload, result, services)
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Pipeline execution failed") from exc
+    finally:
+        if any(v is not None for v in task_status.values()):
+            effective = (
+                bool(task_status["rewrite"]) or bool(task_status["draft"])
+                if task_status["draft"] is not None or task_status["rewrite"] is not None
+                else None
+            )
+            _log_task_success_rate(
+                task_status,
+                terminate_ok=succeeded,
+                effective_output=effective if succeeded else None,
+            )
 
 
 @router.post("/pipeline/stream")
@@ -105,6 +168,16 @@ def run_pipeline_stream(
     q: Queue[dict | None] = Queue()
 
     def worker() -> None:
+        task_status: dict[str, bool | None] = {
+            "plan": None,
+            "research": None,
+            "draft": None,
+            "review": None,
+            "rewrite": None,
+            "citations": None,
+        }
+        succeeded = False
+        effective_output: bool | None = None
         try:
             sources = [
                 SourceDocument(
@@ -124,6 +197,7 @@ def run_pipeline_stream(
                 constraints=payload.constraints,
                 key_points=payload.key_points,
             )
+            task_status["plan"] = bool(outline.outline.strip())
             q.put(
                 {
                     "type": "outline",
@@ -141,6 +215,7 @@ def run_pipeline_stream(
                 notes = services.pipeline.researcher.collect_notes(query=query, sources=sources)
             else:
                 notes = []
+            task_status["research"] = None if not sources else bool(notes)
             notes_text = services.pipeline.researcher.format_notes(notes)
             q.put(
                 {
@@ -174,36 +249,45 @@ def run_pipeline_stream(
                 draft_chunks.append(chunk)
                 q.put({"type": "delta", "stage": "draft", "content": chunk})
             draft = "".join(draft_chunks)
+            task_status["draft"] = _is_effective(draft)
             q.put({"type": "draft", "payload": {"draft": draft}})
 
             q.put({"type": "status", "step": "review"})
             review_chunks: list[str] = []
+            # 根据 draft 长度动态设置 max_tokens，避免截断
+            review_max_tokens = min(8000, max(2000, int(len(draft) * 0.8)))
             for chunk in services.reviewer.agent.review_stream(
                 draft=draft,
                 criteria=payload.review_criteria,
                 sources=notes_text,
                 audience=payload.audience,
+                max_tokens=review_max_tokens,
             ):
                 if not chunk:
                     continue
                 review_chunks.append(chunk)
                 q.put({"type": "delta", "stage": "review", "content": chunk})
             review = "".join(review_chunks)
+            task_status["review"] = bool(review.strip())
             q.put({"type": "review", "payload": {"review": review}})
 
             q.put({"type": "status", "step": "rewrite"})
             rewrite_chunks: list[str] = []
+            # 根据 draft 长度动态设置 max_tokens，避免截断
+            rewrite_max_tokens = min(8000, max(2000, int(len(draft) * 1.5)))
             for chunk in services.rewriter.agent.rewrite_stream(
                 draft=draft,
                 guidance=review,
                 style=payload.style,
                 target_length=payload.target_length,
+                max_tokens=rewrite_max_tokens,
             ):
                 if not chunk:
                     continue
                 rewrite_chunks.append(chunk)
                 q.put({"type": "delta", "stage": "rewrite", "content": chunk})
             revised = "".join(rewrite_chunks)
+            task_status["rewrite"] = _is_effective(revised)
             q.put({"type": "rewrite", "payload": {"revised": revised}})
 
             q.put({"type": "status", "step": "citations"})
@@ -216,10 +300,19 @@ def run_pipeline_stream(
             )
             result = PipelineResult(outline=outline, research_notes=notes, draft_result=draft_result)
             response = _serialize_pipeline_result(payload, result, services)
+            task_status["citations"] = True
+            succeeded = True
+            effective_output = bool(task_status["rewrite"]) or bool(task_status["draft"])
             q.put({"type": "result", "payload": response.model_dump()})
         except Exception as exc:  # pragma: no cover
             q.put({"type": "error", "detail": str(exc)})
         finally:
+            if any(v is not None for v in task_status.values()):
+                _log_task_success_rate(
+                    task_status,
+                    terminate_ok=succeeded,
+                    effective_output=effective_output if succeeded else None,
+                )
             q.put(None)
 
     def generator():

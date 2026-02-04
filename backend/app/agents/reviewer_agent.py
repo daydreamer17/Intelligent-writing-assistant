@@ -82,6 +82,7 @@ class ReviewerAgent(BaseWritingAgent):
         criteria: str = "",
         sources: str = "",
         audience: str = "",
+        max_tokens: Optional[int] = None,
     ):
         # 截断过长的内容以避免超过模型限制
         max_draft_chars = 15000  # 约 6000 tokens
@@ -106,4 +107,4 @@ class ReviewerAgent(BaseWritingAgent):
             "Highlight factual claims that need citations.\n\n"
             + "\n\n".join(parts)
         )
-        yield from self.stream(prompt)
+        yield from self.stream(prompt, max_tokens=max_tokens)

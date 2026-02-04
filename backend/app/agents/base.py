@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import json
+import sqlite3
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional
 import logging
 import time
 import threading
+from datetime import datetime
 
 from hello_agents import HelloAgentsLLM, SimpleAgent, ToolAwareSimpleAgent
 from hello_agents.core.message import Message
@@ -376,22 +379,49 @@ def _prune_agent_history(agent: Any, *, upcoming_user_chars: int) -> None:
     if not history:
         return
 
-    kept: list[Any] = []
+    sanitized, deferred, forgotten = _apply_memory_policy(history)
+    if deferred:
+        _push_cold_memory(agent, deferred)
+    if forgotten:
+        logger.info("Forgot %s memory items by policy.", len(forgotten))
+
+    pinned = [msg for msg, action in sanitized if action == "pin"]
+    normal = [msg for msg, action in sanitized if action in ("normal", "compress")]
+
+    pinned_chars = sum(len(getattr(m, "content", "") or "") for m in pinned)
+    if pinned and pinned_chars > allowed_history_chars:
+        # Truncate pinned messages proportionally to fit the budget.
+        per = max(200, int(allowed_history_chars / max(len(pinned), 1)))
+        new_pinned: list[Any] = []
+        for msg in pinned:
+            content = getattr(msg, "content", "") or ""
+            if len(content) > per:
+                content = _truncate_text_tail(content, per)
+                msg = _clone_message(msg, content)
+            new_pinned.append(msg)
+        pinned = new_pinned
+        pinned_chars = sum(len(getattr(m, "content", "") or "") for m in pinned)
+
+    available = max(0, allowed_history_chars - pinned_chars)
+    kept_norm: list[Any] = []
     total = 0
-    for msg in reversed(history):
+    for msg in reversed(normal):
         content = getattr(msg, "content", "") or ""
         msg_len = len(content)
-        if kept and total + msg_len > allowed_history_chars:
+        if kept_norm and total + msg_len > available:
             break
-        if not kept and msg_len > allowed_history_chars:
-            # Keep at least the last message, but truncate it to fit the cap.
-            truncated = _truncate_text_tail(content, allowed_history_chars)
-            kept = [_clone_message(msg, truncated)]
-            total = len(truncated)
+        if not kept_norm and msg_len > available:
+            if available > 0:
+                truncated = _truncate_text_tail(content, available)
+                kept_norm = [_clone_message(msg, truncated)]
+                total = len(truncated)
             break
-        kept.append(msg)
+        kept_norm.append(msg)
         total += msg_len
-    kept.reverse()
+    kept_norm.reverse()
+
+    keep_set = {id(msg) for msg in (pinned + kept_norm)}
+    kept: list[Any] = [msg for msg, _ in sanitized if id(msg) in keep_set]
 
     if len(kept) == len(history):
         return
@@ -403,7 +433,7 @@ def _prune_agent_history(agent: Any, *, upcoming_user_chars: int) -> None:
         "Pruned agent history: kept %s/%s messages (%s/%s chars allowed=%s).",
         len(kept),
         len(history),
-        total,
+        sum(len(getattr(m, "content", "") or "") for m in kept),
         sum(len(getattr(m, "content", "") or "") for m in history),
         allowed_history_chars,
     )
@@ -468,7 +498,19 @@ def _maybe_compress_history(agent: Any, llm: HelloAgentsLLM) -> None:
     if not history:
         return
 
-    total_chars = sum(len(getattr(m, "content", "") or "") for m in history)
+    sanitized, deferred, forgotten = _apply_memory_policy(history)
+    if deferred:
+        _push_cold_memory(agent, deferred)
+    if forgotten:
+        logger.info("Forgot %s memory items by policy.", len(forgotten))
+
+    # Only compress normal + compress messages; pinned remain verbatim.
+    pinned = [msg for msg, action in sanitized if action == "pin"]
+    normal_msgs = [msg for msg, action in sanitized if action in ("normal", "compress")]
+
+    total_chars = sum(len(getattr(m, "content", "") or "") for m in normal_msgs) + sum(
+        len(getattr(m, "content", "") or "") for m in pinned
+    )
     history_tokens_est = _estimate_tokens(total_chars, chars_per_token)
     budget_tokens_est = _estimate_tokens(budget_chars, chars_per_token)
     trigger_tokens_est = int(budget_tokens_est * threshold_ratio)
@@ -481,17 +523,20 @@ def _maybe_compress_history(agent: Any, llm: HelloAgentsLLM) -> None:
         budget_tokens_est,
         trigger_tokens_est,
     )
-    if history_tokens_est <= trigger_tokens_est:
+    if history_tokens_est <= trigger_tokens_est and not any(
+        action == "compress" for _, action in sanitized
+    ):
         return
 
     # Layered memory: keep (1) long-term summary, (2) recent summary, (3) last N messages.
     keep_last = max(0, keep_last)
     summary_tags = ("[LONG_TERM_SUMMARY]", "[RECENT_SUMMARY]")
-    long_summary, recent_summary, normal_msgs = _extract_layered_memory(history, summary_tags)
+    long_summary, recent_summary, filtered_msgs = _extract_layered_memory(normal_msgs, summary_tags)
+    # Keep pinned messages separate; they always go into context as-is.
 
     # Compose transcript from normal messages only (exclude existing summaries).
-    head = normal_msgs[:-keep_last] if keep_last else normal_msgs
-    tail = normal_msgs[-keep_last:] if keep_last else []
+    head = filtered_msgs[:-keep_last] if keep_last else filtered_msgs
+    tail = filtered_msgs[-keep_last:] if keep_last else []
     if not head:
         return
 
@@ -543,6 +588,8 @@ def _maybe_compress_history(agent: Any, llm: HelloAgentsLLM) -> None:
 
     # Rebuild history with layered summaries + tail messages.
     agent.clear_history()
+    for msg in pinned:
+        agent.add_message(msg)
     if long_summary_text:
         agent.add_message(Message(f"[LONG_TERM_SUMMARY]\n{long_summary_text}", "assistant"))
     if recent_summary_text:
@@ -600,3 +647,124 @@ def _estimate_tokens(chars: int, chars_per_token: float) -> int:
     if chars_per_token <= 0:
         chars_per_token = 0.5
     return int(chars / chars_per_token)
+
+
+def _apply_memory_policy(history: list[Any]) -> tuple[list[tuple[Any, str]], list[Any], list[Any]]:
+    """
+    Classify history items into memory buckets and return:
+    - sanitized list of (message, action)
+    - deferred messages (cold store)
+    - forgotten messages (drop)
+    """
+    tag_pin = os.getenv("LLM_MEMORY_TAG_PIN", "[MEM:PIN]")
+    tag_compress = os.getenv("LLM_MEMORY_TAG_COMPRESS", "[MEM:COMPRESS]")
+    tag_defer = os.getenv("LLM_MEMORY_TAG_DEFER", "[MEM:DEFER]")
+    tag_forget = os.getenv("LLM_MEMORY_TAG_FORGET", "[MEM:FORGET]")
+    prefer_meta = os.getenv("LLM_MEMORY_META_PRIORITY", "true").lower() in ("1", "true", "yes")
+
+    sanitized: list[tuple[Any, str]] = []
+    deferred: list[Any] = []
+    forgotten: list[Any] = []
+
+    for msg in history:
+        content = getattr(msg, "content", "") or ""
+        meta = getattr(msg, "metadata", None) or {}
+        action = meta.get("memory") if prefer_meta else None
+        action = (action or "").lower()
+
+        if not action:
+            if content.startswith(tag_pin):
+                action = "pin"
+                content = content[len(tag_pin):].lstrip()
+            elif content.startswith(tag_compress):
+                action = "compress"
+                content = content[len(tag_compress):].lstrip()
+            elif content.startswith(tag_defer):
+                action = "defer"
+                content = content[len(tag_defer):].lstrip()
+            elif content.startswith(tag_forget):
+                action = "forget"
+                content = content[len(tag_forget):].lstrip()
+            else:
+                action = "normal"
+
+        if action == "forget":
+            forgotten.append(msg)
+            continue
+        if action == "defer":
+            deferred.append(msg)
+            continue
+
+        if content != getattr(msg, "content", ""):
+            msg = _clone_message(msg, content)
+
+        if action not in ("pin", "compress", "normal"):
+            action = "normal"
+
+        sanitized.append((msg, action))
+
+    return sanitized, deferred, forgotten
+
+
+def _push_cold_memory(agent: Any, messages: list[Any]) -> None:
+    """Store deferred memories on the agent instance (not included in context)."""
+    if not messages:
+        return
+    cold = getattr(agent, "_cold_memory", None)
+    if cold is None:
+        cold = []
+        setattr(agent, "_cold_memory", cold)
+    cold.extend(messages)
+    _persist_cold_memory(agent, messages)
+
+
+def _persist_cold_memory(agent: Any, messages: list[Any]) -> None:
+    enabled = os.getenv("LLM_COLD_STORE_ENABLED", "true").lower() in ("1", "true", "yes")
+    if not enabled:
+        return
+    db_path = os.getenv("LLM_COLD_STORE_PATH") or os.getenv("STORAGE_PATH") or ""
+    if not db_path:
+        return
+    max_chars = _parse_int_env("LLM_COLD_STORE_MAX_CHARS", default=5000)
+    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+    try:
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cold_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        now = datetime.utcnow().isoformat()
+        cur = conn.cursor()
+        agent_name = getattr(agent, "name", "unknown")
+        for msg in messages:
+            role = getattr(msg, "role", "assistant")
+            content = getattr(msg, "content", "") or ""
+            if max_chars > 0 and len(content) > max_chars:
+                content = _truncate_text_tail(content, max_chars)
+            metadata = getattr(msg, "metadata", None)
+            if metadata is not None:
+                try:
+                    metadata = json.dumps(metadata, ensure_ascii=False, default=str)
+                except Exception:
+                    metadata = None
+            cur.execute(
+                """
+                INSERT INTO cold_memory (agent_name, role, content, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (agent_name, role, content, metadata, now),
+            )
+        conn.commit()
+        conn.close()
+        logger.info("Persisted %s cold memory items to SQLite.", len(messages))
+    except Exception as exc:
+        logger.warning("Failed to persist cold memory: %s", exc)

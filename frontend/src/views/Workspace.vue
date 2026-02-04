@@ -238,7 +238,10 @@ const handleDraft = async () => {
           output.draft += evt.content || "";
         }
         if (evt.type === "result") {
-          output.draft = evt.payload?.draft || "";
+          // 只在流式内容为空时才使用 result（兜底）
+          if (!output.draft) {
+            output.draft = evt.payload?.draft || "";
+          }
           showToast("草稿已生成");
         }
         if (evt.type === "error") {
@@ -278,7 +281,10 @@ const handleReview = async () => {
           output.review += evt.content || "";
         }
         if (evt.type === "result") {
-          output.review = evt.payload?.review || "";
+          // 只在流式内容为空时才使用 result（兜底）
+          if (!output.review) {
+            output.review = evt.payload?.review || "";
+          }
           showToast("审校完成");
         }
         if (evt.type === "error") {
@@ -318,7 +324,10 @@ const handleRewrite = async () => {
           output.revised += evt.content || "";
         }
         if (evt.type === "result") {
-          output.revised = evt.payload?.revised || "";
+          // 只在流式内容为空时才使用 result（兜底）
+          if (!output.revised) {
+            output.revised = evt.payload?.revised || "";
+          }
           showToast("改写完成");
         }
         if (evt.type === "error") {
@@ -390,21 +399,30 @@ const handlePipeline = async () => {
       }
       if (evt.type === "draft") {
         currentPipelineStep.value = 3;
-        output.draft = evt.payload?.draft || "";
+        // 优先使用已经通过 delta 累积的内容，只在为空时才使用 payload（兜底）
+        if (!output.draft) {
+          output.draft = evt.payload?.draft || "";
+        }
       }
       if (evt.type === "delta" && evt.stage === "draft") {
         output.draft += evt.content || "";
       }
       if (evt.type === "review") {
         currentPipelineStep.value = 4;
-        output.review = evt.payload?.review || "";
+        // 优先使用已经通过 delta 累积的内容，只在为空时才使用 payload（兜底）
+        if (!output.review) {
+          output.review = evt.payload?.review || "";
+        }
       }
       if (evt.type === "delta" && evt.stage === "review") {
         output.review += evt.content || "";
       }
       if (evt.type === "rewrite") {
         currentPipelineStep.value = 5;
-        output.revised = evt.payload?.revised || "";
+        // 优先使用已经通过 delta 累积的内容，只在为空时才使用 payload（兜底）
+        if (!output.revised) {
+          output.revised = evt.payload?.revised || "";
+        }
       }
       if (evt.type === "delta" && evt.stage === "rewrite") {
         output.revised += evt.content || "";
@@ -415,13 +433,24 @@ const handlePipeline = async () => {
       if (evt.type === "result") {
         const res = evt.payload;
         currentPipelineStep.value = pipelineSteps.length;
+
+        // 只更新非流式字段，保留已经通过 delta 累积的内容
         output.outline = res.outline;
         output.assumptions = res.assumptions;
         output.open_questions = res.open_questions;
         output.research_notes = res.research_notes || [];
-        output.draft = res.draft;
-        output.review = res.review;
-        output.revised = res.revised;
+
+        // 只在流式内容为空时才使用 result 中的值（兜底）
+        if (!output.draft) {
+          output.draft = res.draft;
+        }
+        if (!output.review) {
+          output.review = res.review;
+        }
+        if (!output.revised) {
+          output.revised = res.revised;
+        }
+
         output.bibliography = res.bibliography;
         output.version_id = res.version_id;
         output.citations = res.citations || [];
