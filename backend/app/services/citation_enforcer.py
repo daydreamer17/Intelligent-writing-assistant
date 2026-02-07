@@ -65,12 +65,14 @@ class CitationEnforcer:
         covered_tokens = 0
         covered_paragraphs = 0
         enforced_paragraphs: List[str] = []
+        paragraph_tokens: List[List[str]] = []
 
         for para in paragraphs:
             stripped = para.strip()
             if not stripped:
                 continue
             tokens = self._tokenize(stripped)
+            paragraph_tokens.append(tokens)
             total_tokens += len(tokens)
             best_idx, best_ratio = self._best_match(tokens, note_tokens)
             if best_ratio >= self._threshold:
@@ -80,6 +82,14 @@ class CitationEnforcer:
                 label = labels[best_idx] if best_idx is not None else labels[0]
                 stripped = f"{stripped} {label}"
             enforced_paragraphs.append(stripped)
+
+        if apply_labels and _parse_bool_env("RAG_CITATION_REQUIRE_ALL_LABELS", True):
+            enforced_paragraphs = self._ensure_all_labels(
+                paragraphs=enforced_paragraphs,
+                paragraph_tokens=paragraph_tokens,
+                labels=labels,
+                note_tokens=note_tokens,
+            )
 
         total_paragraphs = len(enforced_paragraphs)
         token_coverage = covered_tokens / total_tokens if total_tokens > 0 else 0.0
@@ -132,6 +142,82 @@ class CitationEnforcer:
                 best_idx = idx
         return best_idx, best_ratio
 
+    def _ensure_all_labels(
+        self,
+        *,
+        paragraphs: List[str],
+        paragraph_tokens: List[List[str]],
+        labels: List[str],
+        note_tokens: List[List[str]],
+    ) -> List[str]:
+        if not paragraphs or not labels:
+            return paragraphs
+
+        used_labels = _labels_in_text("\n".join(paragraphs), labels)
+        missing = [idx for idx, label in enumerate(labels) if label not in used_labels]
+        if not missing:
+            return paragraphs
+
+        paragraphs_out = list(paragraphs)
+        para_used_for_backfill: set[int] = set()
+
+        for note_idx in missing:
+            label = labels[note_idx]
+            target_idx = self._best_paragraph_for_note(
+                note_tokens[note_idx] if note_idx < len(note_tokens) else [],
+                paragraph_tokens,
+                prefer_unused=True,
+                used_paragraphs=para_used_for_backfill,
+            )
+            if target_idx is None:
+                target_idx = self._best_paragraph_for_note(
+                    note_tokens[note_idx] if note_idx < len(note_tokens) else [],
+                    paragraph_tokens,
+                    prefer_unused=False,
+                    used_paragraphs=para_used_for_backfill,
+                )
+            if target_idx is None:
+                continue
+            if label not in paragraphs_out[target_idx]:
+                paragraphs_out[target_idx] = f"{paragraphs_out[target_idx]} {label}"
+            para_used_for_backfill.add(target_idx)
+
+        final_used = _labels_in_text("\n".join(paragraphs_out), labels)
+        logger.info(
+            "Citation label coverage: used=%s/%s missing_before=%s",
+            len(final_used),
+            len(labels),
+            len(missing),
+        )
+        return paragraphs_out
+
+    def _best_paragraph_for_note(
+        self,
+        note_tokens: List[str],
+        paragraph_tokens: List[List[str]],
+        *,
+        prefer_unused: bool,
+        used_paragraphs: set[int],
+    ) -> int | None:
+        if not paragraph_tokens:
+            return None
+        note_set = set(note_tokens)
+        best_idx: int | None = None
+        best_score = -1.0
+        for idx, para_tokens in enumerate(paragraph_tokens):
+            if prefer_unused and idx in used_paragraphs:
+                continue
+            token_set = set(para_tokens)
+            if note_set and token_set:
+                overlap = len(note_set.intersection(token_set))
+                score = overlap / max(len(note_set), 1)
+            else:
+                score = 0.0
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        return best_idx
+
     def _semantic_coverage(
         self,
         *,
@@ -175,6 +261,14 @@ def _has_citation(text: str, labels: List[str]) -> bool:
         if label in text:
             return True
     return False
+
+
+def _labels_in_text(text: str, labels: List[str]) -> set[str]:
+    used: set[str] = set()
+    for label in labels:
+        if label in text:
+            used.add(label)
+    return used
 
 
 def _parse_float_env(name: str, default: float) -> float:

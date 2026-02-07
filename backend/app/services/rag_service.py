@@ -134,33 +134,47 @@ class RAGService:
         return len(self._documents)
 
     def _dynamic_search_plan(self, *, top_k: int, corpus_size: int) -> tuple[int, int]:
-        if not _parse_bool_env("RAG_DYNAMIC_TOPK_ENABLED", True):
-            return top_k, self._candidate_k(top_k)
+        requested_top_k = max(1, top_k)
+        if corpus_size <= 0:
+            return requested_top_k, requested_top_k
 
-        small_threshold = max(1, _parse_int_env("RAG_DYNAMIC_SMALL_THRESHOLD", 1000))
-        large_threshold = max(small_threshold + 1, _parse_int_env("RAG_DYNAMIC_LARGE_THRESHOLD", 50000))
+        if not _parse_bool_env("RAG_DYNAMIC_TOPK_ENABLED", True):
+            candidate_k = min(corpus_size, max(requested_top_k, self._candidate_k(requested_top_k)))
+            final_top_k = min(corpus_size, requested_top_k)
+            return final_top_k, candidate_k
+
+        small_threshold = max(1, _parse_int_env("RAG_DYNAMIC_SMALL_THRESHOLD", 50))
+        large_threshold = max(small_threshold + 1, _parse_int_env("RAG_DYNAMIC_LARGE_THRESHOLD", 500))
 
         if corpus_size <= small_threshold:
-            target_top_k = max(1, _parse_int_env("RAG_DYNAMIC_TOPK_SMALL", 8))
-            target_candidates = max(target_top_k, _parse_int_env("RAG_DYNAMIC_CANDIDATES_SMALL", 30))
+            target_top_k = max(1, _parse_int_env("RAG_DYNAMIC_TOPK_SMALL", 5))
+            target_candidates = max(target_top_k, _parse_int_env("RAG_DYNAMIC_CANDIDATES_SMALL", 15))
             bucket = "small"
         elif corpus_size >= large_threshold:
             target_top_k = max(1, _parse_int_env("RAG_DYNAMIC_TOPK_LARGE", 12))
-            target_candidates = max(target_top_k, _parse_int_env("RAG_DYNAMIC_CANDIDATES_LARGE", 120))
+            target_candidates = max(target_top_k, _parse_int_env("RAG_DYNAMIC_CANDIDATES_LARGE", 36))
             bucket = "large"
         else:
             target_top_k = max(1, _parse_int_env("RAG_DYNAMIC_TOPK_MEDIUM", 10))
-            target_candidates = max(target_top_k, _parse_int_env("RAG_DYNAMIC_CANDIDATES_MEDIUM", 60))
+            target_candidates = max(target_top_k, _parse_int_env("RAG_DYNAMIC_CANDIDATES_MEDIUM", 24))
             bucket = "medium"
 
-        # 动态策略优先：当调用方 top_k 偏小（如默认 5）时自动放大到动态目标。
-        final_top_k = max(1, max(top_k, target_top_k))
-        candidate_k = max(final_top_k, target_candidates)
+        # Dynamic target can expand the caller's requested top_k.
+        final_top_k = min(corpus_size, max(requested_top_k, target_top_k))
+
+        # For very small corpora, keep one document out so ranking still filters.
+        if corpus_size < 10 and corpus_size > 1:
+            final_top_k = max(1, min(final_top_k, corpus_size - 1))
+            candidate_k = corpus_size
+        else:
+            candidate_k = min(corpus_size, max(final_top_k, target_candidates))
 
         self._logger.info(
-            "RAG dynamic search plan: corpus=%s bucket=%s top_k=%s candidates=%s",
+            "RAG dynamic search plan: corpus=%s bucket=%s requested_top_k=%s target_top_k=%s final_top_k=%s candidates=%s",
             corpus_size,
             bucket,
+            requested_top_k,
+            target_top_k,
             final_top_k,
             candidate_k,
         )
