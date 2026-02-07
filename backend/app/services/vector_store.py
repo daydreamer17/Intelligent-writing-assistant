@@ -9,6 +9,7 @@ from typing import Iterable, List, Protocol
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
+from ..utils.tokenizer import tokenize_list
 from .research_service import SourceDocument
 
 
@@ -58,18 +59,8 @@ class HashEmbedding:
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
-        tokens = []
-        current = []
-        for ch in text.lower():
-            if ch.isalnum():
-                current.append(ch)
-            else:
-                if current:
-                    tokens.append("".join(current))
-                    current = []
-        if current:
-            tokens.append("".join(current))
-        return tokens
+        """使用统一的分词工具（支持中文）"""
+        return tokenize_list(text, lowercase=True)
 
     def embed_one(self, text: str) -> List[float]:
         return self._embed_single(text)

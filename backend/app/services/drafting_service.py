@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import re
 
 from ..agents.writing_agent import WritingAgent
+from .evidence_service import EvidenceExtractor
 from .reviewing_service import ReviewingService
 from .rewriting_service import RewritingService
 
@@ -24,10 +26,12 @@ class DraftingService:
         writing_agent: WritingAgent,
         reviewing_service: ReviewingService | None = None,
         rewriting_service: RewritingService | None = None,
+        evidence_extractor: EvidenceExtractor | None = None,
     ) -> None:
         self.writing_agent = writing_agent
         self.reviewing_service = reviewing_service
         self.rewriting_service = rewriting_service
+        self.evidence_extractor = evidence_extractor
 
     def create_draft(
         self,
@@ -38,14 +42,14 @@ class DraftingService:
         constraints: str = "",
         style: str = "",
         target_length: str = "",
+        evidence_text: str = "",
     ) -> str:
         target_len = _parse_target_length(target_length)
-        notes = research_notes or "No external sources provided."
-        prompt_constraints = constraints
-        if research_notes:
-            prompt_constraints = (constraints + "\n\nUse the research notes below.\n" + notes).strip()
-        else:
-            prompt_constraints = (constraints + "\n\nDo not invent facts.").strip()
+        prompt_constraints = self.build_constraints(
+            research_notes=research_notes,
+            constraints=constraints,
+            evidence_text=evidence_text,
+        )
 
         if target_len is not None and target_len >= 1800:
             return self.writing_agent.draft_long(
@@ -88,12 +92,16 @@ class DraftingService:
         guidance: str,
         style: str = "",
         target_length: str = "",
+        evidence_text: str = "",
     ) -> str:
         if not self.rewriting_service:
             return draft
+        final_guidance = guidance
+        if evidence_text:
+            final_guidance = (guidance + "\n\nOnly use the evidence below:\n" + evidence_text).strip()
         return self.rewriting_service.rewrite(
             draft=draft,
-            guidance=guidance,
+            guidance=final_guidance,
             style=style,
             target_length=target_length,
         ).revised
@@ -110,6 +118,7 @@ class DraftingService:
         review_criteria: str = "",
         audience: str = "",
     ) -> DraftResult:
+        evidence_text = self.extract_evidence(research_notes)
         draft = self.create_draft(
             topic=topic,
             outline=outline,
@@ -117,6 +126,7 @@ class DraftingService:
             constraints=constraints,
             style=style,
             target_length=target_length,
+            evidence_text=evidence_text,
         )
         review = self.review_draft(
             draft=draft,
@@ -129,6 +139,7 @@ class DraftingService:
             guidance=review,
             style=style,
             target_length=target_length,
+            evidence_text=evidence_text,
         )
         return DraftResult(
             outline=outline,
@@ -137,6 +148,29 @@ class DraftingService:
             review=review,
             revised=revised,
         )
+
+    def extract_evidence(self, research_notes: str) -> str:
+        if not _citations_enabled():
+            return ""
+        if not self.evidence_extractor or not research_notes.strip():
+            return ""
+        return self.evidence_extractor.extract(research_notes)
+
+    def build_constraints(
+        self,
+        *,
+        research_notes: str,
+        constraints: str,
+        evidence_text: str = "",
+    ) -> str:
+        notes = research_notes or "No external sources provided."
+        if _citations_enabled():
+            evidence = evidence_text or self.extract_evidence(research_notes)
+            if evidence:
+                return (constraints + "\n\nUse ONLY the evidence below. Do not add new facts.\n" + evidence).strip()
+        if research_notes:
+            return (constraints + "\n\nUse the research notes below.\n" + notes).strip()
+        return (constraints + "\n\nDo not invent facts.").strip()
 
 
 def _parse_target_length(value: str) -> int | None:
@@ -147,3 +181,7 @@ def _parse_target_length(value: str) -> int | None:
         return int(match.group(0))
     except ValueError:
         return None
+
+
+def _citations_enabled() -> bool:
+    return os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes")

@@ -17,64 +17,94 @@ export const runPipelineStream = async (
 
   // 创建 AbortController 用于超时控制
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 900000); // 15分钟超时
+  const timeoutId = setTimeout(() => controller.abort(), 1800000); // 30分钟超时
 
   try {
     const response = await fetch(`${store.apiBase}/api/pipeline/stream`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Connection": "keep-alive", // 保持连接
       },
       body: JSON.stringify(payload),
       signal: controller.signal,
-      // 禁用浏览器默认的超时行为
-      keepalive: true,
     });
 
     if (!response.ok || !response.body) {
       throw new Error(`stream failed: ${response.status}`);
     }
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buffer = "";
-    let lastActivityTime = Date.now();
-    const activityTimeout = 600000; // 10分钟无数据才认为连接断开
-    let receivedResult = false;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let lastActivityTime = Date.now();
+  const activityTimeout = 600000; // 10分钟无数据才认为连接断开
+  let receivedResult = false;
+  let receivedAny = false;
 
-    while (true) {
-      // 检查是否长时间无数据
-      if (Date.now() - lastActivityTime > activityTimeout) {
-        throw new Error("Stream timeout: no data received for 10 minutes");
-      }
+    try {
+      while (true) {
+        // 检查是否长时间无数据
+        if (Date.now() - lastActivityTime > activityTimeout) {
+          throw new Error("Stream timeout: no data received for 10 minutes");
+        }
 
-      const { value, done } = await reader.read();
-      if (done) break;
+        const { value, done } = await reader.read();
+        if (done) break;
 
-      lastActivityTime = Date.now(); // 更新活动时间
-      buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() || "";
+        lastActivityTime = Date.now(); // 更新活动时间
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
 
-      for (const chunk of parts) {
-        const line = chunk.split("\n").find((l) => l.startsWith("data:"));
-        if (!line) continue;
-        const jsonStr = line.replace("data:", "").trim();
-        if (!jsonStr) continue;
-        try {
-          const evt = JSON.parse(jsonStr);
-          if (evt?.type === "result") {
-            receivedResult = true;
+        for (const chunk of parts) {
+          const line = chunk.split("\n").find((l) => l.startsWith("data:"));
+          if (!line) continue;
+          const jsonStr = line.replace("data:", "").trim();
+          if (!jsonStr) continue;
+          try {
+            const evt = JSON.parse(jsonStr);
+            receivedAny = true;
+            if (evt?.type === "result") {
+              receivedResult = true;
+            }
+            onEvent(evt);
+          } catch {
+            // ignore parse errors
           }
-          onEvent(evt);
-        } catch {
-          // ignore parse errors
+        }
+      }
+    } catch (err: any) {
+      const message = String(err?.message || "");
+      if (receivedResult || message.includes("BodyStreamBuffer was aborted")) {
+        return;
+      }
+      throw err;
+    } finally {
+      // 处理残留 buffer（避免末尾没有换行导致丢失最后一条事件）
+      if (buffer.trim()) {
+        const line = buffer.split("\n").find((l) => l.startsWith("data:"));
+        if (line) {
+          const jsonStr = line.replace("data:", "").trim();
+          if (jsonStr) {
+            try {
+              const evt = JSON.parse(jsonStr);
+              receivedAny = true;
+              if (evt?.type === "result") {
+                receivedResult = true;
+              }
+              onEvent(evt);
+            } catch {
+              // ignore parse errors
+            }
+          }
         }
       }
     }
 
     if (!receivedResult) {
+      if (receivedAny) {
+        return;
+      }
       throw new Error("Stream ended before final result");
     }
   } finally {

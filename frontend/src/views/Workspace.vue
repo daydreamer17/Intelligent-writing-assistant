@@ -44,8 +44,8 @@
       <div class="field">
         <label>研究素材（可选，来自 RAG 或手动粘贴）</label>
         <textarea v-model="form.research_notes" rows="4"></textarea>
-        <div v-if="snippets.length" class="muted">
-          已收集素材：{{ snippets.length }}
+        <div v-if="ragSnippets.length" class="muted">
+          已收集素材：{{ ragSnippets.length }}
           <button class="btn ghost" @click="appendSnippets">加入到素材</button>
           <button class="btn ghost" @click="clearSnippets">清空</button>
         </div>
@@ -64,6 +64,31 @@
         <button class="btn ghost" @click="exportText">导出 TXT</button>
         <button class="btn ghost" @click="exportMarkdown">导出 MD</button>
         <button class="btn ghost" @click="exportHtml">导出 HTML</button>
+      </div>
+      <div style="display:flex; gap:12px; align-items:center; margin-top:12px;">
+        <label style="display:flex; align-items:center; gap:8px;">
+          <input
+            type="checkbox"
+            :checked="citationEnforce || false"
+            :disabled="citationUpdating"
+            @change="handleCitationToggle"
+          />
+          强制引用（仅在启用时要求输出引用）
+        </label>
+        <span v-if="citationEnforce === null" class="muted">设置加载失败</span>
+        <span v-else class="muted">当前：{{ citationEnforce ? "开启" : "关闭" }}</span>
+      </div>
+      <div v-if="output.coverage_detail || output.coverage !== undefined" class="muted">
+        <div>
+          引用覆盖率：{{ Math.round(((output.coverage_detail?.semantic_coverage ?? output.coverage) || 0) * 100) }}%
+        </div>
+        <div v-if="output.coverage_detail">
+          段落覆盖率：{{ Math.round((output.coverage_detail.paragraph_coverage || 0) * 100) }}%
+          （{{ output.coverage_detail.covered_paragraphs }}/{{ output.coverage_detail.total_paragraphs }}）
+        </div>
+        <div v-if="output.coverage_detail">
+          语义覆盖率：{{ Math.round((output.coverage_detail.semantic_coverage || 0) * 100) }}%
+        </div>
       </div>
       <div v-if="error" class="muted">错误：{{ error }}</div>
     </div>
@@ -100,14 +125,16 @@
 
 <script setup lang="ts">
 import { reactive, ref, watch } from "vue";
+import { storeToRefs } from "pinia";
 import { useAppStore } from "../store";
 import { draftStream, plan, reviewStream, rewriteStream } from "../services/writing";
 import { runPipelineStream } from "../services/pipeline";
 import { getHealthDetail } from "../services/health";
+import { getCitationSetting, setCitationSetting } from "../services/settings";
 import { handleApiError } from "../utils/errorHandler";
 import { validatePipelineRequest, validateDraftRequest, validateReviewRequest, validateRewriteRequest } from "../utils/validation";
 import { debounce } from "../utils/debounce";
-import type { PipelineRequest, HealthDetailResponse } from "../types";
+import type { PipelineRequest, HealthDetailResponse, CoverageDetail } from "../types";
 import OutlinePanel from "../components/OutlinePanel.vue";
 import DraftEditor from "../components/DraftEditor.vue";
 import ReviewPanel from "../components/ReviewPanel.vue";
@@ -142,6 +169,8 @@ const output = reactive({
   bibliography: "",
   citations: [] as { label: string; title: string; url?: string }[],
   version_id: undefined as number | undefined,
+  coverage: undefined as number | undefined,
+  coverage_detail: undefined as CoverageDetail | undefined,
 });
 
 const loading = reactive({
@@ -155,8 +184,10 @@ const loading = reactive({
 const error = ref("");
 const toast = ref("");
 const health = ref<HealthDetailResponse | null>(null);
+const citationEnforce = ref<boolean | null>(null);
+const citationUpdating = ref(false);
 const store = useAppStore();
-const snippets = store.ragSnippets;
+const { ragSnippets } = storeToRefs(store);
 
 // 进度指示器状态
 const pipelineSteps = ['生成大纲', '收集研究笔记', '创作初稿', '审阅反馈', '修改润色', '生成引用'];
@@ -177,6 +208,8 @@ const clearGenerated = () => {
   output.bibliography = "";
   output.citations = [];
   output.version_id = undefined;
+  output.coverage = undefined;
+  output.coverage_detail = undefined;
   showToast("已清空生成内容");
 };
 
@@ -362,7 +395,7 @@ const handlePipeline = async () => {
     currentPipelineStep.value = 0;
 
     // 将RAG snippets转换为sources格式
-    const sources = snippets.map((content, idx) => ({
+    const sources = ragSnippets.value.map((content, idx) => ({
       doc_id: `snippet-${Date.now()}-${idx}`,
       title: `RAG片段 ${idx + 1}`,
       content: content,
@@ -390,8 +423,13 @@ const handlePipeline = async () => {
       }
       if (evt.type === "research") {
         currentPipelineStep.value = 2;
-        if (!form.research_notes) {
-          form.research_notes = evt.payload?.notes_text || "";
+        const notesText = evt.payload?.notes_text || "";
+        if (notesText) {
+          if (!form.research_notes) {
+            form.research_notes = notesText;
+          } else if (!form.research_notes.includes("GitHub MCP Context")) {
+            form.research_notes = [form.research_notes, notesText].filter(Boolean).join("\n\n");
+          }
         }
         if (evt.payload?.notes) {
           output.research_notes = evt.payload.notes;
@@ -419,8 +457,15 @@ const handlePipeline = async () => {
       }
       if (evt.type === "rewrite") {
         currentPipelineStep.value = 5;
-        // 优先使用已经通过 delta 累积的内容，只在为空时才使用 payload（兜底）
-        if (!output.revised) {
+        if (evt.payload?.final) {
+          output.revised = evt.payload?.revised || "";
+          if (typeof evt.payload?.coverage === "number") {
+            output.coverage = evt.payload.coverage;
+          }
+          if (evt.payload?.coverage_detail) {
+            output.coverage_detail = evt.payload.coverage_detail;
+          }
+        } else if (!output.revised) {
           output.revised = evt.payload?.revised || "";
         }
       }
@@ -454,6 +499,15 @@ const handlePipeline = async () => {
         output.bibliography = res.bibliography;
         output.version_id = res.version_id;
         output.citations = res.citations || [];
+        if (res.citation_enforced) {
+          output.revised = res.revised;
+        }
+        if (typeof res.coverage === "number") {
+          output.coverage = res.coverage;
+        }
+        if (res.coverage_detail) {
+          output.coverage_detail = res.coverage_detail;
+        }
         showToast("Pipeline 完成");
       }
     });
@@ -470,13 +524,14 @@ const updateDraft = (value: string) => {
 };
 
 const appendSnippets = () => {
-  if (snippets.length) {
-    form.research_notes = [form.research_notes, ...snippets].filter(Boolean).join("\n\n");
+  if (ragSnippets.value.length) {
+    form.research_notes = [form.research_notes, ...ragSnippets.value].filter(Boolean).join("\n\n");
   }
 };
 
 const clearSnippets = () => {
   store.clearSnippets();
+  showToast("已清空 RAG 素材");
 };
 
 const exportText = () => {
@@ -541,6 +596,33 @@ const loadHealth = async () => {
 };
 
 loadHealth();
+
+const loadCitationSetting = async () => {
+  try {
+    const res = await getCitationSetting();
+    citationEnforce.value = res.enabled;
+  } catch {
+    citationEnforce.value = null;
+  }
+};
+
+loadCitationSetting();
+
+const handleCitationToggle = async (event: Event) => {
+  const target = event.target as HTMLInputElement;
+  const nextValue = target.checked;
+  citationUpdating.value = true;
+  try {
+    const res = await setCitationSetting(nextValue);
+    citationEnforce.value = res.enabled;
+    showToast(`强制引用已${res.enabled ? "开启" : "关闭"}`);
+  } catch (err) {
+    error.value = handleApiError(err);
+    target.checked = citationEnforce.value || false;
+  } finally {
+    citationUpdating.value = false;
+  }
+};
 
 const showToast = (message: string) => {
   toast.value = message;

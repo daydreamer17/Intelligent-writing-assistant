@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from hello_agents.tools import ToolRegistry
@@ -7,10 +8,12 @@ from hello_agents.tools import ToolRegistry
 from .base import AgentRuntimeConfig, BaseWritingAgent
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a skilled editor. "
-    "Rewrite and polish text while preserving meaning. "
-    "Improve clarity, coherence, and tone. "
-    "Avoid adding unsupported facts."
+    "You are a rewriting editor. "
+    "Return ONLY the final rewritten document text. "
+    "Do NOT output review comments, critique, analysis, checklists, or meta explanations. "
+    "Preserve factual meaning and avoid adding unsupported facts. "
+    "Keep the same language as the draft unless explicitly requested otherwise. "
+    "If factual grounding is needed and tools are available, call tools first."
 )
 
 
@@ -61,20 +64,26 @@ class EditorAgent(BaseWritingAgent):
         if len(guidance) > max_guidance_chars:
             guidance = guidance[:max_guidance_chars] + "\n...(指导意见过长已截断)"
 
-        parts = [f"Draft:\n{draft}"]
-        if guidance:
-            parts.append(f"Editing guidance:\n{guidance}")
-        if style:
-            parts.append(f"Style:\n{style}")
-        if target_length:
-            parts.append(f"Target length:\n{target_length}")
-
-        prompt = (
-            "Rewrite the draft based on the guidance below. "
-            "Keep structure when possible.\n\n"
-            + "\n\n".join(parts)
+        prompt = self._build_rewrite_prompt(
+            draft=draft,
+            guidance=guidance,
+            style=style,
+            target_length=target_length,
         )
-        return self.run(prompt, max_tokens=max_tokens)
+        rewritten = self.run(prompt, max_tokens=max_tokens)
+
+        # If model accidentally returns review/feedback text, force a repair pass.
+        if _looks_like_review_feedback(rewritten):
+            repair_prompt = self._build_repair_prompt(
+                draft=draft,
+                guidance=guidance,
+                bad_output=rewritten,
+                style=style,
+                target_length=target_length,
+            )
+            rewritten = self.run(repair_prompt, max_tokens=max_tokens)
+
+        return _clean_rewrite_output(rewritten)
 
     def rewrite_stream(
         self,
@@ -95,17 +104,99 @@ class EditorAgent(BaseWritingAgent):
         if len(guidance) > max_guidance_chars:
             guidance = guidance[:max_guidance_chars] + "\n...(指导意见过长已截断)"
 
-        parts = [f"Draft:\n{draft}"]
-        if guidance:
-            parts.append(f"Editing guidance:\n{guidance}")
-        if style:
-            parts.append(f"Style:\n{style}")
-        if target_length:
-            parts.append(f"Target length:\n{target_length}")
-
-        prompt = (
-            "Rewrite the draft based on the guidance below. "
-            "Keep structure when possible.\n\n"
-            + "\n\n".join(parts)
+        # Reuse the exact same quality gate as non-stream path, then chunk-yield.
+        rewritten = self.rewrite(
+            draft=draft,
+            guidance=guidance,
+            style=style,
+            target_length=target_length,
+            max_tokens=max_tokens,
         )
-        yield from self.stream(prompt, max_tokens=max_tokens)
+        chunk_size = 480
+        for start in range(0, len(rewritten), chunk_size):
+            yield rewritten[start : start + chunk_size]
+
+    def _build_rewrite_prompt(
+        self,
+        *,
+        draft: str,
+        guidance: str,
+        style: str,
+        target_length: str,
+    ) -> str:
+        instruction = (
+            "Task: Rewrite the draft into a final publishable document.\n"
+            "Hard Rules:\n"
+            "1. Output ONLY rewritten document text.\n"
+            "2. Do NOT output comments such as suggestions/issues/analysis/assessment.\n"
+            "3. Keep factual content grounded in draft and guidance; do not invent facts.\n"
+            "4. Keep the original language.\n"
+            "5. Keep structure when possible, but optimize readability and coherence.\n"
+        )
+        parts = [instruction, f"[DRAFT]\n{draft}\n[/DRAFT]"]
+        if guidance:
+            parts.append(f"[GUIDANCE]\n{guidance}\n[/GUIDANCE]")
+        if style:
+            parts.append(f"[STYLE]\n{style}\n[/STYLE]")
+        if target_length:
+            parts.append(f"[TARGET_LENGTH]\n{target_length}\n[/TARGET_LENGTH]")
+        return "\n\n".join(parts)
+
+    def _build_repair_prompt(
+        self,
+        *,
+        draft: str,
+        guidance: str,
+        bad_output: str,
+        style: str,
+        target_length: str,
+    ) -> str:
+        parts = [
+            "The previous output was review feedback, not rewritten text.",
+            "Rewrite the draft into final text now.",
+            "Return ONLY rewritten text. No analysis, no suggestions, no bullets about issues.",
+            f"[DRAFT]\n{draft}\n[/DRAFT]",
+        ]
+        if guidance:
+            parts.append(f"[GUIDANCE]\n{guidance}\n[/GUIDANCE]")
+        if style:
+            parts.append(f"[STYLE]\n{style}\n[/STYLE]")
+        if target_length:
+            parts.append(f"[TARGET_LENGTH]\n{target_length}\n[/TARGET_LENGTH]")
+        parts.append(f"[INCORRECT_OUTPUT_EXAMPLE]\n{bad_output}\n[/INCORRECT_OUTPUT_EXAMPLE]")
+        return "\n\n".join(parts)
+
+
+def _looks_like_review_feedback(text: str) -> bool:
+    value = (text or "").strip().lower()
+    if not value:
+        return False
+    strong_markers = [
+        "feedback by severity",
+        "high severity",
+        "critical issues",
+        "改进方向",
+        "审校建议",
+        "问题",
+        "建议",
+        "评估",
+    ]
+    hit = sum(1 for m in strong_markers if m in value)
+    if hit >= 2:
+        return True
+    heading_count = len(re.findall(r"(?m)^(#{1,4}|[-*]\s+|\d+\.)", value))
+    review_word_count = len(
+        re.findall(r"(建议|问题|评估|应当|需要|feedback|issue|severity|critique)", value)
+    )
+    return heading_count >= 4 and review_word_count >= 4
+
+
+def _clean_rewrite_output(text: str) -> str:
+    value = (text or "").strip()
+    # Strip fenced wrappers if the model encloses the output.
+    if value.startswith("```") and value.endswith("```"):
+        value = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", value)
+        value = re.sub(r"\n?```$", "", value)
+    # Remove common "label only" prefix.
+    value = re.sub(r"^(改写后文本|重写结果|final rewritten text)\s*[:：]\s*", "", value, flags=re.I)
+    return value.strip()

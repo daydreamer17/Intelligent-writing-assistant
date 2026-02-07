@@ -170,7 +170,7 @@ export const validateFileType = (file: File, allowedTypes: string[]): string | n
  */
 export const validateFiles = (files: File[]): ValidationResult => {
   const errors: string[] = [];
-  const allowedTypes = ['txt', 'pdf', 'docx'];
+  const allowedTypes = ['txt', 'pdf', 'docx', 'md', 'markdown'];
   if (!files.length) {
     errors.push('请先选择文件');
   }

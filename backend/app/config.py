@@ -29,6 +29,8 @@ class AppConfig:
     embedding_probe: bool = True
     auto_update_env: bool = False
     upload_max_mb: int = 10
+    github_token: str = ""
+    github_mcp_enabled: bool = False
 
     @staticmethod
     def from_env() -> "AppConfig":
@@ -40,6 +42,11 @@ class AppConfig:
                 return int(value)
             except ValueError:
                 return None
+
+        github_token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip() or os.getenv("GITHUB_ACCESS_TOKEN", "").strip()
+        github_mcp_enabled = os.getenv("MCP_GITHUB_ENABLED", "").strip().lower() in ("1", "true", "yes")
+        if github_token and os.getenv("MCP_GITHUB_ENABLED") is None:
+            github_mcp_enabled = True
 
         return AppConfig(
             llm_provider=os.getenv("LLM_PROVIDER", ""),
@@ -64,4 +71,6 @@ class AppConfig:
             embedding_probe=os.getenv("EMBEDDING_PROBE", "true").lower() == "true",
             auto_update_env=os.getenv("AUTO_UPDATE_ENV", "false").lower() == "true",
             upload_max_mb=int(os.getenv("UPLOAD_MAX_MB", "10")),
+            github_token=github_token,
+            github_mcp_enabled=github_mcp_enabled,
         )

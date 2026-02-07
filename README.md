@@ -17,6 +17,14 @@
 - **ReviewerAgent**：从多维度审核内容质量（准确性、连贯性、风格一致性等）
 - **EditorAgent**：基于审核意见优化和改进内容
 
+### 新增改进（近期）
+- **动态 RAG 检索**：`top_k` 与候选集按语料规模自动调整，避免固定参数带来的召回不足
+- **RAG 引用与拒答机制**：支持 `RAG_CITATION_ENFORCE` 强制引用；检索不足时可触发拒答
+- **两段式证据生成**：强制引用开启时，先抽取证据，再基于证据生成内容
+- **中文分词优化**：统一分词器接入 `jieba`，提升中文检索与覆盖评估准确性
+- **GitHub MCP 接入**：支持将 GitHub 结果注入研究素材，并提供显式 MCP API
+- **流式稳定性增强**：Pipeline/分步接口均支持 SSE 流式输出与前端阶段进度同步
+
 ## 🛠️ 技术栈
 
 ### 后端
@@ -170,6 +178,21 @@ QDRANT_EMBED_DIM=1024
 
 # 存储配置
 STORAGE_PATH=./data/app.db
+
+# 新增 RAG/引用相关配置（示例）
+RAG_HYDE_ENABLED=true
+RAG_MAX_EXPANSION_QUERIES=3
+RAG_RERANK_ENABLED=true
+RAG_RERANK_MAX_CANDIDATES=8
+RAG_DYNAMIC_TOPK_ENABLED=true
+RAG_NOTES_DYNAMIC_ENABLED=true
+RAG_CITATION_ENFORCE=false
+RAG_COVERAGE_THRESHOLD=0.3
+RAG_REFUSAL_ENABLED=true
+
+# MCP GitHub（可选）
+MCP_GITHUB_ENABLED=false
+GITHUB_PERSONAL_ACCESS_TOKEN=your_github_token
 ```
 
 ## 📊 当前进度
@@ -184,6 +207,10 @@ STORAGE_PATH=./data/app.db
 - [x] **进度指示器**：可视化的流程进度展示
 - [x] **状态持久化**：Pinia Store 持久化存储
 - [x] **类型安全**：完整的 TypeScript 类型定义
+- [x] **动态 RAG 策略**：按语料规模动态调整检索范围和研究笔记数量
+- [x] **可选强制引用**：前端可切换 `RAG_CITATION_ENFORCE`，并联动覆盖率评估
+- [x] **拒答保护机制**：检索命中不足时返回拒答文案，减少低质量幻觉输出
+- [x] **MCP GitHub 知识接入**：可调用 GitHub MCP 并注入研究上下文
 
 ### 🧪 已测试功能
 - [x] 文案编写功能（WritingAgent）
@@ -225,10 +252,19 @@ STORAGE_PATH=./data/app.db
 
 #### RAG 管理
 - `POST /api/rag/upload` - 上传文本内容
-- `POST /api/rag/upload-file` - 上传文档文件
+- `POST /api/rag/upload-file` - 上传文档文件（.txt / .pdf / .docx / .md / .markdown）
 - `POST /api/rag/search` - 检索相关文档
 - `GET /api/rag/documents` - 列出所有文档
 - `DELETE /api/rag/documents/{doc_id}` - 删除文档
+
+#### 引用与设置
+- `POST /api/citations` - 生成引用与参考文献
+- `GET /api/settings/citation` - 获取强制引用开关
+- `POST /api/settings/citation` - 设置强制引用开关
+
+#### MCP（GitHub）
+- `GET /api/mcp/github/tools` - 列出可用 GitHub MCP 工具
+- `POST /api/mcp/github/call` - 显式调用 GitHub MCP 工具
 
 #### 版本管理
 - `GET /api/versions` - 获取版本列表

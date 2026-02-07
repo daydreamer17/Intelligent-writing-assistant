@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List
 
+from ..utils.tokenizer import tokenize
+
 
 @dataclass(frozen=True)
 class SourceDocument:
@@ -18,6 +20,14 @@ class ResearchNote:
     title: str
     summary: str
     url: str = ""
+
+
+@dataclass(frozen=True)
+class RelevanceReport:
+    query_terms: int
+    docs: int
+    best_recall: float
+    avg_recall: float
 
 
 class ResearchService:
@@ -59,6 +69,28 @@ class ResearchService:
             blocks.append(header + "\n  " + note.summary)
         return "\n".join(blocks)
 
+    def relevance_report(
+        self,
+        query: str,
+        sources: Iterable[SourceDocument],
+    ) -> RelevanceReport:
+        terms = self._tokenize(query)
+        total_terms = len(terms)
+        recalls: List[float] = []
+        if total_terms == 0:
+            return RelevanceReport(query_terms=0, docs=0, best_recall=0.0, avg_recall=0.0)
+        for doc in sources:
+            doc_terms = self._tokenize(doc.title + " " + doc.content)
+            if not doc_terms:
+                continue
+            matched = len(terms & doc_terms)
+            recalls.append(matched / total_terms)
+        if not recalls:
+            return RelevanceReport(query_terms=total_terms, docs=0, best_recall=0.0, avg_recall=0.0)
+        best = max(recalls)
+        avg = sum(recalls) / len(recalls)
+        return RelevanceReport(query_terms=total_terms, docs=len(recalls), best_recall=best, avg_recall=avg)
+
     @staticmethod
     def _score(query: str, content: str, title: str) -> int:
         query_terms = ResearchService._tokenize(query)
@@ -70,4 +102,5 @@ class ResearchService:
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
-        return {token for token in "".join(ch.lower() if ch.isalnum() else " " for ch in text).split() if token}
+        """使用统一的分词工具（支持中文）"""
+        return tokenize(text, lowercase=True)

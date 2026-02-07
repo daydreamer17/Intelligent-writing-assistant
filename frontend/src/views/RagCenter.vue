@@ -2,7 +2,7 @@
   <section class="page">
     <div class="card">
       <h2>RAG 素材中心</h2>
-      <p class="muted">支持 TXT / PDF / DOCX 上传与检索。</p>
+      <p class="muted">支持 TXT / PDF / DOCX / MD 上传与检索。</p>
     </div>
 
     <div class="grid-2">

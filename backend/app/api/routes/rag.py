@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import re
 from uuid import UUID, uuid4
 
 import logging
@@ -171,6 +172,8 @@ def _extract_text(filename: str, content_bytes: bytes) -> str:
         return _extract_pdf_text(content_bytes)
     if name.endswith(".docx"):
         return _extract_docx_text(content_bytes)
+    if name.endswith(".md") or name.endswith(".markdown"):
+        return _extract_markdown_text(content_bytes)
     return content_bytes.decode("utf-8", errors="ignore")
 
 
@@ -210,3 +213,24 @@ def _extract_docx_text(content_bytes: bytes) -> str:
     document = docx.Document(file_like)
     parts = [para.text for para in document.paragraphs if para.text]
     return "\n".join(parts)
+
+
+def _extract_markdown_text(content_bytes: bytes) -> str:
+    text = content_bytes.decode("utf-8", errors="ignore")
+    # Remove fenced code blocks
+    text = re.sub(r"```.*?```", "", text, flags=re.S)
+    # Remove inline code
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    # Convert links/images to their label
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # Strip markdown headings and blockquotes
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.M)
+    text = re.sub(r"^\s{0,3}>\s*", "", text, flags=re.M)
+    # Strip list markers
+    text = re.sub(r"^\s*([-*+]|\d+\.)\s+", "", text, flags=re.M)
+    # Remove emphasis markers
+    text = re.sub(r"[*_]{1,3}", "", text)
+    # Collapse excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text

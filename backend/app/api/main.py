@@ -12,7 +12,15 @@ from fastapi.exceptions import RequestValidationError
 
 try:
     from .deps import AppServices, get_services
-    from .routes import citations_router, pipeline_router, rag_router, versions_router, writing_router
+    from .routes import (
+        citations_router,
+        mcp_github_router,
+        pipeline_router,
+        rag_router,
+        settings_router,
+        versions_router,
+        writing_router,
+    )
     from ..agents.base import AgentRuntimeConfig, build_llm
     from ..config import AppConfig
 except ImportError:  # Allows running `python main.py` directly.
@@ -26,8 +34,10 @@ except ImportError:  # Allows running `python main.py` directly.
     from app.api.deps import AppServices, get_services  # noqa: E402
     from app.api.routes import (  # noqa: E402
         citations_router,
+        mcp_github_router,
         pipeline_router,
         rag_router,
+        settings_router,
         versions_router,
         writing_router,
     )
@@ -54,6 +64,8 @@ def create_app() -> FastAPI:
     app.include_router(rag_router, prefix="/api")
     app.include_router(citations_router, prefix="/api")
     app.include_router(versions_router, prefix="/api")
+    app.include_router(mcp_github_router, prefix="/api")
+    app.include_router(settings_router, prefix="/api")
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
@@ -139,6 +151,11 @@ def create_app() -> FastAPI:
         try:
             services = get_services()
             services.storage.close()
+            tool = services.github_mcp_tool
+            if tool:
+                close_fn = getattr(tool, "close", None)
+                if callable(close_fn):
+                    close_fn()
         except Exception:
             pass
 

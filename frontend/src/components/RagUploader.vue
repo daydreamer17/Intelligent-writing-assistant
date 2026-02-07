@@ -12,7 +12,12 @@
     <button class="btn" @click="handleTextUpload" :disabled="loading.uploadText">上传文本</button>
 
     <h3 style="margin-top:16px;">文件上传</h3>
-    <input type="file" multiple @change="handleFileSelect" />
+    <input
+      type="file"
+      multiple
+      accept=".txt,.pdf,.docx,.md,.markdown"
+      @change="handleFileSelect"
+    />
     <div class="muted">{{ fileNames }}</div>
     <button class="btn secondary" @click="handleFileUpload" :disabled="loading.uploadFiles">上传文件</button>
   </section>

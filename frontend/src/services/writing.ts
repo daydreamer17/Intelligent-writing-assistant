@@ -44,22 +44,44 @@ export const draftStream = async (
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split("\n\n");
-    buffer = parts.pop() || "";
-    for (const chunk of parts) {
-      const line = chunk.split("\n").find((l) => l.startsWith("data:"));
-      if (!line) continue;
-      const jsonStr = line.replace("data:", "").trim();
-      if (!jsonStr) continue;
-      try {
-        const evt = JSON.parse(jsonStr);
-        onEvent(evt);
-      } catch {
-        // ignore parse errors
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+      for (const chunk of parts) {
+        const line = chunk.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        const jsonStr = line.replace("data:", "").trim();
+        if (!jsonStr) continue;
+        try {
+          const evt = JSON.parse(jsonStr);
+          onEvent(evt);
+        } catch {
+          // ignore parse errors
+        }
+      }
+    }
+  } catch (err: any) {
+    const message = String(err?.message || "");
+    if (!message.includes("BodyStreamBuffer was aborted")) {
+      throw err;
+    }
+  } finally {
+    if (buffer.trim()) {
+      const line = buffer.split("\n").find((l) => l.startsWith("data:"));
+      if (line) {
+        const jsonStr = line.replace("data:", "").trim();
+        if (jsonStr) {
+          try {
+            const evt = JSON.parse(jsonStr);
+            onEvent(evt);
+          } catch {
+            // ignore parse errors
+          }
+        }
       }
     }
   }
@@ -91,22 +113,44 @@ export const reviewStream = async (
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split("\n\n");
-    buffer = parts.pop() || "";
-    for (const chunk of parts) {
-      const line = chunk.split("\n").find((l) => l.startsWith("data:"));
-      if (!line) continue;
-      const jsonStr = line.replace("data:", "").trim();
-      if (!jsonStr) continue;
-      try {
-        const evt = JSON.parse(jsonStr);
-        onEvent(evt);
-      } catch {
-        // ignore parse errors
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+      for (const chunk of parts) {
+        const line = chunk.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        const jsonStr = line.replace("data:", "").trim();
+        if (!jsonStr) continue;
+        try {
+          const evt = JSON.parse(jsonStr);
+          onEvent(evt);
+        } catch {
+          // ignore parse errors
+        }
+      }
+    }
+  } catch (err: any) {
+    const message = String(err?.message || "");
+    if (!message.includes("BodyStreamBuffer was aborted")) {
+      throw err;
+    }
+  } finally {
+    if (buffer.trim()) {
+      const line = buffer.split("\n").find((l) => l.startsWith("data:"));
+      if (line) {
+        const jsonStr = line.replace("data:", "").trim();
+        if (jsonStr) {
+          try {
+            const evt = JSON.parse(jsonStr);
+            onEvent(evt);
+          } catch {
+            // ignore parse errors
+          }
+        }
       }
     }
   }
@@ -138,22 +182,44 @@ export const rewriteStream = async (
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split("\n\n");
-    buffer = parts.pop() || "";
-    for (const chunk of parts) {
-      const line = chunk.split("\n").find((l) => l.startsWith("data:"));
-      if (!line) continue;
-      const jsonStr = line.replace("data:", "").trim();
-      if (!jsonStr) continue;
-      try {
-        const evt = JSON.parse(jsonStr);
-        onEvent(evt);
-      } catch {
-        // ignore parse errors
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+      for (const chunk of parts) {
+        const line = chunk.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        const jsonStr = line.replace("data:", "").trim();
+        if (!jsonStr) continue;
+        try {
+          const evt = JSON.parse(jsonStr);
+          onEvent(evt);
+        } catch {
+          // ignore parse errors
+        }
+      }
+    }
+  } catch (err: any) {
+    const message = String(err?.message || "");
+    if (!message.includes("BodyStreamBuffer was aborted")) {
+      throw err;
+    }
+  } finally {
+    if (buffer.trim()) {
+      const line = buffer.split("\n").find((l) => l.startsWith("data:"));
+      if (line) {
+        const jsonStr = line.replace("data:", "").trim();
+        if (jsonStr) {
+          try {
+            const evt = JSON.parse(jsonStr);
+            onEvent(evt);
+          } catch {
+            // ignore parse errors
+          }
+        }
       }
     }
   }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from queue import Empty, Queue
 from threading import Thread
@@ -17,9 +18,132 @@ from ...models.schemas import (
     RewriteRequest,
     RewriteResponse,
 )
+from ...services.citation_enforcer import CitationEnforcer
+from ...services.github_context import maybe_fetch_github_context
+from ...services.research_service import ResearchService, RelevanceReport, SourceDocument
 from ..deps import AppServices, get_services
 
 router = APIRouter(tags=["writing"])
+_citation_enforcer = CitationEnforcer()
+_researcher = ResearchService()
+
+
+def _citations_enabled() -> bool:
+    return os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes")
+
+
+def _refusal_enabled() -> bool:
+    return os.getenv("RAG_REFUSAL_ENABLED", "true").lower() in ("1", "true", "yes")
+
+
+def _refusal_message() -> str:
+    return "在提供的文档中，无法找到该问题的答案。"
+
+
+def _parse_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _parse_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _should_refuse(report: RelevanceReport) -> bool:
+    if not _citations_enabled() or not _refusal_enabled():
+        return False
+    min_terms = max(1, _parse_int("RAG_REFUSAL_MIN_QUERY_TERMS", 2))
+    min_docs = max(1, _parse_int("RAG_REFUSAL_MIN_DOCS", 1))
+    min_best = _parse_float("RAG_REFUSAL_MIN_RECALL", 0.1)
+    min_avg = _parse_float("RAG_REFUSAL_MIN_AVG_RECALL", 0.05)
+    if report.query_terms < min_terms:
+        return False
+    if report.docs < min_docs:
+        return True
+    if report.best_recall < min_best:
+        return True
+    if report.avg_recall < min_avg:
+        return True
+    return False
+
+
+def _log_refusal(report: RelevanceReport, *, refused: bool, context: str) -> None:
+    status = "refuse" if refused else "pass"
+    print(
+        f"[RAG][refusal:{status}] context={context} docs={report.docs} terms={report.query_terms} "
+        f"best={report.best_recall:.3f} avg={report.avg_recall:.3f}"
+    )
+
+
+def _citation_top_k() -> int:
+    raw = os.getenv("RAG_CITATION_TOP_K", "5")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 5
+
+
+def _enforce_with_rag(
+    text: str,
+    *,
+    query: str,
+    services: AppServices,
+    docs: List[SourceDocument] | None = None,
+) -> str:
+    if not _citations_enabled():
+        return text
+    docs = docs or services.rag.search(query, top_k=_citation_top_k())
+    if not docs:
+        return text
+    notes = _researcher.collect_notes(query=query, sources=docs, top_k=min(len(docs), _citation_top_k()))
+    enforced, _ = _citation_enforcer.enforce(text, notes, apply_labels=True)
+    return enforced
+
+
+def _rag_refusal_check(
+    *,
+    query: str,
+    services: AppServices,
+) -> tuple[bool, List[SourceDocument]]:
+    docs = services.rag.search(query, top_k=_citation_top_k())
+    report = _researcher.relevance_report(query, docs)
+    refused = _should_refuse(report)
+    _log_refusal(report, refused=refused, context="writing")
+    return refused, docs
+
+
+def _build_evidence_from_rag(
+    *,
+    query: str,
+    services: AppServices,
+) -> str:
+    if not _citations_enabled():
+        return ""
+    docs = services.rag.search(query, top_k=_citation_top_k())
+    if not docs:
+        return ""
+    notes = _researcher.collect_notes(query=query, sources=docs, top_k=min(len(docs), _citation_top_k()))
+    notes_text = _researcher.format_notes(notes)
+    return services.drafter.extract_evidence(notes_text)
+
+
+def _append_block(text: str, block: str, label: str) -> str:
+    if not block:
+        return text
+    if text:
+        return f"{text}\n\n[{label}]\n{block}"
+    return f"[{label}]\n{block}"
 
 
 @router.post("/plan", response_model=PlanResponse)
@@ -28,13 +152,19 @@ def create_plan(
     services: AppServices = Depends(get_services),
 ) -> PlanResponse:
     try:
+        github_context = maybe_fetch_github_context(
+            services.github_mcp_tool,
+            query=payload.topic,
+            context="\n".join([payload.constraints, payload.key_points, payload.style, payload.audience]),
+        )
+        key_points = _append_block(payload.key_points, github_context, "GitHub参考")
         plan = services.planner.plan_outline(
             topic=payload.topic,
             audience=payload.audience,
             style=payload.style,
             target_length=payload.target_length,
             constraints=payload.constraints,
-            key_points=payload.key_points,
+            key_points=key_points,
         )
         return PlanResponse(
             outline=plan.outline,
@@ -51,13 +181,29 @@ def create_draft(
     services: AppServices = Depends(get_services),
 ) -> DraftResponse:
     try:
+        github_context = maybe_fetch_github_context(
+            services.github_mcp_tool,
+            query=payload.topic,
+            context="\n".join([payload.outline, payload.constraints, payload.style, payload.target_length]),
+        )
+        research_notes = _append_block(payload.research_notes, github_context, "GitHub参考")
+        refusal_query = f"{payload.topic}\n{payload.outline}"
+        refused, docs = _rag_refusal_check(query=refusal_query, services=services)
+        if refused:
+            return DraftResponse(draft=_refusal_message())
         draft = services.drafter.create_draft(
             topic=payload.topic,
             outline=payload.outline,
-            research_notes=payload.research_notes,
+            research_notes=research_notes,
             constraints=payload.constraints,
             style=payload.style,
             target_length=payload.target_length,
+        )
+        draft = _enforce_with_rag(
+            draft,
+            query=refusal_query,
+            services=services,
+            docs=docs,
         )
         return DraftResponse(draft=draft)
     except Exception as exc:
@@ -74,13 +220,31 @@ def create_draft_stream(
 
     q: Queue[dict | None] = Queue()
 
+    github_context = maybe_fetch_github_context(
+        services.github_mcp_tool,
+        query=payload.topic,
+        context="\n".join([payload.outline, payload.constraints, payload.style, payload.target_length]),
+    )
+    research_notes = _append_block(payload.research_notes, github_context, "GitHub参考")
+
     def worker() -> None:
         try:
+            refusal_query = f"{payload.topic}\n{payload.outline}"
+            refused, docs = _rag_refusal_check(query=refusal_query, services=services)
+            if refused:
+                q.put({"type": "result", "payload": {"draft": _refusal_message()}})
+                return
+            evidence_text = services.drafter.extract_evidence(research_notes)
+            draft_constraints = services.drafter.build_constraints(
+                research_notes=research_notes,
+                constraints=payload.constraints,
+                evidence_text=evidence_text,
+            )
             chunks: list[str] = []
             for chunk in services.drafter.writing_agent.draft_stream(
                 topic=payload.topic,
                 outline=payload.outline,
-                constraints=payload.constraints,
+                constraints=draft_constraints,
                 style=payload.style,
                 target_length=payload.target_length,
             ):
@@ -89,6 +253,12 @@ def create_draft_stream(
                 chunks.append(chunk)
                 q.put({"type": "delta", "content": chunk})
             draft = "".join(chunks)
+            draft = _enforce_with_rag(
+                draft,
+                query=refusal_query,
+                services=services,
+                docs=docs,
+            )
             q.put({"type": "result", "payload": {"draft": draft}})
         except Exception as exc:  # pragma: no cover
             q.put({"type": "error", "detail": str(exc)})
@@ -126,10 +296,16 @@ def review_draft(
     services: AppServices = Depends(get_services),
 ) -> ReviewResponse:
     try:
+        github_context = maybe_fetch_github_context(
+            services.github_mcp_tool,
+            query=(payload.criteria or payload.draft[:200]),
+            context="\n".join([payload.sources, payload.audience]),
+        )
+        sources = _append_block(payload.sources, github_context, "GitHub参考")
         review = services.reviewer.review(
             draft=payload.draft,
             criteria=payload.criteria,
-            sources=payload.sources,
+            sources=sources,
             audience=payload.audience,
         )
         return ReviewResponse(review=review.review)
@@ -147,13 +323,20 @@ def review_draft_stream(
 
     q: Queue[dict | None] = Queue()
 
+    github_context = maybe_fetch_github_context(
+        services.github_mcp_tool,
+        query=(payload.criteria or payload.draft[:200]),
+        context="\n".join([payload.sources, payload.audience]),
+    )
+    sources = _append_block(payload.sources, github_context, "GitHub参考")
+
     def worker() -> None:
         try:
             chunks: list[str] = []
             for chunk in services.reviewer.agent.review_stream(
                 draft=payload.draft,
                 criteria=payload.criteria,
-                sources=payload.sources,
+                sources=sources,
                 audience=payload.audience,
             ):
                 if not chunk:
@@ -198,13 +381,32 @@ def rewrite_draft(
     services: AppServices = Depends(get_services),
 ) -> RewriteResponse:
     try:
+        github_context = maybe_fetch_github_context(
+            services.github_mcp_tool,
+            query=(payload.guidance or payload.draft[:200]),
+            context=payload.style,
+        )
+        guidance = _append_block(payload.guidance, github_context, "GitHub参考")
+        refusal_query = payload.draft
+        refused, docs = _rag_refusal_check(query=refusal_query, services=services)
+        if refused:
+            return RewriteResponse(revised=_refusal_message())
+        evidence_text = _build_evidence_from_rag(query=payload.draft, services=services)
+        if evidence_text:
+            guidance = (guidance + "\n\nOnly use the evidence below:\n" + evidence_text).strip()
         revised = services.rewriter.rewrite(
             draft=payload.draft,
-            guidance=payload.guidance,
+            guidance=guidance,
             style=payload.style,
             target_length=payload.target_length,
         )
-        return RewriteResponse(revised=revised.revised)
+        text = _enforce_with_rag(
+            revised.revised,
+            query=refusal_query,
+            services=services,
+            docs=docs,
+        )
+        return RewriteResponse(revised=text)
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Rewrite failed") from exc
 
@@ -219,12 +421,29 @@ def rewrite_draft_stream(
 
     q: Queue[dict | None] = Queue()
 
+    github_context = maybe_fetch_github_context(
+        services.github_mcp_tool,
+        query=(payload.guidance or payload.draft[:200]),
+        context=payload.style,
+    )
+    guidance = _append_block(payload.guidance, github_context, "GitHub参考")
+
     def worker() -> None:
         try:
+            refusal_query = payload.draft
+            refused, docs = _rag_refusal_check(query=refusal_query, services=services)
+            if refused:
+                q.put({"type": "result", "payload": {"revised": _refusal_message()}})
+                return
+            evidence_text = _build_evidence_from_rag(query=payload.draft, services=services)
+            if evidence_text:
+                guidance_with_evidence = (guidance + "\n\nOnly use the evidence below:\n" + evidence_text).strip()
+            else:
+                guidance_with_evidence = guidance
             chunks: list[str] = []
             for chunk in services.rewriter.agent.rewrite_stream(
                 draft=payload.draft,
-                guidance=payload.guidance,
+                guidance=guidance_with_evidence,
                 style=payload.style,
                 target_length=payload.target_length,
             ):
@@ -233,6 +452,12 @@ def rewrite_draft_stream(
                 chunks.append(chunk)
                 q.put({"type": "delta", "content": chunk})
             revised_text = "".join(chunks)
+            revised_text = _enforce_with_rag(
+                revised_text,
+                query=refusal_query,
+                services=services,
+                docs=docs,
+            )
             q.put({"type": "result", "payload": {"revised": revised_text}})
         except Exception as exc:  # pragma: no cover
             q.put({"type": "error", "detail": str(exc)})

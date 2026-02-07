@@ -7,6 +7,16 @@ export interface ResearchNoteResponse {
   url?: string;
 }
 
+export interface CoverageDetail {
+  token_coverage: number;
+  paragraph_coverage: number;
+  semantic_coverage: number;
+  covered_tokens: number;
+  total_tokens: number;
+  covered_paragraphs: number;
+  total_paragraphs: number;
+}
+
 export interface CitationItemResponse {
   label: string;
   title: string;
@@ -35,4 +45,7 @@ export interface PipelineResponse {
   citations: CitationItemResponse[];
   bibliography: string;
   version_id?: number;
+  coverage?: number;
+  coverage_detail?: CoverageDetail;
+  citation_enforced?: boolean;
 }

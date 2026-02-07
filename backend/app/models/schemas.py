@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -85,6 +87,16 @@ class PipelineRequest(BaseModel):
     sources: list[SourceDocumentInput] = Field(default_factory=list, description="可用资料源")
 
 
+class CoverageDetail(BaseModel):
+    token_coverage: float = Field(0.0, description="按 token 统计的覆盖率")
+    paragraph_coverage: float = Field(0.0, description="按段落统计的覆盖率")
+    semantic_coverage: float = Field(0.0, description="按语义相似度统计的覆盖率")
+    covered_tokens: int = 0
+    total_tokens: int = 0
+    covered_paragraphs: int = 0
+    total_paragraphs: int = 0
+
+
 class PipelineResponse(BaseModel):
     outline: str
     assumptions: str = ""
@@ -96,6 +108,9 @@ class PipelineResponse(BaseModel):
     citations: list[CitationItemResponse] = Field(default_factory=list)
     bibliography: str = ""
     version_id: int | None = None
+    coverage: float | None = None
+    coverage_detail: CoverageDetail | None = None
+    citation_enforced: bool = False
 
 
 class UploadDocumentsRequest(BaseModel):
@@ -169,3 +184,25 @@ class VersionDiffResponse(BaseModel):
     to_version_id: int
     field: str
     diff: str
+
+
+class CitationSettingRequest(BaseModel):
+    enabled: bool = Field(..., description="是否启用强制引用")
+
+
+class CitationSettingResponse(BaseModel):
+    enabled: bool
+
+
+class MCPToolCallRequest(BaseModel):
+    tool_name: str = Field(..., description="MCP 工具名称")
+    arguments: dict[str, Any] = Field(default_factory=dict, description="工具参数")
+
+
+class MCPToolCallResponse(BaseModel):
+    result: str
+
+
+class MCPToolsResponse(BaseModel):
+    tools: list[dict[str, str]] = Field(default_factory=list)
+    raw: str = ""

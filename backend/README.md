@@ -9,6 +9,16 @@ FastAPI backend for a multi-agent writing pipeline (plan -> draft -> review -> r
 - Storage: SQLite for documents, draft versions, citations
 - API: FastAPI routers for writing, pipeline, rag, citations, versions
 
+## Recent Enhancements
+- Dynamic RAG retrieval plan by corpus size (`RAG_DYNAMIC_TOPK_*`)
+- Dynamic research notes count in pipeline (`RAG_NOTES_DYNAMIC_*`)
+- Optional citation enforcement toggle (`RAG_CITATION_ENFORCE`) for pipeline and step-by-step routes
+- Refusal guardrail when retrieval quality is too low (`RAG_REFUSAL_*`)
+- Two-pass evidence-first generation when citation enforcement is enabled
+- Coverage metrics returned from pipeline (`coverage` + `coverage_detail`)
+- GitHub MCP integration and explicit MCP APIs (`/api/mcp/github/*`)
+- Unified Chinese tokenization via `jieba` for retrieval and citation matching
+
 ## Project Layout
 ```
 backend/
@@ -102,6 +112,61 @@ Embeddings (used by Qdrant when `EMBEDDING_PROVIDER` is not `hash`):
 
 ### Pipeline throttling (optional)
 - `PIPELINE_STAGE_SLEEP` (seconds between stages)
+- `PIPELINE_EFFECTIVE_OUTPUT_MIN_CHARS` (minimum chars considered effective output)
+
+### RAG retrieval strategy (optional)
+- `RAG_HYDE_ENABLED`
+- `RAG_QUERY_MAX_CHARS`
+- `RAG_HYDE_MAX_CHARS`
+- `RAG_HYDE_MAX_TOKENS`
+- `RAG_MAX_EXPANSION_QUERIES`
+- `RAG_RERANK_ENABLED`
+- `RAG_RERANK_TOP_K`
+- `RAG_RERANK_MAX_CANDIDATES`
+- `RAG_RERANK_SNIPPET_CHARS`
+- `RAG_RERANK_MAX_PROMPT_CHARS`
+- `RAG_RERANK_MAX_TOKENS`
+
+### RAG dynamic retrieval by corpus size (optional)
+- `RAG_DYNAMIC_TOPK_ENABLED`
+- `RAG_DYNAMIC_SMALL_THRESHOLD`
+- `RAG_DYNAMIC_LARGE_THRESHOLD`
+- `RAG_DYNAMIC_TOPK_SMALL`
+- `RAG_DYNAMIC_TOPK_MEDIUM`
+- `RAG_DYNAMIC_TOPK_LARGE`
+- `RAG_DYNAMIC_CANDIDATES_SMALL`
+- `RAG_DYNAMIC_CANDIDATES_MEDIUM`
+- `RAG_DYNAMIC_CANDIDATES_LARGE`
+
+### RAG dynamic notes count (pipeline)
+- `RAG_NOTES_DYNAMIC_ENABLED`
+- `RAG_NOTES_TOP_K`
+- `RAG_NOTES_SMALL_THRESHOLD`
+- `RAG_NOTES_LARGE_THRESHOLD`
+- `RAG_NOTES_TOP_K_SMALL`
+- `RAG_NOTES_TOP_K_MEDIUM`
+- `RAG_NOTES_TOP_K_LARGE`
+
+### Citation/coverage/refusal (optional)
+- `RAG_CITATION_ENFORCE`
+- `RAG_CITATION_TOP_K`
+- `RAG_COVERAGE_THRESHOLD`
+- `RAG_COVERAGE_SEMANTIC_ENABLED`
+- `RAG_COVERAGE_SEMANTIC_THRESHOLD`
+- `RAG_COVERAGE_SEMANTIC_MAX_PARAGRAPHS`
+- `RAG_COVERAGE_SEMANTIC_MAX_NOTES`
+- `RAG_REFUSAL_ENABLED`
+- `RAG_REFUSAL_MIN_QUERY_TERMS`
+- `RAG_REFUSAL_MIN_DOCS`
+- `RAG_REFUSAL_MIN_RECALL`
+- `RAG_REFUSAL_MIN_AVG_RECALL`
+- `RAG_EVIDENCE_MAX_ITEMS`
+- `RAG_EVIDENCE_MAX_CHARS`
+- `RAG_EVIDENCE_MAX_TOKENS`
+
+### GitHub MCP (optional)
+- `MCP_GITHUB_ENABLED=true|false`
+- `GITHUB_PERSONAL_ACCESS_TOKEN` (required when enabled)
 
 ### Example `.env`
 ```env
@@ -156,7 +221,7 @@ All routes are prefixed with `/api`.
 
 ### RAG
 - `POST /api/rag/upload` (JSON documents)
-- `POST /api/rag/upload-file` (files: .txt / .pdf / .docx)
+- `POST /api/rag/upload-file` (files: .txt / .pdf / .docx / .md / .markdown)
 - `POST /api/rag/search`
 - `GET /api/rag/documents`
 - `DELETE /api/rag/documents/{doc_id}`
@@ -164,11 +229,19 @@ All routes are prefixed with `/api`.
 ### Citations
 - `POST /api/citations`
 
+### Settings
+- `GET /api/settings/citation`
+- `POST /api/settings/citation`
+
 ### Versions
 - `GET /api/versions`
 - `GET /api/versions/{version_id}`
 - `GET /api/versions/{version_id}/diff`
 - `DELETE /api/versions/{version_id}`
+
+### MCP (GitHub)
+- `GET /api/mcp/github/tools`
+- `POST /api/mcp/github/call`
 
 ## Streaming (SSE)
 Streaming endpoints return `text/event-stream` with JSON events like:
@@ -181,6 +254,7 @@ Streaming endpoints return `text/event-stream` with JSON events like:
 - File uploads enforce `UPLOAD_MAX_MB` and reject larger payloads.
 - PDF and DOCX parsing requires `pypdf` and `python-docx` (already in `requirements.txt`).
 - Qdrant collections must match `QDRANT_EMBED_DIM` and `QDRANT_DISTANCE`.
+- Pipeline logs include Task Success Rate and RAG refusal check details.
 
 ## Docs
 - Swagger UI: `http://localhost:8000/docs`
