@@ -6,7 +6,7 @@
     </div>
 
     <div class="card">
-      <div class="grid-2">
+      <div class="grid-2 filter-grid">
         <div class="field">
           <label>筛选关键词</label>
           <input v-model="keyword" placeholder="主题/内容关键词" />
@@ -40,11 +40,26 @@
     />
 
     <div class="card" v-if="detail">
-      <h3>版本详情</h3>
-      <pre>{{ detail.draft }}</pre>
+      <div class="section-header">
+        <h3>版本详情</h3>
+        <button class="btn ghost" @click="detailCollapsed = !detailCollapsed">
+          {{ detailCollapsed ? "展开详情" : "收起详情" }}
+        </button>
+      </div>
+      <pre v-if="!detailCollapsed" class="detail-content">{{ detail.draft }}</pre>
+      <p v-else class="muted">已收起版本详情。</p>
     </div>
 
-    <DiffViewer v-if="diffText" :diff="diffText" />
+    <div class="card" v-if="diffText">
+      <div class="section-header">
+        <h3>差异对比</h3>
+        <button class="btn ghost" @click="diffCollapsed = !diffCollapsed">
+          {{ diffCollapsed ? "展开差异" : "收起差异" }}
+        </button>
+      </div>
+      <DiffViewer v-if="!diffCollapsed" :diff="diffText" :show-header="false" />
+      <p v-else class="muted">已收起差异详情。</p>
+    </div>
     <EmptyState v-else text="暂无差异内容" />
     <Toast :message="toast" />
   </section>
@@ -71,6 +86,8 @@ const error = ref("");
 const page = ref(1);
 const pageSize = 5;
 const compareTo = ref("");
+const detailCollapsed = ref(false);
+const diffCollapsed = ref(false);
 
 const filtered = computed(() => {
   if (!keyword.value) return versions.value;
@@ -109,6 +126,7 @@ const selectVersion = async (versionId: number) => {
     error.value = "";
     const res = await getVersion(versionId);
     detail.value = res.version;
+    detailCollapsed.value = false;
   } catch (err) {
     error.value = handleApiError(err);
     toast.value = error.value;
@@ -122,6 +140,7 @@ const showDiff = async (versionId: number) => {
     const compareId = compareTo.value ? Number(compareTo.value) : undefined;
     const res = await diffVersion(versionId, diffField.value, compareId);
     diffText.value = res.diff;
+    diffCollapsed.value = false;
   } catch (err) {
     error.value = handleApiError(err);
     toast.value = error.value;
@@ -152,3 +171,47 @@ const prevPage = () => {
 
 onMounted(loadVersions);
 </script>
+
+<style scoped>
+.page {
+  max-width: 1320px;
+  margin: 0 auto;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.section-header h3 {
+  margin: 0;
+}
+
+.filter-grid {
+  grid-template-columns: 1.4fr 1fr 0.9fr;
+}
+
+.detail-content {
+  margin-top: 12px;
+  font-size: 14px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  max-height: 560px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #f8fafc;
+}
+
+@media (max-width: 1100px) {
+  .filter-grid {
+    grid-template-columns: 1fr;
+  }
+}
+</style>

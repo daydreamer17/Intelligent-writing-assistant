@@ -8,6 +8,8 @@
 - **📝 智能写作流程**：WritingAgent → ReviewerAgent → EditorAgent 三阶段协作
 - **🔍 RAG 知识增强**：支持文档上传和向量检索，为写作提供知识支持
 - **📚 历史记录管理**：完整的版本历史记录和对比功能
+- **📈 离线检索评测**：支持上传标注集并计算 Recall/Precision/HitRate/MRR/nDCG
+- **🗂️ 评测历史持久化**：每次评测自动保存，可回放与删除历史结果
 - **🎯 多样化输出**：支持不同受众、风格和长度的内容定制
 - **💾 自动保存**：防止数据丢失的自动保存机制
 - **🔄 实时进度**：可视化的写作流程进度指示器
@@ -53,6 +55,8 @@
 - **RAG 引用与拒答机制**：支持 `RAG_CITATION_ENFORCE` 强制引用；检索不足时可触发拒答
 - **两段式证据生成**：强制引用开启时，先抽取证据，再基于证据生成内容
 - **GitHub MCP 接入**：支持将 GitHub 结果注入研究素材，并提供显式 MCP API
+- **评测可视化与失败样本分析**：前端直接展示各 K 曲线与逐 query 失败样本
+- **历史页可收起详情**：版本详情/差异对比/评测详情支持展开与收起
 
 ## 🛠️ 技术栈
 
@@ -69,6 +73,7 @@
   - LLM-based 重排序（Rerank）
   - 动态 Top-K 策略（语料规模自适应）
   - 引用强制和覆盖率检查
+  - 离线检索评测（Recall@K / Precision@K / HitRate@K / MRR / nDCG）
 
 ### 前端
 - **框架**：Vue 3 + TypeScript + Composition API
@@ -96,6 +101,7 @@ my_agent/
 │   │   ├── services/          # 业务逻辑层
 │   │   │   ├── pipeline_service.py      # 流程编排
 │   │   │   ├── rag_service.py          # RAG 服务（HyDE + Rerank）
+│   │   │   ├── retrieval_eval_service.py # 离线检索评测服务
 │   │   │   ├── research_service.py     # 研究笔记服务
 │   │   │   ├── citation_enforcer.py    # 引用强制和覆盖率检查
 │   │   │   ├── storage_service.py      # 存储服务
@@ -334,6 +340,9 @@ STORAGE_PATH=./data/app.db
 - [x] **超时配置优化**：解决 LLM 生成截断和流式内容覆盖问题
 - [x] **RAG Top-K 优化**：动态阈值调整，候选数优化，重排序过采样率提升
 - [x] **中文分词支持**：统一分词器接入 jieba，支持中文检索和引用匹配
+- [x] **离线检索评测**：支持上传标注集并可视化多 K 指标曲线与失败样本
+- [x] **评测历史管理**：评测结果自动入库，支持历史加载与删除
+- [x] **历史详情可收起**：版本详情/差异详情/评测详情支持收起与展开
 
 ### 🧪 已测试功能
 - [x] 文案编写功能（WritingAgent）
@@ -381,6 +390,10 @@ STORAGE_PATH=./data/app.db
 - `POST /api/rag/upload` - 上传文本内容
 - `POST /api/rag/upload-file` - 上传文档文件（.txt / .pdf / .docx / .md / .markdown）
 - `POST /api/rag/search` - 检索相关文档
+- `POST /api/rag/evaluate` - 运行离线检索评测
+- `GET /api/rag/evaluations` - 获取评测历史列表
+- `GET /api/rag/evaluations/{run_id}` - 获取单次评测详情
+- `DELETE /api/rag/evaluations/{run_id}` - 删除单次评测记录
 - `GET /api/rag/documents` - 列出所有文档
 - `DELETE /api/rag/documents/{doc_id}` - 删除文档
 
@@ -432,6 +445,24 @@ Agent 的 Prompt 定义在各自的类中，可以通过修改 `system_prompt` �
 
 ## 📝 更新日志
 
+### v0.4.0 (2026-02-10)
+**📊 评测与体验增强版**
+
+#### 离线检索评测增强
+- ✨ 新增 `POST /api/rag/evaluate` 标注集离线评测接口
+- ✨ 新增检索指标：Recall@K、Precision@K、HitRate@K、MRR、nDCG
+- ✨ 新增评测历史接口：`GET /api/rag/evaluations`、`GET /api/rag/evaluations/{run_id}`、`DELETE /api/rag/evaluations/{run_id}`
+- 💾 每次评测结果自动持久化到 SQLite，支持前端历史回放与删除
+
+#### 前端评测与历史体验优化
+- ✨ RAG 评测页支持曲线可视化与逐 Query 失败样本展示
+- ✨ 版本历史页与评测详情支持“展开/收起”而非依赖刷新页面
+- ✨ 差异视图优化为大字号、自动换行与分行高亮，避免横向滚动
+
+#### 生成链路稳定性补强
+- 🔧 Pipeline 与分步流式链路统一修复“流式未完成前页面结束”导致的展示截断
+- 🔧 引用覆盖率细化为 token/段落/语义三类指标，提升可解释性
+
 ### v0.3.0 (2026-02-08)
 **⚡ 性能优化专版**
 
@@ -463,13 +494,6 @@ Agent 的 Prompt 定义在各自的类中，可以通过修改 `system_prompt` �
 - ✨ 接入 `jieba` 分词库，支持中文分词
 - ✨ 覆盖范围：RAG 检索、重排序、引用匹配、覆盖率计算
 - 📊 **效果**：中文查询准确率提升 40%+
-
-#### 文档完善
-- 📚 新增 [TIMEOUT_CONFIG.md](TIMEOUT_CONFIG.md)：超时配置详解
-- 📚 新增 [RAG_IMPROVEMENTS.md](RAG_IMPROVEMENTS.md)：RAG 改进记录
-- 📚 新增 [RAG_TOPK_OPTIMIZATION.md](RAG_TOPK_OPTIMIZATION.md)：Top-K 优化分析
-- 📚 新增 [RAG_DYNAMIC_TOPK_IMPROVEMENTS.md](RAG_DYNAMIC_TOPK_IMPROVEMENTS.md)：动态 Top-K 改进方案
-- 📚 新增 [RAG_EVALUATION_REPORT.md](RAG_EVALUATION_REPORT.md)：RAG 系统评估报告
 
 ### v0.2.0 (2026-02-07)
 - ✨ 新增动态 RAG 检索策略（按语料规模动态调整检索 `top_k` 与候选数）

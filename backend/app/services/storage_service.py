@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import json
 from datetime import datetime
 from typing import Iterable, List, Optional
 
-from ..models.entities import CitationEntity, DocumentEntity, DraftVersion
+from ..models.entities import CitationEntity, DocumentEntity, DraftVersion, RetrievalEvalRun
 from .research_service import SourceDocument
 
 
@@ -57,6 +58,19 @@ class StorageService:
                 label TEXT NOT NULL,
                 title TEXT NOT NULL,
                 url TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS retrieval_eval_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                total_queries INTEGER NOT NULL,
+                queries_with_relevance INTEGER NOT NULL,
+                k_values_json TEXT NOT NULL,
+                macro_metrics_json TEXT NOT NULL,
+                per_query_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
             """
@@ -271,3 +285,85 @@ class StorageService:
             )
         self._conn.commit()
         return saved
+
+    def save_retrieval_eval_run(
+        self,
+        *,
+        total_queries: int,
+        queries_with_relevance: int,
+        k_values: list[int],
+        macro_metrics: list[dict],
+        per_query: list[dict],
+    ) -> int:
+        now = datetime.utcnow().isoformat()
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO retrieval_eval_runs (
+                total_queries,
+                queries_with_relevance,
+                k_values_json,
+                macro_metrics_json,
+                per_query_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(total_queries),
+                int(queries_with_relevance),
+                json.dumps(k_values, ensure_ascii=False),
+                json.dumps(macro_metrics, ensure_ascii=False),
+                json.dumps(per_query, ensure_ascii=False),
+                now,
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def list_retrieval_eval_runs(self, limit: int = 20) -> list[RetrievalEvalRun]:
+        cur = self._conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT * FROM retrieval_eval_runs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [
+            RetrievalEvalRun(
+                run_id=row["id"],
+                total_queries=row["total_queries"],
+                queries_with_relevance=row["queries_with_relevance"],
+                k_values_json=row["k_values_json"],
+                macro_metrics_json=row["macro_metrics_json"],
+                per_query_json=row["per_query_json"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def get_retrieval_eval_run(self, run_id: int) -> Optional[RetrievalEvalRun]:
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT * FROM retrieval_eval_runs WHERE id = ?",
+            (int(run_id),),
+        ).fetchone()
+        if not row:
+            return None
+        return RetrievalEvalRun(
+            run_id=row["id"],
+            total_queries=row["total_queries"],
+            queries_with_relevance=row["queries_with_relevance"],
+            k_values_json=row["k_values_json"],
+            macro_metrics_json=row["macro_metrics_json"],
+            per_query_json=row["per_query_json"],
+            created_at=row["created_at"],
+        )
+
+    def delete_retrieval_eval_run(self, run_id: int) -> bool:
+        cur = self._conn.cursor()
+        cur.execute("DELETE FROM retrieval_eval_runs WHERE id = ?", (int(run_id),))
+        self._conn.commit()
+        return cur.rowcount > 0

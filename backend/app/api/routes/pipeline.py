@@ -94,31 +94,91 @@ def _refusal_enabled() -> bool:
     return os.getenv("RAG_REFUSAL_ENABLED", "true").lower() in ("1", "true", "yes")
 
 
-def _should_refuse(query: str, sources: list[SourceDocument], researcher) -> bool:
+def _refusal_mode() -> str:
+    raw = os.getenv("RAG_REFUSAL_MODE", "fallback").strip().lower()
+    if raw in {"strict", "fallback"}:
+        return raw
+    return "fallback"
+
+
+def _base_should_refuse(report) -> bool:
     if not _refusal_enabled():
         return False
-    report = researcher.relevance_report(query, sources)
     min_terms = max(1, _parse_int("RAG_REFUSAL_MIN_QUERY_TERMS", 2))
     min_docs = max(1, _parse_int("RAG_REFUSAL_MIN_DOCS", 1))
     min_best = _parse_float("RAG_REFUSAL_MIN_RECALL", 0.1)
     min_avg = _parse_float("RAG_REFUSAL_MIN_AVG_RECALL", 0.05)
     if report.query_terms < min_terms:
-        logger.info(
-            "RAG refusal check skipped: terms=%s < min_terms=%s",
-            report.query_terms,
-            min_terms,
-        )
         return False
-    refused = report.docs < min_docs or report.best_recall < min_best or report.avg_recall < min_avg
+    return report.docs < min_docs or report.best_recall < min_best or report.avg_recall < min_avg
+
+
+def _fallback_should_refuse(report) -> bool:
+    min_terms = max(1, _parse_int("RAG_REFUSAL_MIN_QUERY_TERMS", 2))
+    min_docs = max(1, _parse_int("RAG_REFUSAL_FALLBACK_MIN_DOCS", 2))
+    min_best = _parse_float("RAG_REFUSAL_FALLBACK_MIN_RECALL", 0.12)
+    min_avg = _parse_float("RAG_REFUSAL_FALLBACK_MIN_AVG_RECALL", 0.06)
+    if report.query_terms < min_terms:
+        return False
+    return report.docs < min_docs or report.best_recall < min_best or report.avg_recall < min_avg
+
+
+def _log_refusal(report, *, refused: bool, context: str) -> None:
     logger.info(
-        "RAG refusal check: docs=%s terms=%s best=%.3f avg=%.3f -> %s",
+        "RAG refusal check (%s): docs=%s terms=%s mixed_best=%.3f mixed_avg=%.3f lex_best=%.3f tfidf_best=%.3f -> %s",
+        context,
         report.docs,
         report.query_terms,
         report.best_recall,
         report.avg_recall,
+        report.lexical_best,
+        report.tfidf_best,
         "refuse" if refused else "pass",
     )
-    return refused
+
+
+def _same_source_ids(left: list[SourceDocument], right: list[SourceDocument]) -> bool:
+    if len(left) != len(right):
+        return False
+    return [item.doc_id for item in left] == [item.doc_id for item in right]
+
+
+def _merge_sources(primary: list[SourceDocument], extra: list[SourceDocument]) -> list[SourceDocument]:
+    merged = list(primary)
+    seen = {item.doc_id for item in primary}
+    for doc in extra:
+        if doc.doc_id in seen:
+            continue
+        merged.append(doc)
+        seen.add(doc.doc_id)
+    return merged
+
+
+def _refusal_check_with_fallback(
+    *,
+    query: str,
+    sources: list[SourceDocument],
+    services: AppServices,
+) -> tuple[bool, list[SourceDocument]]:
+    report = services.pipeline.researcher.relevance_report(query, sources)
+    refused = _base_should_refuse(report)
+    _log_refusal(report, refused=refused, context="base")
+    if not refused or _refusal_mode() == "strict":
+        return refused, sources
+
+    fallback_top_k = max(5, _parse_int("RAG_REFUSAL_FALLBACK_TOP_K", 12))
+    fallback_docs = services.rag.search(query, top_k=fallback_top_k)
+    merged = _merge_sources(sources, fallback_docs)
+    fallback_report = services.pipeline.researcher.relevance_report(query, merged)
+    fallback_refused = _fallback_should_refuse(fallback_report)
+    _log_refusal(
+        fallback_report,
+        refused=fallback_refused,
+        context=f"fallback@{fallback_top_k}",
+    )
+    if not fallback_refused:
+        return False, merged
+    return True, sources
 
 
 def _github_note(context: str) -> ResearchNote:
@@ -257,11 +317,18 @@ def run_pipeline(
             sources=sources,
             review_criteria=payload.review_criteria,
         )
-        if github_context and not any(note.doc_id == "github:mcp" for note in result.research_notes):
-            result.research_notes.append(_github_note(github_context))
         apply_labels = os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes")
         refusal_query = f"{payload.topic}\n{result.outline.outline}"
-        if apply_labels and _should_refuse(refusal_query, sources, services.pipeline.researcher):
+        effective_sources = list(sources)
+        if apply_labels:
+            refused, effective_sources = _refusal_check_with_fallback(
+                query=refusal_query,
+                sources=effective_sources,
+                services=services,
+            )
+        else:
+            refused = False
+        if refused:
             refusal_text = _refusal_message()
             draft_result = DraftResult(
                 outline=result.draft_result.outline,
@@ -290,6 +357,32 @@ def run_pipeline(
                 coverage_detail=CoverageDetail(),
                 citation_enforced=False,
             )
+        if apply_labels and not _same_source_ids(sources, effective_sources):
+            refreshed_notes = services.pipeline.collect_research_notes(
+                payload.topic,
+                result.outline,
+                effective_sources,
+            )
+            if github_context and not any(note.doc_id == "github:mcp" for note in refreshed_notes):
+                refreshed_notes.append(_github_note(github_context))
+            refreshed_notes_text = services.pipeline.researcher.format_notes(refreshed_notes)
+            refreshed_draft = services.drafter.run_full(
+                topic=payload.topic,
+                outline=result.outline.outline,
+                research_notes=refreshed_notes_text,
+                constraints=constraints,
+                style=payload.style,
+                target_length=payload.target_length,
+                review_criteria=payload.review_criteria,
+                audience=payload.audience,
+            )
+            result = PipelineResult(
+                outline=result.outline,
+                research_notes=refreshed_notes,
+                draft_result=refreshed_draft,
+            )
+        elif github_context and not any(note.doc_id == "github:mcp" for note in result.research_notes):
+            result.research_notes.append(_github_note(github_context))
         enforced_text, report = _citation_enforcer.enforce(
             result.draft_result.revised or result.draft_result.draft,
             result.research_notes,
@@ -415,14 +508,26 @@ def run_pipeline_stream(
                 }
             )
 
+            apply_labels = os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes")
+            refusal_query = f"{payload.topic}\n{outline.outline}"
+            effective_sources = list(sources)
+            if apply_labels and effective_sources:
+                refused, effective_sources = _refusal_check_with_fallback(
+                    query=refusal_query,
+                    sources=effective_sources,
+                    services=services,
+                )
+            else:
+                refused = False
+
             q.put({"type": "status", "step": "research"})
-            if sources:
-                notes = services.pipeline.collect_research_notes(payload.topic, outline, sources)
+            if effective_sources:
+                notes = services.pipeline.collect_research_notes(payload.topic, outline, effective_sources)
             else:
                 notes = []
             if github_context and not any(note.doc_id == "github:mcp" for note in notes):
                 notes.append(_github_note(github_context))
-            task_status["research"] = None if not sources else bool(notes)
+            task_status["research"] = None if not effective_sources else bool(notes)
             notes_text = services.pipeline.researcher.format_notes(notes)
             q.put(
                 {
@@ -442,9 +547,7 @@ def run_pipeline_stream(
                 }
             )
 
-            apply_labels = os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes")
-            refusal_query = f"{payload.topic}\n{outline.outline}"
-            if apply_labels and _should_refuse(refusal_query, sources, services.pipeline.researcher):
+            if apply_labels and refused:
                 refusal_text = _refusal_message()
                 task_status["draft"] = False
                 task_status["review"] = False

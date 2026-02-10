@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 import re
+import json
 from uuid import UUID, uuid4
 
 import logging
@@ -15,12 +16,21 @@ from ...models.schemas import (
     SourceDocumentResponse,
     UploadDocumentsRequest,
     UploadDocumentsResponse,
+    RetrievalEvalRequest,
+    RetrievalEvalResponse,
+    RetrievalEvalCaseResult,
+    RetrievalMetricAtK,
+    RetrievalEvalRunsResponse,
+    RetrievalEvalRunSummaryResponse,
+    DeleteRetrievalEvalRunResponse,
 )
 from ...services.rag_service import UploadedDocument
+from ...services.retrieval_eval_service import EvalCase, RetrievalEvalService
 from ..deps import AppServices, get_services
 
 router = APIRouter(tags=["rag"])
 logger = logging.getLogger("app.rag")
+_eval_service = RetrievalEvalService()
 
 
 @router.post("/rag/upload", response_model=UploadDocumentsResponse)
@@ -83,6 +93,142 @@ def search_documents(
         logger.exception("RAG search failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+
+@router.post("/rag/evaluate", response_model=RetrievalEvalResponse)
+def evaluate_retrieval(
+    payload: RetrievalEvalRequest,
+    services: AppServices = Depends(get_services),
+) -> RetrievalEvalResponse:
+    try:
+        if not payload.cases:
+            raise HTTPException(status_code=422, detail="No evaluation cases provided")
+
+        k_values = [k for k in payload.k_values if k > 0] or [1, 3, 5]
+        max_k = max(k_values)
+
+        cases = [
+            EvalCase(
+                query=case.query,
+                relevant_doc_ids=case.relevant_doc_ids,
+                query_id=case.query_id,
+            )
+            for case in payload.cases
+            if case.query.strip()
+        ]
+        if not cases:
+            raise HTTPException(status_code=422, detail="All evaluation queries are empty")
+
+        report = _eval_service.evaluate(
+            cases=cases,
+            k_values=k_values,
+            search_fn=lambda query, top_k: services.rag.search(query, top_k=min(top_k, max_k)),
+        )
+
+        macro_metrics_data = [_metric_to_dict(item) for item in report.macro_metrics]
+        per_query_data = [
+            {
+                "query": row.query,
+                "query_id": row.query_id,
+                "relevant_count": row.relevant_count,
+                "retrieved_doc_ids": row.retrieved_doc_ids,
+                "metrics": [_metric_to_dict(m) for m in row.metrics],
+            }
+            for row in report.per_query
+        ]
+        run_id = services.storage.save_retrieval_eval_run(
+            total_queries=report.total_queries,
+            queries_with_relevance=report.queries_with_relevance,
+            k_values=report.k_values,
+            macro_metrics=macro_metrics_data,
+            per_query=per_query_data,
+        )
+        saved_row = services.storage.get_retrieval_eval_run(run_id)
+
+        return RetrievalEvalResponse(
+            eval_run_id=run_id,
+            created_at=saved_row.created_at if saved_row else "",
+            total_queries=report.total_queries,
+            queries_with_relevance=report.queries_with_relevance,
+            k_values=report.k_values,
+            macro_metrics=[_metric_from_dict(item) for item in macro_metrics_data],
+            per_query=[_case_result_from_dict(item) for item in per_query_data],
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("RAG evaluate failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/rag/evaluations", response_model=RetrievalEvalRunsResponse)
+def list_retrieval_evaluations(
+    limit: int = 20,
+    services: AppServices = Depends(get_services),
+) -> RetrievalEvalRunsResponse:
+    try:
+        runs = services.storage.list_retrieval_eval_runs(limit=limit)
+        response_runs = [
+            RetrievalEvalRunSummaryResponse(
+                run_id=row.run_id,
+                created_at=row.created_at,
+                total_queries=row.total_queries,
+                queries_with_relevance=row.queries_with_relevance,
+                k_values=_json_load_list(row.k_values_json, default=[]),
+                macro_metrics=[
+                    _metric_from_dict(item)
+                    for item in _json_load_list(row.macro_metrics_json, default=[])
+                ],
+            )
+            for row in runs
+        ]
+        return RetrievalEvalRunsResponse(runs=response_runs)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("RAG evaluations list failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/rag/evaluations/{run_id}", response_model=RetrievalEvalResponse)
+def get_retrieval_evaluation(
+    run_id: int,
+    services: AppServices = Depends(get_services),
+) -> RetrievalEvalResponse:
+    try:
+        row = services.storage.get_retrieval_eval_run(run_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Evaluation run not found")
+        macro_metrics_data = _json_load_list(row.macro_metrics_json, default=[])
+        per_query_data = _json_load_list(row.per_query_json, default=[])
+        return RetrievalEvalResponse(
+            eval_run_id=row.run_id,
+            created_at=row.created_at,
+            total_queries=row.total_queries,
+            queries_with_relevance=row.queries_with_relevance,
+            k_values=_json_load_list(row.k_values_json, default=[]),
+            macro_metrics=[_metric_from_dict(item) for item in macro_metrics_data],
+            per_query=[_case_result_from_dict(item) for item in per_query_data],
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("RAG evaluation detail failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.delete("/rag/evaluations/{run_id}", response_model=DeleteRetrievalEvalRunResponse)
+def delete_retrieval_evaluation(
+    run_id: int,
+    services: AppServices = Depends(get_services),
+) -> DeleteRetrievalEvalRunResponse:
+    try:
+        deleted = services.storage.delete_retrieval_eval_run(run_id)
+        return DeleteRetrievalEvalRunResponse(deleted=deleted)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("RAG evaluation delete failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 @router.get("/rag/documents", response_model=SearchDocumentsResponse)
 def list_documents(
@@ -234,3 +380,45 @@ def _extract_markdown_text(content_bytes: bytes) -> str:
     # Collapse excessive blank lines
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
+
+
+def _metric_to_dict(item: object) -> dict:
+    return {
+        "k": int(getattr(item, "k")),
+        "recall": float(getattr(item, "recall")),
+        "precision": float(getattr(item, "precision")),
+        "hit_rate": float(getattr(item, "hit_rate")),
+        "mrr": float(getattr(item, "mrr")),
+        "ndcg": float(getattr(item, "ndcg")),
+    }
+
+
+def _metric_from_dict(item: dict) -> RetrievalMetricAtK:
+    return RetrievalMetricAtK(
+        k=int(item.get("k", 0)),
+        recall=float(item.get("recall", 0.0)),
+        precision=float(item.get("precision", 0.0)),
+        hit_rate=float(item.get("hit_rate", 0.0)),
+        mrr=float(item.get("mrr", 0.0)),
+        ndcg=float(item.get("ndcg", 0.0)),
+    )
+
+
+def _case_result_from_dict(item: dict) -> RetrievalEvalCaseResult:
+    return RetrievalEvalCaseResult(
+        query=str(item.get("query", "")),
+        query_id=str(item.get("query_id", "")),
+        relevant_count=int(item.get("relevant_count", 0)),
+        retrieved_doc_ids=[str(v) for v in item.get("retrieved_doc_ids", [])],
+        metrics=[_metric_from_dict(m) for m in item.get("metrics", [])],
+    )
+
+
+def _json_load_list(raw: str, default: list) -> list:
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+        return default
+    except Exception:
+        return default

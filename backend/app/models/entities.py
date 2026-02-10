@@ -31,3 +31,14 @@ class CitationEntity:
     title: str
     url: str = ""
     created_at: str = ""
+
+
+@dataclass(frozen=True)
+class RetrievalEvalRun:
+    run_id: int
+    total_queries: int
+    queries_with_relevance: int
+    k_values_json: str
+    macro_metrics_json: str
+    per_query_json: str
+    created_at: str = ""

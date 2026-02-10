@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass
 from typing import Iterable, List, Tuple
 
+import httpx
+
 from ..utils.tokenizer import tokenize_for_citation
 from .research_service import ResearchNote
 from .vector_store import Embedder
@@ -89,6 +91,10 @@ class CitationEnforcer:
                 paragraph_tokens=paragraph_tokens,
                 labels=labels,
                 note_tokens=note_tokens,
+            )
+            enforced_paragraphs = self._append_missing_labels_tail(
+                paragraphs=enforced_paragraphs,
+                labels=labels,
             )
 
         total_paragraphs = len(enforced_paragraphs)
@@ -218,6 +224,25 @@ class CitationEnforcer:
                 best_idx = idx
         return best_idx
 
+    def _append_missing_labels_tail(
+        self,
+        *,
+        paragraphs: List[str],
+        labels: List[str],
+    ) -> List[str]:
+        used = _labels_in_text("\n".join(paragraphs), labels)
+        missing = [label for label in labels if label not in used]
+        if not missing:
+            return paragraphs
+
+        if not _parse_bool_env("RAG_CITATION_APPEND_MISSING_TO_TAIL", True):
+            return paragraphs
+
+        prefix = os.getenv("RAG_CITATION_TAIL_PREFIX", "引用补全")
+        tail = f"{prefix}: {' '.join(missing)}"
+        logger.info("Citation tail backfill appended missing labels: %s", " ".join(missing))
+        return [*paragraphs, tail]
+
     def _semantic_coverage(
         self,
         *,
@@ -232,12 +257,16 @@ class CitationEnforcer:
         max_paragraphs = max(1, _parse_int_env("RAG_COVERAGE_SEMANTIC_MAX_PARAGRAPHS", 20))
         max_notes = max(1, _parse_int_env("RAG_COVERAGE_SEMANTIC_MAX_NOTES", 12))
         threshold = _parse_float_env("RAG_COVERAGE_SEMANTIC_THRESHOLD", 0.25)
-        para_slice = paragraphs[:max_paragraphs]
-        note_texts = [(note.title + " " + note.summary).strip() for note in notes[:max_notes]]
-        try:
-            embeddings = embedder.embed(para_slice + note_texts)
-        except Exception as exc:
-            logger.warning("Semantic coverage failed: %s", exc)
+        batch_size = max(1, _parse_int_env("RAG_COVERAGE_SEMANTIC_BATCH_SIZE", 8))
+        max_text_chars = max(200, _parse_int_env("RAG_COVERAGE_SEMANTIC_MAX_TEXT_CHARS", 2000))
+        para_slice = [_trim_text(item, max_text_chars) for item in paragraphs[:max_paragraphs]]
+        note_texts = [
+            _trim_text((note.title + " " + note.summary).strip(), max_text_chars)
+            for note in notes[:max_notes]
+        ]
+        texts = para_slice + note_texts
+        embeddings = self._embed_texts_robust(embedder=embedder, texts=texts, batch_size=batch_size)
+        if embeddings is None:
             return None
         para_vecs = embeddings[: len(para_slice)]
         note_vecs = embeddings[len(para_slice) :]
@@ -249,6 +278,38 @@ class CitationEnforcer:
             if best >= threshold:
                 covered += 1
         return covered / len(para_slice) if para_slice else 0.0
+
+    def _embed_texts_robust(
+        self,
+        *,
+        embedder: Embedder,
+        texts: List[str],
+        batch_size: int,
+    ) -> List[List[float]] | None:
+        vectors: List[List[float]] = []
+        try:
+            for start in range(0, len(texts), batch_size):
+                part = texts[start : start + batch_size]
+                vectors.extend(embedder.embed(part))
+            if len(vectors) == len(texts):
+                return vectors
+            logger.warning(
+                "Semantic coverage embedding size mismatch: vectors=%s texts=%s",
+                len(vectors),
+                len(texts),
+            )
+        except Exception as exc:
+            logger.warning("Semantic coverage batch embedding failed: %s", _format_http_error(exc))
+
+        # Fallback to per-item embedding so one bad batch does not disable the whole metric.
+        single_vectors: List[List[float]] = []
+        for item in texts:
+            try:
+                single_vectors.append(embedder.embed_one(item))
+            except Exception as exc:
+                logger.warning("Semantic coverage single embedding failed: %s", _format_http_error(exc))
+                return None
+        return single_vectors
 
 
 def _split_paragraphs(text: str) -> List[str]:
@@ -313,3 +374,22 @@ def _cosine(left: List[float], right: List[float]) -> float:
     if left_norm == 0.0 or right_norm == 0.0:
         return 0.0
     return dot / ((left_norm ** 0.5) * (right_norm ** 0.5))
+
+
+def _trim_text(text: str, max_chars: int) -> str:
+    value = (text or "").strip()
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars]
+
+
+def _format_http_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            body = exc.response.text
+        except Exception:
+            body = ""
+        if body:
+            return f"{exc} | body={body[:300]}"
+        return str(exc)
+    return str(exc)

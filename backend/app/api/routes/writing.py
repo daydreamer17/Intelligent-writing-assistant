@@ -36,6 +36,13 @@ def _refusal_enabled() -> bool:
     return os.getenv("RAG_REFUSAL_ENABLED", "true").lower() in ("1", "true", "yes")
 
 
+def _refusal_mode() -> str:
+    raw = os.getenv("RAG_REFUSAL_MODE", "fallback").strip().lower()
+    if raw in {"strict", "fallback"}:
+        return raw
+    return "fallback"
+
+
 def _refusal_message() -> str:
     return "在提供的文档中，无法找到该问题的答案。"
 
@@ -82,7 +89,8 @@ def _log_refusal(report: RelevanceReport, *, refused: bool, context: str) -> Non
     status = "refuse" if refused else "pass"
     print(
         f"[RAG][refusal:{status}] context={context} docs={report.docs} terms={report.query_terms} "
-        f"best={report.best_recall:.3f} avg={report.avg_recall:.3f}"
+        f"mixed_best={report.best_recall:.3f} mixed_avg={report.avg_recall:.3f} "
+        f"lex_best={report.lexical_best:.3f} tfidf_best={report.tfidf_best:.3f}"
     )
 
 
@@ -116,11 +124,42 @@ def _rag_refusal_check(
     query: str,
     services: AppServices,
 ) -> tuple[bool, List[SourceDocument]]:
-    docs = services.rag.search(query, top_k=_citation_top_k())
+    base_top_k = _citation_top_k()
+    docs = services.rag.search(query, top_k=base_top_k)
     report = _researcher.relevance_report(query, docs)
     refused = _should_refuse(report)
-    _log_refusal(report, refused=refused, context="writing")
-    return refused, docs
+    _log_refusal(report, refused=refused, context=f"writing:base@{base_top_k}")
+    if not refused or _refusal_mode() == "strict":
+        return refused, docs
+
+    fallback_top_k = max(base_top_k, _parse_int("RAG_REFUSAL_FALLBACK_TOP_K", base_top_k * 2))
+    fallback_docs = services.rag.search(query, top_k=fallback_top_k)
+    fallback_report = _researcher.relevance_report(query, fallback_docs)
+    fallback_refused = _should_refuse_fallback(fallback_report)
+    _log_refusal(
+        fallback_report,
+        refused=fallback_refused,
+        context=f"writing:fallback@{fallback_top_k}",
+    )
+    if not fallback_refused:
+        return False, fallback_docs
+    return True, docs
+
+
+def _should_refuse_fallback(report: RelevanceReport) -> bool:
+    min_terms = max(1, _parse_int("RAG_REFUSAL_MIN_QUERY_TERMS", 2))
+    min_docs = max(1, _parse_int("RAG_REFUSAL_FALLBACK_MIN_DOCS", 2))
+    min_best = _parse_float("RAG_REFUSAL_FALLBACK_MIN_RECALL", 0.12)
+    min_avg = _parse_float("RAG_REFUSAL_FALLBACK_MIN_AVG_RECALL", 0.06)
+    if report.query_terms < min_terms:
+        return False
+    if report.docs < min_docs:
+        return True
+    if report.best_recall < min_best:
+        return True
+    if report.avg_recall < min_avg:
+        return True
+    return False
 
 
 def _build_evidence_from_rag(

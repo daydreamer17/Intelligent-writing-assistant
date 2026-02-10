@@ -18,6 +18,9 @@ FastAPI backend for a multi-agent writing pipeline (plan -> draft -> review -> r
 - Coverage metrics returned from pipeline (`coverage` + `coverage_detail`)
 - GitHub MCP integration and explicit MCP APIs (`/api/mcp/github/*`)
 - Unified Chinese tokenization via `jieba` for retrieval and citation matching
+- Offline retrieval evaluation API (`/api/rag/evaluate`) with Recall/Precision/HitRate/MRR/nDCG
+- Retrieval evaluation history persistence in SQLite (`/api/rag/evaluations*`)
+- RAG file upload now supports `.txt / .pdf / .docx / .md / .markdown` with markdown-to-plain-text extraction
 
 ## Project Layout
 ```
@@ -149,17 +152,27 @@ Embeddings (used by Qdrant when `EMBEDDING_PROVIDER` is not `hash`):
 
 ### Citation/coverage/refusal (optional)
 - `RAG_CITATION_ENFORCE`
+- `RAG_CITATION_REQUIRE_ALL_LABELS`
+- `RAG_CITATION_APPEND_MISSING_TO_TAIL`
+- `RAG_CITATION_TAIL_PREFIX`
 - `RAG_CITATION_TOP_K`
 - `RAG_COVERAGE_THRESHOLD`
 - `RAG_COVERAGE_SEMANTIC_ENABLED`
 - `RAG_COVERAGE_SEMANTIC_THRESHOLD`
 - `RAG_COVERAGE_SEMANTIC_MAX_PARAGRAPHS`
 - `RAG_COVERAGE_SEMANTIC_MAX_NOTES`
+- `RAG_COVERAGE_SEMANTIC_BATCH_SIZE`
+- `RAG_COVERAGE_SEMANTIC_MAX_TEXT_CHARS`
 - `RAG_REFUSAL_ENABLED`
+- `RAG_REFUSAL_MODE` (`strict` | `fallback`)
 - `RAG_REFUSAL_MIN_QUERY_TERMS`
 - `RAG_REFUSAL_MIN_DOCS`
 - `RAG_REFUSAL_MIN_RECALL`
 - `RAG_REFUSAL_MIN_AVG_RECALL`
+- `RAG_REFUSAL_FALLBACK_TOP_K`
+- `RAG_REFUSAL_FALLBACK_MIN_DOCS`
+- `RAG_REFUSAL_FALLBACK_MIN_RECALL`
+- `RAG_REFUSAL_FALLBACK_MIN_AVG_RECALL`
 - `RAG_EVIDENCE_MAX_ITEMS`
 - `RAG_EVIDENCE_MAX_CHARS`
 - `RAG_EVIDENCE_MAX_TOKENS`
@@ -167,6 +180,7 @@ Embeddings (used by Qdrant when `EMBEDDING_PROVIDER` is not `hash`):
 ### GitHub MCP (optional)
 - `MCP_GITHUB_ENABLED=true|false`
 - `GITHUB_PERSONAL_ACCESS_TOKEN` (required when enabled)
+- `MCP_GITHUB_TOOL_SCOPE` (`search` | `all`)
 
 ### Example `.env`
 ```env
@@ -223,6 +237,10 @@ All routes are prefixed with `/api`.
 - `POST /api/rag/upload` (JSON documents)
 - `POST /api/rag/upload-file` (files: .txt / .pdf / .docx / .md / .markdown)
 - `POST /api/rag/search`
+- `POST /api/rag/evaluate`
+- `GET /api/rag/evaluations`
+- `GET /api/rag/evaluations/{run_id}`
+- `DELETE /api/rag/evaluations/{run_id}`
 - `GET /api/rag/documents`
 - `DELETE /api/rag/documents/{doc_id}`
 
@@ -255,6 +273,7 @@ Streaming endpoints return `text/event-stream` with JSON events like:
 - PDF and DOCX parsing requires `pypdf` and `python-docx` (already in `requirements.txt`).
 - Qdrant collections must match `QDRANT_EMBED_DIM` and `QDRANT_DISTANCE`.
 - Pipeline logs include Task Success Rate and RAG refusal check details.
+- Retrieval evaluation runs are saved in SQLite table `retrieval_eval_runs`.
 
 ## Docs
 - Swagger UI: `http://localhost:8000/docs`

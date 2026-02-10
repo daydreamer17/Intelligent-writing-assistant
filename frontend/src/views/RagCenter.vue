@@ -10,6 +10,7 @@
       <RagSearch @error="setError" />
     </div>
     <RagLibrary ref="libraryRef" @error="setError" />
+    <RagEvaluator @error="setError" />
 
     <div v-if="error" class="muted">错误：{{ error }}</div>
     <Toast :message="toast" />
@@ -21,6 +22,7 @@ import { ref } from "vue";
 import RagUploader from "../components/RagUploader.vue";
 import RagSearch from "../components/RagSearch.vue";
 import RagLibrary from "../components/RagLibrary.vue";
+import RagEvaluator from "../components/RagEvaluator.vue";
 import Toast from "../components/Toast.vue";
 const error = ref("");
 const toast = ref("");

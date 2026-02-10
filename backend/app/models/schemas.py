@@ -130,6 +130,60 @@ class SearchDocumentsResponse(BaseModel):
     documents: list[SourceDocumentResponse] = Field(default_factory=list)
 
 
+class RetrievalEvalCaseInput(BaseModel):
+    query: str = Field(..., description="Retrieval query")
+    relevant_doc_ids: list[str] = Field(default_factory=list, description="Relevant document IDs")
+    query_id: str = Field("", description="Optional query sample ID")
+
+
+class RetrievalMetricAtK(BaseModel):
+    k: int
+    recall: float
+    precision: float
+    hit_rate: float
+    mrr: float
+    ndcg: float
+
+
+class RetrievalEvalCaseResult(BaseModel):
+    query: str
+    query_id: str = ""
+    relevant_count: int
+    retrieved_doc_ids: list[str] = Field(default_factory=list)
+    metrics: list[RetrievalMetricAtK] = Field(default_factory=list)
+
+
+class RetrievalEvalRequest(BaseModel):
+    cases: list[RetrievalEvalCaseInput] = Field(default_factory=list)
+    k_values: list[int] = Field(default_factory=lambda: [1, 3, 5], description="K values to evaluate")
+
+
+class RetrievalEvalResponse(BaseModel):
+    eval_run_id: int | None = None
+    created_at: str = ""
+    total_queries: int
+    queries_with_relevance: int
+    k_values: list[int] = Field(default_factory=list)
+    macro_metrics: list[RetrievalMetricAtK] = Field(default_factory=list)
+    per_query: list[RetrievalEvalCaseResult] = Field(default_factory=list)
+
+
+class RetrievalEvalRunSummaryResponse(BaseModel):
+    run_id: int
+    created_at: str = ""
+    total_queries: int
+    queries_with_relevance: int
+    k_values: list[int] = Field(default_factory=list)
+    macro_metrics: list[RetrievalMetricAtK] = Field(default_factory=list)
+
+
+class RetrievalEvalRunsResponse(BaseModel):
+    runs: list[RetrievalEvalRunSummaryResponse] = Field(default_factory=list)
+
+
+class DeleteRetrievalEvalRunResponse(BaseModel):
+    deleted: bool
+
 class DeleteDocumentResponse(BaseModel):
     deleted: bool
 
@@ -206,3 +260,4 @@ class MCPToolCallResponse(BaseModel):
 class MCPToolsResponse(BaseModel):
     tools: list[dict[str, str]] = Field(default_factory=list)
     raw: str = ""
+
