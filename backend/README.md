@@ -21,6 +21,10 @@ FastAPI backend for a multi-agent writing pipeline (plan -> draft -> review -> r
 - Offline retrieval evaluation API (`/api/rag/evaluate`) with Recall/Precision/HitRate/MRR/nDCG
 - Retrieval evaluation history persistence in SQLite (`/api/rag/evaluations*`)
 - RAG file upload now supports `.txt / .pdf / .docx / .md / .markdown` with markdown-to-plain-text extraction
+- Session-isolated conversation memory with TTL cleanup (`CONVERSATION_MEMORY_MODE=session`)
+- Cold-store recall injection (deferred memory can be retrieved back into prompt context)
+- Session memory reset API (`POST /api/settings/session-memory/clear`) and frontend reset button
+- Retrieval mode split (`RETRIEVAL_MODE=sqlite_only|hybrid`) decoupled from conversation memory mode
 
 ## Project Layout
 ```
@@ -84,16 +88,32 @@ Create a `.env` file in `backend/` (or copy from `.env.example` if you have one)
 ### Storage
 - `STORAGE_PATH` (default `data/app.db`)
 
-### Memory / Vector Store
-- `MEMORY_MODE=short_term` (SQLite only)
-- `MEMORY_MODE=long_term` (SQLite + Qdrant if configured)
+### Retrieval + Conversation Memory
+- `RETRIEVAL_MODE=sqlite_only|hybrid`
+- `CONVERSATION_MEMORY_MODE=session|global`
+- `MEMORY_MODE` remains as a legacy compatibility flag (auto-derived from `RETRIEVAL_MODE`)
+
+Conversation memory controls:
+- `LLM_SESSION_MAX_AGENTS` (session agent pool size)
+- `LLM_SESSION_TTL_SECONDS` (session agent TTL)
+- `LLM_SESSION_MAX_HISTORY_MESSAGES` (per-session history cap)
+- `LLM_SESSION_MAX_HISTORY_CHARS` (per-session character cap)
+
+Cold-store memory controls:
+- `LLM_COLD_STORE_ENABLED`
+- `LLM_COLD_STORE_PATH`
+- `LLM_COLD_STORE_MAX_CHARS`
+- `LLM_COLD_RECALL_ENABLED`
+- `LLM_COLD_RECALL_TOP_K`
+- `LLM_COLD_RECALL_MAX_CHARS`
+- `LLM_COLD_RECALL_LOOKBACK`
 
 **RAG storage behavior**
 - SQLite always stores the document text, titles, metadata, and version history.
-- Qdrant is used only for vector search when `MEMORY_MODE=long_term` and `QDRANT_URL` is set.
+- Qdrant is used for vector retrieval when `RETRIEVAL_MODE=hybrid` and `QDRANT_URL` is set.
 - If Qdrant is unavailable, the system falls back to SQLite keyword search, but still stores all documents in SQLite.
 
-Qdrant (enabled when `MEMORY_MODE=long_term` and `QDRANT_URL` is set):
+Qdrant (enabled when `RETRIEVAL_MODE=hybrid` and `QDRANT_URL` is set):
 - `QDRANT_URL`
 - `QDRANT_API_KEY` (optional)
 - `QDRANT_COLLECTION` (default `writing_memory`)
@@ -181,6 +201,8 @@ Embeddings (used by Qdrant when `EMBEDDING_PROVIDER` is not `hash`):
 - `MCP_GITHUB_ENABLED=true|false`
 - `GITHUB_PERSONAL_ACCESS_TOKEN` (required when enabled)
 - `MCP_GITHUB_TOOL_SCOPE` (`search` | `all`)
+- `MCP_GITHUB_MAX_TOOLS` (limit expanded tool count)
+- `LLM_AGENT_TOOL_CALLING_ENABLED` (enable/disable agent-side tool calling in generation pipeline)
 
 ### Example `.env`
 ```env
@@ -195,7 +217,8 @@ LLM_MAX_CONTEXT_TOKENS=32768
 LLM_INPUT_SAFETY_MARGIN=8000
 LLM_CHARS_PER_TOKEN=0.6
 
-MEMORY_MODE=long_term
+RETRIEVAL_MODE=hybrid
+CONVERSATION_MEMORY_MODE=session
 QDRANT_URL=http://localhost:6333
 QDRANT_COLLECTION=writing_memory
 QDRANT_EMBED_DIM=256
@@ -250,6 +273,7 @@ All routes are prefixed with `/api`.
 ### Settings
 - `GET /api/settings/citation`
 - `POST /api/settings/citation`
+- `POST /api/settings/session-memory/clear`
 
 ### Versions
 - `GET /api/versions`
@@ -274,6 +298,7 @@ Streaming endpoints return `text/event-stream` with JSON events like:
 - Qdrant collections must match `QDRANT_EMBED_DIM` and `QDRANT_DISTANCE`.
 - Pipeline logs include Task Success Rate and RAG refusal check details.
 - Retrieval evaluation runs are saved in SQLite table `retrieval_eval_runs`.
+- In `session` mode, pass `session_id` from frontend to keep memory isolated per task/user.
 
 ## Docs
 - Swagger UI: `http://localhost:8000/docs`

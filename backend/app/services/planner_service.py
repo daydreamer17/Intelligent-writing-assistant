@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from ..agents.writing_agent import WritingAgent
 
@@ -26,6 +26,9 @@ class PlanningService:
         target_length: str = "",
         constraints: str = "",
         key_points: str = "",
+        max_tokens: int | None = None,
+        max_input_chars: int | None = None,
+        session_id: str = "",
     ) -> OutlinePlan:
         prompt = self._build_prompt(
             topic=topic,
@@ -35,8 +38,60 @@ class PlanningService:
             constraints=constraints,
             key_points=key_points,
         )
-        response = self.agent.run(prompt)
+        response = self.agent.run(
+            prompt,
+            session_id=session_id,
+            max_tokens=max_tokens,
+            max_input_chars=max_input_chars,
+        )
         outline, assumptions, questions = self._split_sections(response)
+        return OutlinePlan(outline=outline, assumptions=assumptions, open_questions=questions)
+
+    def plan_outline_stream(
+        self,
+        *,
+        topic: str,
+        audience: str = "",
+        style: str = "",
+        target_length: str = "",
+        constraints: str = "",
+        key_points: str = "",
+        max_tokens: int | None = None,
+        max_input_chars: int | None = None,
+        session_id: str = "",
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> OutlinePlan:
+        prompt = self._build_prompt(
+            topic=topic,
+            audience=audience,
+            style=style,
+            target_length=target_length,
+            constraints=constraints,
+            key_points=key_points,
+        )
+        chunks: list[str] = []
+        for chunk in self.agent.stream(
+            prompt,
+            session_id=session_id,
+            max_tokens=max_tokens,
+            max_input_chars=max_input_chars,
+        ):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            if on_chunk is not None:
+                on_chunk(chunk)
+        text = "".join(chunks).strip()
+        if not text:
+            text = self.agent.run(
+                prompt,
+                session_id=session_id,
+                max_tokens=max_tokens,
+                max_input_chars=max_input_chars,
+            )
+            if on_chunk is not None and text:
+                on_chunk(text)
+        outline, assumptions, questions = self._split_sections(text)
         return OutlinePlan(outline=outline, assumptions=assumptions, open_questions=questions)
 
     def _build_prompt(

@@ -33,6 +33,7 @@ class PlanRequest(BaseModel):
     target_length: str = Field("", description="目标长度")
     constraints: str = Field("", description="限制条件")
     key_points: str = Field("", description="关键要点")
+    session_id: str = Field("", description="会话ID（用于隔离记忆）")
 
 
 class PlanResponse(BaseModel):
@@ -48,6 +49,7 @@ class DraftRequest(BaseModel):
     constraints: str = Field("", description="限制条件")
     style: str = Field("", description="写作风格")
     target_length: str = Field("", description="目标长度")
+    session_id: str = Field("", description="会话ID（用于隔离记忆）")
 
 
 class DraftResponse(BaseModel):
@@ -59,6 +61,7 @@ class ReviewRequest(BaseModel):
     criteria: str = Field("", description="审校标准")
     sources: str = Field("", description="可用来源")
     audience: str = Field("", description="目标读者")
+    session_id: str = Field("", description="会话ID（用于隔离记忆）")
 
 
 class ReviewResponse(BaseModel):
@@ -70,6 +73,7 @@ class RewriteRequest(BaseModel):
     guidance: str = Field("", description="改写指导")
     style: str = Field("", description="写作风格")
     target_length: str = Field("", description="目标长度")
+    session_id: str = Field("", description="会话ID（用于隔离记忆）")
 
 
 class RewriteResponse(BaseModel):
@@ -85,6 +89,7 @@ class PipelineRequest(BaseModel):
     key_points: str = Field("", description="关键要点")
     review_criteria: str = Field("", description="审校标准")
     sources: list[SourceDocumentInput] = Field(default_factory=list, description="可用资料源")
+    session_id: str = Field("", description="会话ID（用于隔离记忆）")
 
 
 class CoverageDetail(BaseModel):
@@ -246,6 +251,18 @@ class CitationSettingRequest(BaseModel):
 
 class CitationSettingResponse(BaseModel):
     enabled: bool
+
+
+class SessionMemoryClearRequest(BaseModel):
+    session_id: str = Field("", description="会话ID；为空时清理默认会话")
+    drop_agent: bool = Field(True, description="是否同时移除会话实例")
+    clear_cold: bool = Field(False, description="是否清理该会话的冷存记忆")
+
+
+class SessionMemoryClearResponse(BaseModel):
+    session_id: str
+    cleared: bool
+    cleared_agents: list[str] = Field(default_factory=list)
 
 
 class MCPToolCallRequest(BaseModel):

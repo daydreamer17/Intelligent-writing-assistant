@@ -51,6 +51,9 @@ class ReviewerAgent(BaseWritingAgent):
         criteria: str = "",
         sources: str = "",
         audience: str = "",
+        max_tokens: Optional[int] = None,
+        max_input_chars: Optional[int] = None,
+        session_id: str = "",
     ) -> str:
         # 截断过长的内容以避免超过模型限制
         max_draft_chars = 15000  # 约 6000 tokens
@@ -75,7 +78,12 @@ class ReviewerAgent(BaseWritingAgent):
             "Highlight factual claims that need citations.\n\n"
             + "\n\n".join(parts)
         )
-        return self.run(prompt)
+        return self.run(
+            prompt,
+            session_id=session_id,
+            max_tokens=max_tokens,
+            max_input_chars=max_input_chars,
+        )
 
     def review_stream(
         self,
@@ -85,6 +93,8 @@ class ReviewerAgent(BaseWritingAgent):
         sources: str = "",
         audience: str = "",
         max_tokens: Optional[int] = None,
+        max_input_chars: Optional[int] = None,
+        session_id: str = "",
     ):
         # 截断过长的内容以避免超过模型限制
         max_draft_chars = 15000  # 约 6000 tokens
@@ -109,4 +119,9 @@ class ReviewerAgent(BaseWritingAgent):
             "Highlight factual claims that need citations.\n\n"
             + "\n\n".join(parts)
         )
-        yield from self.stream(prompt, max_tokens=max_tokens)
+        yield from self.stream(
+            prompt,
+            max_tokens=max_tokens,
+            max_input_chars=max_input_chars,
+            session_id=session_id,
+        )

@@ -14,7 +14,12 @@ class AppConfig:
     llm_timeout: float = 60.0
     llm_max_tokens: Optional[int] = None
     storage_path: str = "data/app.db"
+    # Legacy flag (kept for backward compatibility). Prefer RETRIEVAL_MODE.
     memory_mode: str = "short_term"
+    # Retrieval backend mode: sqlite_only | hybrid
+    retrieval_mode: str = "sqlite_only"
+    # Conversation memory mode: session | global
+    conversation_memory_mode: str = "session"
     qdrant_url: str = ""
     qdrant_api_key: str = ""
     qdrant_collection: str = "writing_memory"
@@ -48,6 +53,20 @@ class AppConfig:
         if github_token and os.getenv("MCP_GITHUB_ENABLED") is None:
             github_mcp_enabled = True
 
+        legacy_memory_mode = os.getenv("MEMORY_MODE", "short_term").strip().lower()
+        retrieval_mode_raw = os.getenv("RETRIEVAL_MODE", "").strip().lower()
+        if not retrieval_mode_raw:
+            retrieval_mode_raw = "hybrid" if legacy_memory_mode == "long_term" else "sqlite_only"
+        if retrieval_mode_raw not in {"sqlite_only", "hybrid"}:
+            retrieval_mode_raw = "sqlite_only"
+
+        conversation_mode_raw = os.getenv("CONVERSATION_MEMORY_MODE", "session").strip().lower()
+        if conversation_mode_raw not in {"session", "global"}:
+            conversation_mode_raw = "session"
+
+        # Keep exposing legacy memory_mode for compatibility with existing code/logs.
+        legacy_mode_compat = "long_term" if retrieval_mode_raw == "hybrid" else "short_term"
+
         return AppConfig(
             llm_provider=os.getenv("LLM_PROVIDER", ""),
             llm_model=os.getenv("LLM_MODEL", ""),
@@ -56,7 +75,9 @@ class AppConfig:
             llm_timeout=float(os.getenv("LLM_TIMEOUT", "60")),
             llm_max_tokens=_parse_int(os.getenv("LLM_MAX_TOKENS", "")),
             storage_path=os.getenv("STORAGE_PATH", "data/app.db"),
-            memory_mode=os.getenv("MEMORY_MODE", "short_term"),
+            memory_mode=legacy_mode_compat,
+            retrieval_mode=retrieval_mode_raw,
+            conversation_memory_mode=conversation_mode_raw,
             qdrant_url=os.getenv("QDRANT_URL", ""),
             qdrant_api_key=os.getenv("QDRANT_API_KEY", ""),
             qdrant_collection=os.getenv("QDRANT_COLLECTION", "writing_memory"),

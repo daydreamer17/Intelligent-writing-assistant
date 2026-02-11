@@ -43,6 +43,15 @@ class WritingPipeline:
         key_points: str = "",
         sources: Iterable[SourceDocument] | None = None,
         review_criteria: str = "",
+        plan_max_tokens: int | None = None,
+        draft_max_tokens: int | None = None,
+        review_max_tokens: int | None = None,
+        rewrite_max_tokens: int | None = None,
+        plan_max_input_chars: int | None = None,
+        draft_max_input_chars: int | None = None,
+        review_max_input_chars: int | None = None,
+        rewrite_max_input_chars: int | None = None,
+        session_id: str = "",
     ) -> PipelineResult:
         outline = self.planner.plan_outline(
             topic=topic,
@@ -51,6 +60,9 @@ class WritingPipeline:
             target_length=target_length,
             constraints=constraints,
             key_points=key_points,
+            max_tokens=plan_max_tokens,
+            max_input_chars=plan_max_input_chars,
+            session_id=session_id,
         )
 
         _pipeline_throttle()
@@ -69,6 +81,15 @@ class WritingPipeline:
             target_length=target_length,
             review_criteria=review_criteria,
             audience=audience,
+            plan_max_tokens=plan_max_tokens,
+            draft_max_tokens=draft_max_tokens,
+            review_max_tokens=review_max_tokens,
+            rewrite_max_tokens=rewrite_max_tokens,
+            plan_max_input_chars=plan_max_input_chars,
+            draft_max_input_chars=draft_max_input_chars,
+            review_max_input_chars=review_max_input_chars,
+            rewrite_max_input_chars=rewrite_max_input_chars,
+            session_id=session_id,
         )
 
         return PipelineResult(outline=outline, research_notes=notes, draft_result=draft_result)

@@ -5,6 +5,7 @@ export interface PlanRequest {
   target_length?: string;
   constraints?: string;
   key_points?: string;
+  session_id?: string;
 }
 
 export interface PlanResponse {
@@ -20,6 +21,7 @@ export interface DraftRequest {
   constraints?: string;
   style?: string;
   target_length?: string;
+  session_id?: string;
 }
 
 export interface DraftResponse {
@@ -31,6 +33,7 @@ export interface ReviewRequest {
   criteria?: string;
   sources?: string;
   audience?: string;
+  session_id?: string;
 }
 
 export interface ReviewResponse {
@@ -42,6 +45,7 @@ export interface RewriteRequest {
   guidance?: string;
   style?: string;
   target_length?: string;
+  session_id?: string;
 }
 
 export interface RewriteResponse {

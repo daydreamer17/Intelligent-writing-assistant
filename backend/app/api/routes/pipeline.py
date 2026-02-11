@@ -90,6 +90,31 @@ def _parse_int(name: str, default: int) -> int:
         return default
 
 
+def _parse_optional_int(name: str) -> int | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _pipeline_max_tokens(stage: str) -> int | None:
+    stage = stage.upper()
+    return _parse_optional_int(f"PIPELINE_{stage}_MAX_TOKENS") or _parse_optional_int(
+        f"STAGE_{stage}_MAX_TOKENS"
+    )
+
+
+def _pipeline_max_input_chars(stage: str) -> int | None:
+    stage = stage.upper()
+    return _parse_optional_int(f"PIPELINE_{stage}_MAX_INPUT_CHARS") or _parse_optional_int(
+        f"STAGE_{stage}_MAX_INPUT_CHARS"
+    )
+
+
 def _refusal_enabled() -> bool:
     return os.getenv("RAG_REFUSAL_ENABLED", "true").lower() in ("1", "true", "yes")
 
@@ -275,6 +300,25 @@ def run_pipeline(
     }
     succeeded = False
     try:
+        t0 = time.perf_counter()
+        logger.info(
+            "pipeline start: session_id=%s topic_len=%s source_count=%s citation_enforce=%s",
+            payload.session_id or "__default__",
+            len(payload.topic or ""),
+            len(payload.sources or []),
+            os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes"),
+        )
+        logger.info(
+            "pipeline budget: plan(t=%s,c=%s) draft(t=%s,c=%s) review(t=%s,c=%s) rewrite(t=%s,c=%s)",
+            _pipeline_max_tokens("plan"),
+            _pipeline_max_input_chars("plan"),
+            _pipeline_max_tokens("draft"),
+            _pipeline_max_input_chars("draft"),
+            _pipeline_max_tokens("review"),
+            _pipeline_max_input_chars("review"),
+            _pipeline_max_tokens("rewrite"),
+            _pipeline_max_input_chars("rewrite"),
+        )
         github_context = maybe_fetch_github_context(
             services.github_mcp_tool,
             query=payload.topic,
@@ -316,6 +360,15 @@ def run_pipeline(
             key_points=payload.key_points,
             sources=sources,
             review_criteria=payload.review_criteria,
+            plan_max_tokens=_pipeline_max_tokens("plan"),
+            draft_max_tokens=_pipeline_max_tokens("draft"),
+            review_max_tokens=_pipeline_max_tokens("review"),
+            rewrite_max_tokens=_pipeline_max_tokens("rewrite"),
+            plan_max_input_chars=_pipeline_max_input_chars("plan"),
+            draft_max_input_chars=_pipeline_max_input_chars("draft"),
+            review_max_input_chars=_pipeline_max_input_chars("review"),
+            rewrite_max_input_chars=_pipeline_max_input_chars("rewrite"),
+            session_id=payload.session_id,
         )
         apply_labels = os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes")
         refusal_query = f"{payload.topic}\n{result.outline.outline}"
@@ -349,7 +402,7 @@ def run_pipeline(
             task_status["rewrite"] = False
             task_status["citations"] = False
             succeeded = True
-            return _serialize_pipeline_result(
+            response = _serialize_pipeline_result(
                 payload,
                 result,
                 services,
@@ -357,6 +410,12 @@ def run_pipeline(
                 coverage_detail=CoverageDetail(),
                 citation_enforced=False,
             )
+            logger.info(
+                "pipeline refused: session_id=%s elapsed_ms=%.2f",
+                payload.session_id or "__default__",
+                (time.perf_counter() - t0) * 1000,
+            )
+            return response
         if apply_labels and not _same_source_ids(sources, effective_sources):
             refreshed_notes = services.pipeline.collect_research_notes(
                 payload.topic,
@@ -375,6 +434,13 @@ def run_pipeline(
                 target_length=payload.target_length,
                 review_criteria=payload.review_criteria,
                 audience=payload.audience,
+                draft_max_tokens=_pipeline_max_tokens("draft"),
+                review_max_tokens=_pipeline_max_tokens("review"),
+                rewrite_max_tokens=_pipeline_max_tokens("rewrite"),
+                draft_max_input_chars=_pipeline_max_input_chars("draft"),
+                review_max_input_chars=_pipeline_max_input_chars("review"),
+                rewrite_max_input_chars=_pipeline_max_input_chars("rewrite"),
+                session_id=payload.session_id,
             )
             result = PipelineResult(
                 outline=result.outline,
@@ -409,7 +475,7 @@ def run_pipeline(
         task_status["rewrite"] = _is_effective(result.draft_result.revised)
         task_status["citations"] = True
         succeeded = True
-        return _serialize_pipeline_result(
+        response = _serialize_pipeline_result(
             payload,
             result,
             services,
@@ -417,6 +483,15 @@ def run_pipeline(
             coverage_detail=_coverage_detail(report),
             citation_enforced=citation_enforced,
         )
+        logger.info(
+            "pipeline done: session_id=%s draft_len=%s revised_len=%s notes=%s elapsed_ms=%.2f",
+            payload.session_id or "__default__",
+            len(result.draft_result.draft or ""),
+            len(result.draft_result.revised or ""),
+            len(result.research_notes or []),
+            (time.perf_counter() - t0) * 1000,
+        )
+        return response
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Pipeline execution failed") from exc
     finally:
@@ -444,6 +519,13 @@ def run_pipeline_stream(
     q: Queue[dict | None] = Queue()
 
     def worker() -> None:
+        def _emit_text_deltas(stage: str, text: str) -> None:
+            if not text:
+                return
+            chunk_size = max(128, _parse_int("PIPELINE_STREAM_FALLBACK_CHUNK_SIZE", 600))
+            for i in range(0, len(text), chunk_size):
+                q.put({"type": "delta", "stage": stage, "content": text[i : i + chunk_size]})
+
         task_status: dict[str, bool | None] = {
             "plan": None,
             "research": None,
@@ -454,7 +536,39 @@ def run_pipeline_stream(
         }
         succeeded = False
         effective_output: bool | None = None
+        stage_start = time.perf_counter()
+        current_stage = "init"
+
+        def _log_stage(stage_name: str) -> None:
+            nonlocal stage_start
+            now = time.perf_counter()
+            logger.info(
+                "pipeline stream stage: session_id=%s stage=%s elapsed_ms=%.2f",
+                payload.session_id or "__default__",
+                stage_name,
+                (now - stage_start) * 1000,
+            )
+            stage_start = now
         try:
+            logger.info(
+                "pipeline stream start: session_id=%s topic_len=%s source_count=%s citation_enforce=%s",
+                payload.session_id or "__default__",
+                len(payload.topic or ""),
+                len(payload.sources or []),
+                os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes"),
+            )
+            logger.info(
+                "pipeline stream budget: plan(t=%s,c=%s) draft(t=%s,c=%s) review(t=%s,c=%s) rewrite(t=%s,c=%s)",
+                _pipeline_max_tokens("plan"),
+                _pipeline_max_input_chars("plan"),
+                _pipeline_max_tokens("draft"),
+                _pipeline_max_input_chars("draft"),
+                _pipeline_max_tokens("review"),
+                _pipeline_max_input_chars("review"),
+                _pipeline_max_tokens("rewrite"),
+                _pipeline_max_input_chars("rewrite"),
+            )
+            current_stage = "plan"
             github_context = maybe_fetch_github_context(
                 services.github_mcp_tool,
                 query=payload.topic,
@@ -488,15 +602,20 @@ def run_pipeline_stream(
                     )
                 )
             q.put({"type": "status", "step": "plan"})
-            outline = services.pipeline.planner.plan_outline(
+            outline = services.pipeline.planner.plan_outline_stream(
                 topic=payload.topic,
                 audience=payload.audience,
                 style=payload.style,
                 target_length=payload.target_length,
                 constraints=constraints,
                 key_points=payload.key_points,
+                max_tokens=_pipeline_max_tokens("plan"),
+                max_input_chars=_pipeline_max_input_chars("plan"),
+                session_id=payload.session_id,
+                on_chunk=lambda chunk: q.put({"type": "delta", "stage": "plan", "content": chunk}),
             )
             task_status["plan"] = bool(outline.outline.strip())
+            _log_stage("plan")
             q.put(
                 {
                     "type": "outline",
@@ -520,6 +639,7 @@ def run_pipeline_stream(
             else:
                 refused = False
 
+            current_stage = "research"
             q.put({"type": "status", "step": "research"})
             if effective_sources:
                 notes = services.pipeline.collect_research_notes(payload.topic, outline, effective_sources)
@@ -528,6 +648,7 @@ def run_pipeline_stream(
             if github_context and not any(note.doc_id == "github:mcp" for note in notes):
                 notes.append(_github_note(github_context))
             task_status["research"] = None if not effective_sources else bool(notes)
+            _log_stage("research")
             notes_text = services.pipeline.researcher.format_notes(notes)
             q.put(
                 {
@@ -587,6 +708,7 @@ def run_pipeline_stream(
                 q.put({"type": "result", "payload": response.model_dump()})
                 return
 
+            current_stage = "draft"
             q.put({"type": "status", "step": "draft"})
             draft_chunks: list[str] = []
             evidence_text = services.drafter.extract_evidence(notes_text)
@@ -601,15 +723,36 @@ def run_pipeline_stream(
                 constraints=draft_constraints,
                 style=payload.style,
                 target_length=payload.target_length,
+                max_tokens=_pipeline_max_tokens("draft"),
+                max_input_chars=_pipeline_max_input_chars("draft"),
+                session_id=payload.session_id,
             ):
                 if not chunk:
                     continue
                 draft_chunks.append(chunk)
                 q.put({"type": "delta", "stage": "draft", "content": chunk})
             draft = "".join(draft_chunks)
+            if not draft.strip():
+                logger.warning(
+                    "pipeline stream draft produced empty output, fallback to non-stream draft generation."
+                )
+                draft = services.drafter.create_draft(
+                    topic=payload.topic,
+                    outline=outline.outline,
+                    research_notes=notes_text,
+                    constraints=constraints,
+                    style=payload.style,
+                    target_length=payload.target_length,
+                    max_tokens=_pipeline_max_tokens("draft"),
+                    max_input_chars=_pipeline_max_input_chars("draft"),
+                    session_id=payload.session_id,
+                )
+                _emit_text_deltas("draft", draft)
             task_status["draft"] = _is_effective(draft)
+            _log_stage("draft")
             q.put({"type": "draft", "payload": {"draft": draft}})
 
+            current_stage = "review"
             q.put({"type": "status", "step": "review"})
             review_chunks: list[str] = []
             # 根据 draft 长度动态设置 max_tokens，避免截断
@@ -620,15 +763,33 @@ def run_pipeline_stream(
                 sources=notes_text,
                 audience=payload.audience,
                 max_tokens=review_max_tokens,
+                max_input_chars=_pipeline_max_input_chars("review"),
+                session_id=payload.session_id,
             ):
                 if not chunk:
                     continue
                 review_chunks.append(chunk)
                 q.put({"type": "delta", "stage": "review", "content": chunk})
             review = "".join(review_chunks)
+            if not review.strip():
+                logger.warning(
+                    "pipeline stream review produced empty output, fallback to non-stream review generation."
+                )
+                review = services.reviewer.review(
+                    draft=draft,
+                    criteria=payload.review_criteria,
+                    sources=notes_text,
+                    audience=payload.audience,
+                    max_tokens=review_max_tokens,
+                    max_input_chars=_pipeline_max_input_chars("review"),
+                    session_id=payload.session_id,
+                ).review
+                _emit_text_deltas("review", review)
             task_status["review"] = bool(review.strip())
+            _log_stage("review")
             q.put({"type": "review", "payload": {"review": review}})
 
+            current_stage = "rewrite"
             q.put({"type": "status", "step": "rewrite"})
             rewrite_chunks: list[str] = []
             # 根据 draft 长度动态设置 max_tokens，避免截断
@@ -642,12 +803,28 @@ def run_pipeline_stream(
                 style=payload.style,
                 target_length=payload.target_length,
                 max_tokens=rewrite_max_tokens,
+                max_input_chars=_pipeline_max_input_chars("rewrite"),
+                session_id=payload.session_id,
             ):
                 if not chunk:
                     continue
                 rewrite_chunks.append(chunk)
                 q.put({"type": "delta", "stage": "rewrite", "content": chunk})
             revised = "".join(rewrite_chunks)
+            if not revised.strip():
+                logger.warning(
+                    "pipeline stream rewrite produced empty output, fallback to non-stream rewrite generation."
+                )
+                revised = services.rewriter.rewrite(
+                    draft=draft,
+                    guidance=rewrite_guidance,
+                    style=payload.style,
+                    target_length=payload.target_length,
+                    max_tokens=rewrite_max_tokens,
+                    max_input_chars=_pipeline_max_input_chars("rewrite"),
+                    session_id=payload.session_id,
+                ).revised
+                _emit_text_deltas("rewrite", revised)
             apply_labels = os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes")
             enforced_text, report = _citation_enforcer.enforce(
                 revised or draft,
@@ -658,6 +835,7 @@ def run_pipeline_stream(
             citation_enforced = apply_labels and enforced_text != revised
             revised = enforced_text
             task_status["rewrite"] = _is_effective(revised)
+            _log_stage("rewrite")
             q.put(
                 {
                     "type": "rewrite",
@@ -690,9 +868,26 @@ def run_pipeline_stream(
             task_status["citations"] = True
             succeeded = True
             effective_output = bool(task_status["rewrite"]) or bool(task_status["draft"])
+            _log_stage("citations")
+            logger.info(
+                "pipeline stream done: session_id=%s draft_len=%s revised_len=%s notes=%s",
+                payload.session_id or "__default__",
+                len(draft or ""),
+                len(revised or ""),
+                len(notes or []),
+            )
             q.put({"type": "result", "payload": response.model_dump()})
         except Exception as exc:  # pragma: no cover
-            q.put({"type": "error", "detail": str(exc)})
+            logger.exception(
+                "pipeline stream failed: session_id=%s stage=%s",
+                payload.session_id or "__default__",
+                current_stage,
+            )
+            # Mark unfinished stages as failed, so success-rate isn't misleading.
+            for key, value in list(task_status.items()):
+                if value is None:
+                    task_status[key] = False
+            q.put({"type": "error", "detail": str(exc), "stage": current_stage})
         finally:
             if any(v is not None for v in task_status.values()):
                 _log_task_success_rate(

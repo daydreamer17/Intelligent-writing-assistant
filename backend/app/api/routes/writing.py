@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import logging
 from queue import Empty, Queue
 from threading import Thread
 
@@ -24,6 +25,7 @@ from ...services.research_service import ResearchService, RelevanceReport, Sourc
 from ..deps import AppServices, get_services
 
 router = APIRouter(tags=["writing"])
+logger = logging.getLogger("app.writing")
 _citation_enforcer = CitationEnforcer()
 _researcher = ResearchService()
 
@@ -67,6 +69,31 @@ def _parse_int(name: str, default: int) -> int:
         return default
 
 
+def _parse_optional_int(name: str) -> int | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _step_max_tokens(stage: str) -> int | None:
+    stage = stage.upper()
+    return _parse_optional_int(f"STEP_{stage}_MAX_TOKENS") or _parse_optional_int(
+        f"STAGE_{stage}_MAX_TOKENS"
+    )
+
+
+def _step_max_input_chars(stage: str) -> int | None:
+    stage = stage.upper()
+    return _parse_optional_int(f"STEP_{stage}_MAX_INPUT_CHARS") or _parse_optional_int(
+        f"STAGE_{stage}_MAX_INPUT_CHARS"
+    )
+
+
 def _should_refuse(report: RelevanceReport) -> bool:
     if not _citations_enabled() or not _refusal_enabled():
         return False
@@ -107,7 +134,7 @@ def _enforce_with_rag(
     *,
     query: str,
     services: AppServices,
-    docs: List[SourceDocument] | None = None,
+    docs: list[SourceDocument] | None = None,
 ) -> str:
     if not _citations_enabled():
         return text
@@ -123,7 +150,7 @@ def _rag_refusal_check(
     *,
     query: str,
     services: AppServices,
-) -> tuple[bool, List[SourceDocument]]:
+) -> tuple[bool, list[SourceDocument]]:
     base_top_k = _citation_top_k()
     docs = services.rag.search(query, top_k=base_top_k)
     report = _researcher.relevance_report(query, docs)
@@ -191,6 +218,18 @@ def create_plan(
     services: AppServices = Depends(get_services),
 ) -> PlanResponse:
     try:
+        t0 = time.perf_counter()
+        logger.info(
+            "plan start: session_id=%s topic_len=%s key_points_len=%s",
+            payload.session_id or "__default__",
+            len(payload.topic or ""),
+            len(payload.key_points or ""),
+        )
+        logger.info(
+            "plan budget: max_tokens=%s max_input_chars=%s",
+            _step_max_tokens("plan"),
+            _step_max_input_chars("plan"),
+        )
         github_context = maybe_fetch_github_context(
             services.github_mcp_tool,
             query=payload.topic,
@@ -204,12 +243,22 @@ def create_plan(
             target_length=payload.target_length,
             constraints=payload.constraints,
             key_points=key_points,
+            max_tokens=_step_max_tokens("plan"),
+            max_input_chars=_step_max_input_chars("plan"),
+            session_id=payload.session_id,
         )
-        return PlanResponse(
+        response = PlanResponse(
             outline=plan.outline,
             assumptions=plan.assumptions,
             open_questions=plan.open_questions,
         )
+        logger.info(
+            "plan done: session_id=%s outline_len=%s elapsed_ms=%.2f",
+            payload.session_id or "__default__",
+            len(response.outline or ""),
+            (time.perf_counter() - t0) * 1000,
+        )
+        return response
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Plan generation failed") from exc
 
@@ -220,6 +269,19 @@ def create_draft(
     services: AppServices = Depends(get_services),
 ) -> DraftResponse:
     try:
+        t0 = time.perf_counter()
+        logger.info(
+            "draft start: session_id=%s topic_len=%s outline_len=%s notes_len=%s",
+            payload.session_id or "__default__",
+            len(payload.topic or ""),
+            len(payload.outline or ""),
+            len(payload.research_notes or ""),
+        )
+        logger.info(
+            "draft budget: max_tokens=%s max_input_chars=%s",
+            _step_max_tokens("draft"),
+            _step_max_input_chars("draft"),
+        )
         github_context = maybe_fetch_github_context(
             services.github_mcp_tool,
             query=payload.topic,
@@ -237,6 +299,9 @@ def create_draft(
             constraints=payload.constraints,
             style=payload.style,
             target_length=payload.target_length,
+            max_tokens=_step_max_tokens("draft"),
+            max_input_chars=_step_max_input_chars("draft"),
+            session_id=payload.session_id,
         )
         draft = _enforce_with_rag(
             draft,
@@ -244,7 +309,14 @@ def create_draft(
             services=services,
             docs=docs,
         )
-        return DraftResponse(draft=draft)
+        response = DraftResponse(draft=draft)
+        logger.info(
+            "draft done: session_id=%s draft_len=%s elapsed_ms=%.2f",
+            payload.session_id or "__default__",
+            len(response.draft or ""),
+            (time.perf_counter() - t0) * 1000,
+        )
+        return response
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Draft generation failed") from exc
 
@@ -267,7 +339,14 @@ def create_draft_stream(
     research_notes = _append_block(payload.research_notes, github_context, "GitHub参考")
 
     def worker() -> None:
+        t0 = time.perf_counter()
         try:
+            logger.info(
+                "draft stream start: session_id=%s topic_len=%s outline_len=%s",
+                payload.session_id or "__default__",
+                len(payload.topic or ""),
+                len(payload.outline or ""),
+            )
             refusal_query = f"{payload.topic}\n{payload.outline}"
             refused, docs = _rag_refusal_check(query=refusal_query, services=services)
             if refused:
@@ -286,6 +365,9 @@ def create_draft_stream(
                 constraints=draft_constraints,
                 style=payload.style,
                 target_length=payload.target_length,
+                max_tokens=_step_max_tokens("draft"),
+                max_input_chars=_step_max_input_chars("draft"),
+                session_id=payload.session_id,
             ):
                 if not chunk:
                     continue
@@ -299,6 +381,12 @@ def create_draft_stream(
                 docs=docs,
             )
             q.put({"type": "result", "payload": {"draft": draft}})
+            logger.info(
+                "draft stream done: session_id=%s draft_len=%s elapsed_ms=%.2f",
+                payload.session_id or "__default__",
+                len(draft or ""),
+                (time.perf_counter() - t0) * 1000,
+            )
         except Exception as exc:  # pragma: no cover
             q.put({"type": "error", "detail": str(exc)})
         finally:
@@ -335,6 +423,18 @@ def review_draft(
     services: AppServices = Depends(get_services),
 ) -> ReviewResponse:
     try:
+        t0 = time.perf_counter()
+        logger.info(
+            "review start: session_id=%s draft_len=%s criteria_len=%s",
+            payload.session_id or "__default__",
+            len(payload.draft or ""),
+            len(payload.criteria or ""),
+        )
+        logger.info(
+            "review budget: max_tokens=%s max_input_chars=%s",
+            _step_max_tokens("review"),
+            _step_max_input_chars("review"),
+        )
         github_context = maybe_fetch_github_context(
             services.github_mcp_tool,
             query=(payload.criteria or payload.draft[:200]),
@@ -346,8 +446,18 @@ def review_draft(
             criteria=payload.criteria,
             sources=sources,
             audience=payload.audience,
+            max_tokens=_step_max_tokens("review"),
+            max_input_chars=_step_max_input_chars("review"),
+            session_id=payload.session_id,
         )
-        return ReviewResponse(review=review.review)
+        response = ReviewResponse(review=review.review)
+        logger.info(
+            "review done: session_id=%s review_len=%s elapsed_ms=%.2f",
+            payload.session_id or "__default__",
+            len(response.review or ""),
+            (time.perf_counter() - t0) * 1000,
+        )
+        return response
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Review failed") from exc
 
@@ -370,13 +480,23 @@ def review_draft_stream(
     sources = _append_block(payload.sources, github_context, "GitHub参考")
 
     def worker() -> None:
+        t0 = time.perf_counter()
         try:
+            logger.info(
+                "review stream start: session_id=%s draft_len=%s criteria_len=%s",
+                payload.session_id or "__default__",
+                len(payload.draft or ""),
+                len(payload.criteria or ""),
+            )
             chunks: list[str] = []
             for chunk in services.reviewer.agent.review_stream(
                 draft=payload.draft,
                 criteria=payload.criteria,
                 sources=sources,
                 audience=payload.audience,
+                max_tokens=_step_max_tokens("review"),
+                max_input_chars=_step_max_input_chars("review"),
+                session_id=payload.session_id,
             ):
                 if not chunk:
                     continue
@@ -384,6 +504,12 @@ def review_draft_stream(
                 q.put({"type": "delta", "content": chunk})
             review_text = "".join(chunks)
             q.put({"type": "result", "payload": {"review": review_text}})
+            logger.info(
+                "review stream done: session_id=%s review_len=%s elapsed_ms=%.2f",
+                payload.session_id or "__default__",
+                len(review_text or ""),
+                (time.perf_counter() - t0) * 1000,
+            )
         except Exception as exc:  # pragma: no cover
             q.put({"type": "error", "detail": str(exc)})
         finally:
@@ -420,6 +546,18 @@ def rewrite_draft(
     services: AppServices = Depends(get_services),
 ) -> RewriteResponse:
     try:
+        t0 = time.perf_counter()
+        logger.info(
+            "rewrite start: session_id=%s draft_len=%s guidance_len=%s",
+            payload.session_id or "__default__",
+            len(payload.draft or ""),
+            len(payload.guidance or ""),
+        )
+        logger.info(
+            "rewrite budget: max_tokens=%s max_input_chars=%s",
+            _step_max_tokens("rewrite"),
+            _step_max_input_chars("rewrite"),
+        )
         github_context = maybe_fetch_github_context(
             services.github_mcp_tool,
             query=(payload.guidance or payload.draft[:200]),
@@ -438,6 +576,9 @@ def rewrite_draft(
             guidance=guidance,
             style=payload.style,
             target_length=payload.target_length,
+            max_tokens=_step_max_tokens("rewrite"),
+            max_input_chars=_step_max_input_chars("rewrite"),
+            session_id=payload.session_id,
         )
         text = _enforce_with_rag(
             revised.revised,
@@ -445,7 +586,14 @@ def rewrite_draft(
             services=services,
             docs=docs,
         )
-        return RewriteResponse(revised=text)
+        response = RewriteResponse(revised=text)
+        logger.info(
+            "rewrite done: session_id=%s revised_len=%s elapsed_ms=%.2f",
+            payload.session_id or "__default__",
+            len(response.revised or ""),
+            (time.perf_counter() - t0) * 1000,
+        )
+        return response
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Rewrite failed") from exc
 
@@ -468,7 +616,14 @@ def rewrite_draft_stream(
     guidance = _append_block(payload.guidance, github_context, "GitHub参考")
 
     def worker() -> None:
+        t0 = time.perf_counter()
         try:
+            logger.info(
+                "rewrite stream start: session_id=%s draft_len=%s guidance_len=%s",
+                payload.session_id or "__default__",
+                len(payload.draft or ""),
+                len(payload.guidance or ""),
+            )
             refusal_query = payload.draft
             refused, docs = _rag_refusal_check(query=refusal_query, services=services)
             if refused:
@@ -485,6 +640,9 @@ def rewrite_draft_stream(
                 guidance=guidance_with_evidence,
                 style=payload.style,
                 target_length=payload.target_length,
+                max_tokens=_step_max_tokens("rewrite"),
+                max_input_chars=_step_max_input_chars("rewrite"),
+                session_id=payload.session_id,
             ):
                 if not chunk:
                     continue
@@ -498,6 +656,12 @@ def rewrite_draft_stream(
                 docs=docs,
             )
             q.put({"type": "result", "payload": {"revised": revised_text}})
+            logger.info(
+                "rewrite stream done: session_id=%s revised_len=%s elapsed_ms=%.2f",
+                payload.session_id or "__default__",
+                len(revised_text or ""),
+                (time.perf_counter() - t0) * 1000,
+            )
         except Exception as exc:  # pragma: no cover
             q.put({"type": "error", "detail": str(exc)})
         finally:

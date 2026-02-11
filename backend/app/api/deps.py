@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import logging
 from pathlib import Path
+import threading
 
 from ..agents.editor_agent import EditorAgent
 from ..agents.reviewer_agent import ReviewerAgent
@@ -26,6 +27,8 @@ from ..services.vector_store import HashEmbedding, QdrantVectorStore, VectorStor
 from hello_agents.tools import ToolRegistry, MCPTool
 import os
 
+_services_init_lock = threading.Lock()
+
 
 @dataclass(frozen=True)
 class AppServices:
@@ -37,7 +40,13 @@ class AppServices:
     rag: RAGService
     citations: CitationService
     storage: StorageService
+    # Legacy compatibility view: short_term | long_term
     memory_mode: str
+    # Preferred retrieval flag: sqlite_only | hybrid
+    retrieval_mode: str
+    # Conversation memory flag: session | global
+    conversation_memory_mode: str
+    retrieval_backend: str
     storage_path: str
     qdrant_enabled: bool
     qdrant_url: str
@@ -59,6 +68,23 @@ class AppServices:
 
 @lru_cache(maxsize=1)
 def get_services() -> AppServices:
+    with _services_init_lock:
+        return _build_services()
+
+
+def _tool_name(tool: object) -> str:
+    try:
+        getter = getattr(tool, "get", None)
+        if callable(getter):
+            name = getter("name")
+            return str(name) if name else ""
+    except Exception:
+        pass
+    name = getattr(tool, "name", None)
+    return str(name) if name else ""
+
+
+def _build_services() -> AppServices:
     logger = logging.getLogger("app.deps")
     config = AppConfig.from_env()
 
@@ -69,11 +95,28 @@ def get_services() -> AppServices:
             return "*" * len(value)
         return value[:3] + "..." + value[-2:]
 
+    def _env_flag(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            return default
+        return raw.strip().lower() in ("1", "true", "yes")
+
+    def _env_int(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            return int(raw.strip())
+        except ValueError:
+            return default
+
     logger.info(
-        "Config summary: memory_mode=%s storage_path=%s llm_timeout=%ss llm_max_tokens=%s qdrant_url=%s qdrant_collection=%s "
+        "Config summary: memory_mode=%s retrieval_mode=%s conversation_memory_mode=%s storage_path=%s llm_timeout=%ss llm_max_tokens=%s qdrant_url=%s qdrant_collection=%s "
         "qdrant_dim=%s qdrant_distance=%s qdrant_timeout=%ss embedding_provider=%s embedding_model=%s "
         "embedding_api_base=%s embedding_api_key=%s github_mcp=%s",
         config.memory_mode,
+        config.retrieval_mode,
+        config.conversation_memory_mode,
         config.storage_path,
         config.llm_timeout,
         config.llm_max_tokens if config.llm_max_tokens is not None else "unset",
@@ -113,9 +156,17 @@ def get_services() -> AppServices:
                     "github_search_users",
                     "github_get_file_contents",
                 }
-                filtered = [tool for tool in tools_to_register if tool.get("name") in allow]
+                filtered = [tool for tool in tools_to_register if _tool_name(tool) in allow]
                 if filtered:
                     tools_to_register = filtered
+            max_tools = _env_int("MCP_GITHUB_MAX_TOOLS", 5)
+            if max_tools > 0 and len(tools_to_register) > max_tools:
+                logger.info(
+                    "Limiting GitHub MCP expanded tools from %s to %s (MCP_GITHUB_MAX_TOOLS).",
+                    len(tools_to_register),
+                    max_tools,
+                )
+                tools_to_register = tools_to_register[:max_tools]
             if tools_to_register:
                 for tool in tools_to_register:
                     tool_registry.register_tool(tool)
@@ -132,8 +183,16 @@ def get_services() -> AppServices:
             tool_registry = None
             github_mcp_tool = None
 
+    agent_tool_calling_enabled = _env_flag("LLM_AGENT_TOOL_CALLING_ENABLED", False)
+    agent_tool_registry = tool_registry if agent_tool_calling_enabled else None
+    if tool_registry is not None and not agent_tool_calling_enabled:
+        logger.info(
+            "Agent-level tool calling disabled (LLM_AGENT_TOOL_CALLING_ENABLED=false); "
+            "GitHub MCP remains available via explicit service calls."
+        )
+
     writing_agent = WritingAgent(
-        tool_registry=tool_registry,
+        tool_registry=agent_tool_registry,
         provider=config.llm_provider or None,
         model=config.llm_model or None,
         api_key=config.llm_api_key or None,
@@ -142,7 +201,7 @@ def get_services() -> AppServices:
         max_tokens=config.llm_max_tokens,
     )
     reviewer_agent = ReviewerAgent(
-        tool_registry=tool_registry,
+        tool_registry=agent_tool_registry,
         provider=config.llm_provider or None,
         model=config.llm_model or None,
         api_key=config.llm_api_key or None,
@@ -151,7 +210,7 @@ def get_services() -> AppServices:
         max_tokens=config.llm_max_tokens,
     )
     editor_agent = EditorAgent(
-        tool_registry=tool_registry,
+        tool_registry=agent_tool_registry,
         provider=config.llm_provider or None,
         model=config.llm_model or None,
         api_key=config.llm_api_key or None,
@@ -182,7 +241,7 @@ def get_services() -> AppServices:
     embedding_mode = "hash"
     embedding_error: str | None = None
     qdrant_error: str | None = None
-    if config.memory_mode == "long_term" and config.qdrant_url:
+    if config.retrieval_mode == "hybrid" and config.qdrant_url:
         embedder = None
         base_url = config.embedding_api_base or config.llm_api_base
         missing = []
@@ -288,6 +347,10 @@ def get_services() -> AppServices:
     )
     citations = CitationService()
 
+    retrieval_backend = "sqlite_only"
+    if config.retrieval_mode == "hybrid":
+        retrieval_backend = "sqlite+qdrant" if vector_store is not None else "sqlite_fallback"
+
     return AppServices(
         planner=planner,
         reviewer=reviewer,
@@ -298,6 +361,9 @@ def get_services() -> AppServices:
         citations=citations,
         storage=storage,
         memory_mode=config.memory_mode,
+        retrieval_mode=config.retrieval_mode,
+        conversation_memory_mode=config.conversation_memory_mode,
+        retrieval_backend=retrieval_backend,
         storage_path=config.storage_path,
         qdrant_enabled=vector_store is not None,
         qdrant_url=config.qdrant_url or "",

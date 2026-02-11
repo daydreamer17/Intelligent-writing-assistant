@@ -60,6 +60,13 @@
         <button class="btn ghost" @click="handleDraft" :disabled="loading.draft">生成草稿</button>
         <button class="btn ghost" @click="handleReview" :disabled="loading.review">审校</button>
         <button class="btn ghost" @click="handleRewrite" :disabled="loading.rewrite">改写</button>
+        <button
+          class="btn ghost"
+          @click="handleResetSessionMemory"
+          :disabled="loading.pipeline || sessionMemoryResetting"
+        >
+          {{ sessionMemoryResetting ? "重置中..." : "重置会话记忆" }}
+        </button>
         <button class="btn ghost" @click="clearGenerated" :disabled="loading.pipeline || loading.draft || loading.review || loading.rewrite">清空生成内容</button>
         <button class="btn ghost" @click="exportText">导出 TXT</button>
         <button class="btn ghost" @click="exportMarkdown">导出 MD</button>
@@ -130,7 +137,7 @@ import { useAppStore } from "../store";
 import { draftStream, plan, reviewStream, rewriteStream } from "../services/writing";
 import { runPipelineStream } from "../services/pipeline";
 import { getHealthDetail } from "../services/health";
-import { getCitationSetting, setCitationSetting } from "../services/settings";
+import { clearSessionMemory, getCitationSetting, setCitationSetting } from "../services/settings";
 import { handleApiError } from "../utils/errorHandler";
 import { validatePipelineRequest, validateDraftRequest, validateReviewRequest, validateRewriteRequest } from "../utils/validation";
 import { debounce } from "../utils/debounce";
@@ -145,6 +152,29 @@ import StatusBar from "../components/StatusBar.vue";
 import LoadingOverlay from "../components/LoadingOverlay.vue";
 import ProgressIndicator from "../components/ProgressIndicator.vue";
 import Toast from "../components/Toast.vue";
+
+const WORKSPACE_SESSION_KEY = "workspace-session-id";
+
+const createSessionId = () => {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `sess-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+};
+
+const getOrCreateSessionId = () => {
+  try {
+    const current = localStorage.getItem(WORKSPACE_SESSION_KEY);
+    if (current && current.trim()) {
+      return current.trim();
+    }
+    const created = createSessionId();
+    localStorage.setItem(WORKSPACE_SESSION_KEY, created);
+    return created;
+  } catch {
+    return createSessionId();
+  }
+};
 
 const form = reactive({
   topic: "",
@@ -186,12 +216,22 @@ const toast = ref("");
 const health = ref<HealthDetailResponse | null>(null);
 const citationEnforce = ref<boolean | null>(null);
 const citationUpdating = ref(false);
+const sessionMemoryResetting = ref(false);
+const sessionId = ref(getOrCreateSessionId());
 const store = useAppStore();
 const { ragSnippets } = storeToRefs(store);
 
 // 进度指示器状态
 const pipelineSteps = ['生成大纲', '收集研究笔记', '创作初稿', '审阅反馈', '修改润色', '生成引用'];
 const currentPipelineStep = ref(0);
+const pipelineStageIndex: Record<string, number> = {
+  plan: 0,
+  research: 1,
+  draft: 2,
+  review: 3,
+  rewrite: 4,
+  citations: 5,
+};
 
 const resetError = () => {
   error.value = "";
@@ -231,6 +271,7 @@ const handlePlan = async () => {
       target_length: form.target_length,
       constraints: form.constraints,
       key_points: form.key_points,
+      session_id: sessionId.value,
     });
     output.outline = res.outline;
     output.assumptions = res.assumptions;
@@ -265,6 +306,7 @@ const handleDraft = async () => {
         constraints: form.constraints,
         style: form.style,
         target_length: form.target_length,
+        session_id: sessionId.value,
       },
       (evt) => {
         if (evt.type === "delta") {
@@ -308,6 +350,7 @@ const handleReview = async () => {
         criteria: form.review_criteria,
         sources: form.research_notes,
         audience: form.audience,
+        session_id: sessionId.value,
       },
       (evt) => {
         if (evt.type === "delta") {
@@ -351,6 +394,7 @@ const handleRewrite = async () => {
         guidance: output.review || form.review_criteria,
         style: form.style,
         target_length: form.target_length,
+        session_id: sessionId.value,
       },
       (evt) => {
         if (evt.type === "delta") {
@@ -393,6 +437,18 @@ const handlePipeline = async () => {
 
     loading.pipeline = true;
     currentPipelineStep.value = 0;
+    output.outline = "";
+    output.assumptions = "";
+    output.open_questions = "";
+    output.research_notes = [];
+    output.draft = "";
+    output.review = "";
+    output.revised = "";
+    output.bibliography = "";
+    output.citations = [];
+    output.version_id = undefined;
+    output.coverage = undefined;
+    output.coverage_detail = undefined;
 
     // 将RAG snippets转换为sources格式
     const sources = ragSnippets.value.map((content, idx) => ({
@@ -411,9 +467,14 @@ const handlePipeline = async () => {
       key_points: form.key_points,
       review_criteria: form.review_criteria,
       sources: sources,
+      session_id: sessionId.value,
     };
 
     await runPipelineStream(payload, (evt) => {
+      if (evt.type === "status") {
+        const idx = pipelineStageIndex[String(evt.step || "").trim()] ?? 0;
+        currentPipelineStep.value = idx;
+      }
       if (evt.type === "outline") {
         currentPipelineStep.value = 1;
         output.outline = evt.payload?.outline || "";
@@ -443,6 +504,7 @@ const handlePipeline = async () => {
         }
       }
       if (evt.type === "delta" && evt.stage === "draft") {
+        currentPipelineStep.value = pipelineStageIndex.draft;
         output.draft += evt.content || "";
       }
       if (evt.type === "review") {
@@ -453,6 +515,7 @@ const handlePipeline = async () => {
         }
       }
       if (evt.type === "delta" && evt.stage === "review") {
+        currentPipelineStep.value = pipelineStageIndex.review;
         output.review += evt.content || "";
       }
       if (evt.type === "rewrite") {
@@ -470,6 +533,7 @@ const handlePipeline = async () => {
         }
       }
       if (evt.type === "delta" && evt.stage === "rewrite") {
+        currentPipelineStep.value = pipelineStageIndex.rewrite;
         output.revised += evt.content || "";
       }
       if (evt.type === "error") {
@@ -532,6 +596,27 @@ const appendSnippets = () => {
 const clearSnippets = () => {
   store.clearSnippets();
   showToast("已清空 RAG 素材");
+};
+
+const handleResetSessionMemory = async () => {
+  resetError();
+  sessionMemoryResetting.value = true;
+  try {
+    const res = await clearSessionMemory({
+      session_id: sessionId.value,
+      drop_agent: true,
+      clear_cold: false,
+    });
+    if (res.cleared) {
+      showToast("当前会话记忆已重置");
+      return;
+    }
+    showToast("当前会话没有可清理记忆");
+  } catch (err) {
+    error.value = handleApiError(err);
+  } finally {
+    sessionMemoryResetting.value = false;
+  }
 };
 
 const exportText = () => {

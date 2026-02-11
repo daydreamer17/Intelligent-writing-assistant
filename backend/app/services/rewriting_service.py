@@ -22,6 +22,9 @@ class RewritingService:
         guidance: str = "",
         style: str = "",
         target_length: str = "",
+        max_tokens: int | None = None,
+        max_input_chars: int | None = None,
+        session_id: str = "",
     ) -> RewriteResult:
         if _should_chunk(draft, target_length):
             revised = self._rewrite_long(
@@ -29,6 +32,9 @@ class RewritingService:
                 guidance=guidance,
                 style=style,
                 target_length=target_length,
+                max_tokens=max_tokens,
+                max_input_chars=max_input_chars,
+                session_id=session_id,
             )
         else:
             revised = self.agent.rewrite(
@@ -36,6 +42,9 @@ class RewritingService:
                 guidance=guidance,
                 style=style,
                 target_length=target_length,
+                max_tokens=max_tokens,
+                max_input_chars=max_input_chars,
+                session_id=session_id,
             )
         return RewriteResult(revised=revised)
 
@@ -46,6 +55,9 @@ class RewritingService:
         guidance: str = "",
         style: str = "",
         target_length: str = "",
+        max_tokens: int | None = None,
+        max_input_chars: int | None = None,
+        session_id: str = "",
     ) -> str:
         chunks = _split_draft(draft, max_chars=1200)
         outputs: list[str] = []
@@ -61,13 +73,17 @@ class RewritingService:
             if context_tail:
                 section_guidance += f"\n\nPrevious context (do not repeat):\n{context_tail}"
 
-            max_tokens = int(len(chunk) * 1.2)
+            section_max_tokens = int(len(chunk) * 1.2)
+            if max_tokens is not None:
+                section_max_tokens = min(section_max_tokens, max_tokens)
             section_text = self.agent.rewrite(
                 draft=chunk,
                 guidance=section_guidance,
                 style=style,
                 target_length=target_length,
-                max_tokens=max_tokens,
+                max_tokens=section_max_tokens,
+                max_input_chars=max_input_chars,
+                session_id=session_id,
             )
             outputs.append(section_text.strip())
             context_tail = "\n\n".join(outputs)

@@ -53,6 +53,8 @@ class EditorAgent(BaseWritingAgent):
         style: str = "",
         target_length: str = "",
         max_tokens: Optional[int] = None,
+        max_input_chars: Optional[int] = None,
+        session_id: str = "",
     ) -> str:
         # 截断过长的内容以避免超过模型限制
         max_draft_chars = 20000  # 约 8000 tokens
@@ -70,7 +72,12 @@ class EditorAgent(BaseWritingAgent):
             style=style,
             target_length=target_length,
         )
-        rewritten = self.run(prompt, max_tokens=max_tokens)
+        rewritten = self.run(
+            prompt,
+            max_tokens=max_tokens,
+            max_input_chars=max_input_chars,
+            session_id=session_id,
+        )
 
         # If model accidentally returns review/feedback text, force a repair pass.
         if _looks_like_review_feedback(rewritten):
@@ -81,7 +88,12 @@ class EditorAgent(BaseWritingAgent):
                 style=style,
                 target_length=target_length,
             )
-            rewritten = self.run(repair_prompt, max_tokens=max_tokens)
+            rewritten = self.run(
+                repair_prompt,
+                max_tokens=max_tokens,
+                max_input_chars=max_input_chars,
+                session_id=session_id,
+            )
 
         return _clean_rewrite_output(rewritten)
 
@@ -93,6 +105,8 @@ class EditorAgent(BaseWritingAgent):
         style: str = "",
         target_length: str = "",
         max_tokens: Optional[int] = None,
+        max_input_chars: Optional[int] = None,
+        session_id: str = "",
     ):
         # 截断过长的内容以避免超过模型限制
         max_draft_chars = 20000  # 约 8000 tokens
@@ -111,6 +125,8 @@ class EditorAgent(BaseWritingAgent):
             style=style,
             target_length=target_length,
             max_tokens=max_tokens,
+            max_input_chars=max_input_chars,
+            session_id=session_id,
         )
         chunk_size = 480
         for start in range(0, len(rewritten), chunk_size):

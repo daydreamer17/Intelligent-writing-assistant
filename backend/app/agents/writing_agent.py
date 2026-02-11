@@ -52,6 +52,9 @@ class WritingAgent(BaseWritingAgent):
         constraints: str = "",
         style: str = "",
         target_length: str = "",
+        max_tokens: Optional[int] = None,
+        max_input_chars: Optional[int] = None,
+        session_id: str = "",
     ) -> str:
         parts = [
             f"Topic:\n{topic}",
@@ -68,7 +71,12 @@ class WritingAgent(BaseWritingAgent):
             "Write a complete draft based on the information below.\n\n"
             + "\n\n".join(parts)
         )
-        return self.run(prompt)
+        return self.run(
+            prompt,
+            session_id=session_id,
+            max_tokens=max_tokens,
+            max_input_chars=max_input_chars,
+        )
 
     def draft_stream(
         self,
@@ -78,6 +86,9 @@ class WritingAgent(BaseWritingAgent):
         constraints: str = "",
         style: str = "",
         target_length: str = "",
+        max_tokens: Optional[int] = None,
+        max_input_chars: Optional[int] = None,
+        session_id: str = "",
     ):
         # 截断过长的 outline 以避免超过模型限制
         max_outline_chars = 10000  # 约 4000 tokens
@@ -99,7 +110,12 @@ class WritingAgent(BaseWritingAgent):
                 parts.append(f"Target length:\n{target_length}")
 
             prompt = "Write a complete draft based on the information below.\n\n" + "\n\n".join(parts)
-            yield from self.stream(prompt)
+            yield from self.stream(
+                prompt,
+                session_id=session_id,
+                max_tokens=max_tokens,
+                max_input_chars=max_input_chars,
+            )
             return
 
         target_len = self._parse_target_length(target_length) or 0
@@ -130,9 +146,18 @@ class WritingAgent(BaseWritingAgent):
 
             prompt = "Write the next section based on the information below.\n\n" + "\n\n".join(parts)
 
-            max_tokens = int(per_section_len * 1.2) if per_section_len else None
+            section_max_tokens = int(per_section_len * 1.2) if per_section_len else None
+            if max_tokens is not None and section_max_tokens is not None:
+                section_max_tokens = min(max_tokens, section_max_tokens)
+            elif max_tokens is not None:
+                section_max_tokens = max_tokens
             section_chunks = []
-            for chunk in self.stream(prompt, max_tokens=max_tokens):
+            for chunk in self.stream(
+                prompt,
+                max_tokens=section_max_tokens,
+                max_input_chars=max_input_chars,
+                session_id=session_id,
+            ):
                 section_chunks.append(chunk)
                 yield chunk
 
@@ -178,6 +203,9 @@ class WritingAgent(BaseWritingAgent):
         constraints: str = "",
         style: str = "",
         target_length: str = "",
+        max_tokens: Optional[int] = None,
+        max_input_chars: Optional[int] = None,
+        session_id: str = "",
     ) -> str:
         sections = self._split_outline(outline)
         if len(sections) <= 1:
@@ -187,6 +215,9 @@ class WritingAgent(BaseWritingAgent):
                 constraints=constraints,
                 style=style,
                 target_length=target_length,
+                max_tokens=max_tokens,
+                max_input_chars=max_input_chars,
+                session_id=session_id,
             )
 
         target_len = self._parse_target_length(target_length) or 0
@@ -217,8 +248,17 @@ class WritingAgent(BaseWritingAgent):
 
             prompt = "Write the next section based on the information below.\n\n" + "\n\n".join(parts)
 
-            max_tokens = int(per_section_len * 1.2) if per_section_len else None
-            section_text = self.run(prompt, max_tokens=max_tokens)
+            section_max_tokens = int(per_section_len * 1.2) if per_section_len else None
+            if max_tokens is not None and section_max_tokens is not None:
+                section_max_tokens = min(max_tokens, section_max_tokens)
+            elif max_tokens is not None:
+                section_max_tokens = max_tokens
+            section_text = self.run(
+                prompt,
+                max_tokens=section_max_tokens,
+                max_input_chars=max_input_chars,
+                session_id=session_id,
+            )
             outputs.append(section_text.strip())
             context_tail = "\n\n".join(outputs)
             if len(context_tail) > 1200:

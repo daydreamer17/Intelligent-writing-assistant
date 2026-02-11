@@ -102,7 +102,10 @@ def create_app() -> FastAPI:
     def health_detail(services: AppServices = Depends(get_services)) -> dict[str, object]:
         return {
             "status": "ok",
+            "conversation_memory_mode": services.conversation_memory_mode,
+            "retrieval_mode": services.retrieval_mode,
             "memory_mode": services.memory_mode,
+            "retrieval_backend": services.retrieval_backend,
             "storage_path": services.storage_path,
             "qdrant": {
                 "enabled": services.qdrant_enabled,

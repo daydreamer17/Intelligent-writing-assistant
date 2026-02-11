@@ -13,6 +13,7 @@ from datetime import datetime
 from hello_agents import HelloAgentsLLM, SimpleAgent, ToolAwareSimpleAgent
 from hello_agents.core.message import Message
 from hello_agents.tools import ToolRegistry
+from ..utils.tokenizer import tokenize
 
 logger = logging.getLogger("app.llm")
 
@@ -90,42 +91,178 @@ class BaseWritingAgent:
         self.config = config
         self.llm = build_llm(config)
         self._lock = threading.Lock()
+        self._tool_registry = tool_registry
+        self._session_agents: dict[str, Any] = {}
+        self._session_last_seen: dict[str, float] = {}
 
-        # Keep a persistent agent instance to preserve conversation memory across calls.
-        # We prune history to a bounded window to avoid hitting provider max_seq_len.
-        if tool_registry is not None:
-            self.agent = ToolAwareSimpleAgent(
-                name=config.name,
+        # Keep a default session for compatibility; real traffic should pass session_id.
+        default = self._create_agent()
+        self._session_agents["__default__"] = default
+        self._session_last_seen["__default__"] = time.time()
+        self.agent = default
+
+    def _create_agent(self) -> Any:
+        if self._tool_registry is not None:
+            return ToolAwareSimpleAgent(
+                name=self.config.name,
                 llm=self.llm,
-                system_prompt=config.system_prompt,
+                system_prompt=self.config.system_prompt,
                 enable_tool_calling=True,
-                tool_registry=tool_registry,
+                tool_registry=self._tool_registry,
             )
-        else:
-            self.agent = SimpleAgent(
-                name=config.name,
-                llm=self.llm,
-                system_prompt=config.system_prompt,
+        return SimpleAgent(
+            name=self.config.name,
+            llm=self.llm,
+            system_prompt=self.config.system_prompt,
+        )
+
+    def _session_key(self, session_id: Optional[str]) -> str:
+        mode = (os.getenv("CONVERSATION_MEMORY_MODE", "session") or "session").strip().lower()
+        if mode == "global":
+            return "__default__"
+        raw = (session_id or "").strip()
+        if not raw:
+            return "__default__"
+        return raw[:64]
+
+    def _get_session_agent(self, session_id: Optional[str]) -> tuple[str, Any]:
+        key = self._session_key(session_id)
+        agent = self._session_agents.get(key)
+        if agent is None:
+            agent = self._create_agent()
+            self._session_agents[key] = agent
+            logger.info("Created isolated LLM session: agent=%s session_id=%s", self.config.name, key)
+        self._session_last_seen[key] = time.time()
+        self._evict_old_sessions()
+        return key, agent
+
+    def _evict_old_sessions(self) -> None:
+        max_agents = _parse_int_env("LLM_SESSION_MAX_AGENTS", default=32)
+        ttl_seconds = _parse_int_env("LLM_SESSION_TTL_SECONDS", default=3600)
+        now = time.time()
+        keys = list(self._session_agents.keys())
+        for key in keys:
+            if key == "__default__":
+                continue
+            last_seen = self._session_last_seen.get(key, now)
+            if ttl_seconds > 0 and now - last_seen > ttl_seconds:
+                self._session_agents.pop(key, None)
+                self._session_last_seen.pop(key, None)
+                logger.info("Evicted idle LLM session: agent=%s session_id=%s", self.config.name, key)
+
+        if max_agents > 0 and len(self._session_agents) > max_agents:
+            active = sorted(
+                ((k, self._session_last_seen.get(k, 0.0)) for k in self._session_agents.keys() if k != "__default__"),
+                key=lambda item: item[1],
             )
+            while len(self._session_agents) > max_agents and active:
+                key, _ = active.pop(0)
+                self._session_agents.pop(key, None)
+                self._session_last_seen.pop(key, None)
+                logger.info("Evicted overflow LLM session: agent=%s session_id=%s", self.config.name, key)
+
+    def clear_session_memory(
+        self,
+        *,
+        session_id: str = "",
+        drop_agent: bool = False,
+        clear_cold: bool = False,
+    ) -> bool:
+        key = self._session_key(session_id)
+        with self._lock:
+            agent = self._session_agents.get(key)
+            if agent is None:
+                return False
+
+            cleared = False
+            if hasattr(agent, "clear_history"):
+                try:
+                    agent.clear_history()
+                    cleared = True
+                except Exception:
+                    pass
+
+            if clear_cold and hasattr(agent, "_cold_memory"):
+                try:
+                    setattr(agent, "_cold_memory", [])
+                    _delete_cold_memory_rows(agent_name=getattr(agent, "name", "unknown"), session_id=key)
+                    cleared = True
+                except Exception:
+                    pass
+
+            if drop_agent and key != "__default__":
+                self._session_agents.pop(key, None)
+                self._session_last_seen.pop(key, None)
+                cleared = True
+                logger.info("Dropped LLM session: agent=%s session_id=%s", self.config.name, key)
+
+            return cleared
 
     def run(self, input_text: str, **kwargs: Any) -> str:
-        input_text = _truncate_input(input_text)
+        session_id = kwargs.pop("session_id", None)
+        max_input_chars = kwargs.pop("max_input_chars", None)
+        max_context_tokens = kwargs.pop("max_context_tokens", None)
+        input_safety_margin = kwargs.pop("input_safety_margin", None)
         max_retries = _parse_int_env("LLM_RETRY_MAX", default=5)
         backoff_base = _parse_float_env("LLM_RETRY_BACKOFF", default=10.0)
+        clear_on_overflow = os.getenv("LLM_CLEAR_SESSION_ON_OVERFLOW", "true").lower() in ("1", "true", "yes")
+        cleared_session_once = False
         attempt = 0
         while True:
+            tool_calling_temporarily_disabled = False
+            original_tool_calling = None
             with self._lock:
-                _maybe_compress_history(self.agent, self.llm)
-                _prune_agent_history(self.agent, upcoming_user_chars=len(input_text))
+                session_key, agent = self._get_session_agent(session_id)
+                setattr(agent, "_session_id", session_key)
+                prepared_input = _augment_with_cold_recall(agent, input_text)
+                prepared_input = _truncate_input(
+                    prepared_input,
+                    max_chars=max_input_chars,
+                    max_context_tokens=max_context_tokens,
+                    max_output_tokens=kwargs.get("max_tokens"),
+                    safety_margin=input_safety_margin,
+                )
+                _maybe_compress_history(agent, self.llm)
+                _prune_agent_history(
+                    agent,
+                    upcoming_user_chars=len(prepared_input),
+                    max_context_tokens=max_context_tokens,
+                    max_output_tokens=kwargs.get("max_tokens"),
+                    safety_margin=input_safety_margin,
+                )
+                _hard_cap_agent_history(agent)
+                if hasattr(agent, "enable_tool_calling"):
+                    original_tool_calling = getattr(agent, "enable_tool_calling", None)
+                tool_calling_temporarily_disabled = _maybe_disable_tool_prompt(
+                    agent,
+                    upcoming_user_chars=len(prepared_input),
+                )
             try:
-                with self._lock:
-                    response = self.agent.run(input_text, **kwargs)
+                try:
+                    with self._lock:
+                        response = agent.run(prepared_input, **kwargs)
+                finally:
+                    if (
+                        tool_calling_temporarily_disabled
+                        and original_tool_calling is not None
+                        and hasattr(agent, "enable_tool_calling")
+                    ):
+                        setattr(agent, "enable_tool_calling", original_tool_calling)
                 logger.info("LLM call success. Output:\n%s", response)
                 _cooldown_after_call()
                 return response
             except Exception as exc:
                 # 上下文超限：缩短输入并重试（避免 max_total_tokens > max_seq_len）
                 if _is_context_overflow_error(exc) and attempt < max_retries:
+                    if clear_on_overflow and not cleared_session_once:
+                        cleared = self.clear_session_memory(session_id=session_key, drop_agent=True)
+                        if cleared:
+                            logger.warning(
+                                "LLM context overflow. Cleared session memory and retrying: agent=%s session_id=%s.",
+                                self.config.name,
+                                session_key,
+                            )
+                        cleared_session_once = True
                     input_text = _shrink_text(input_text, factor=0.8)
                     logger.warning(
                         "LLM context overflow. Shrinking input and retrying (attempt %s/%s).",
@@ -162,29 +299,76 @@ class BaseWritingAgent:
                 raise
 
     def stream(self, input_text: str, **kwargs: Any) -> Iterator[str]:
-        input_text = _truncate_input(input_text)
+        session_id = kwargs.pop("session_id", None)
+        max_input_chars = kwargs.pop("max_input_chars", None)
+        max_context_tokens = kwargs.pop("max_context_tokens", None)
+        input_safety_margin = kwargs.pop("input_safety_margin", None)
         max_retries = _parse_int_env("LLM_RETRY_MAX", default=5)
         backoff_base = _parse_float_env("LLM_RETRY_BACKOFF", default=10.0)
+        clear_on_overflow = os.getenv("LLM_CLEAR_SESSION_ON_OVERFLOW", "true").lower() in ("1", "true", "yes")
+        cleared_session_once = False
         attempt = 0
         while True:
             emitted = False
+            tool_calling_temporarily_disabled = False
+            original_tool_calling = None
             with self._lock:
-                _maybe_compress_history(self.agent, self.llm)
-                _prune_agent_history(self.agent, upcoming_user_chars=len(input_text))
+                session_key, agent = self._get_session_agent(session_id)
+                setattr(agent, "_session_id", session_key)
+                prepared_input = _augment_with_cold_recall(agent, input_text)
+                prepared_input = _truncate_input(
+                    prepared_input,
+                    max_chars=max_input_chars,
+                    max_context_tokens=max_context_tokens,
+                    max_output_tokens=kwargs.get("max_tokens"),
+                    safety_margin=input_safety_margin,
+                )
+                _maybe_compress_history(agent, self.llm)
+                _prune_agent_history(
+                    agent,
+                    upcoming_user_chars=len(prepared_input),
+                    max_context_tokens=max_context_tokens,
+                    max_output_tokens=kwargs.get("max_tokens"),
+                    safety_margin=input_safety_margin,
+                )
+                _hard_cap_agent_history(agent)
+                if hasattr(agent, "enable_tool_calling"):
+                    original_tool_calling = getattr(agent, "enable_tool_calling", None)
+                tool_calling_temporarily_disabled = _maybe_disable_tool_prompt(
+                    agent,
+                    upcoming_user_chars=len(prepared_input),
+                )
             try:
-                # Hold the lock during the whole stream so concurrent requests don't
-                # interleave and corrupt the shared conversation history.
-                with self._lock:
-                    for chunk in self.agent.stream_run(input_text, **kwargs):
-                        if not chunk:
-                            continue
-                        emitted = True
-                        yield chunk
+                try:
+                    # Hold the lock during the whole stream so concurrent requests don't
+                    # interleave and corrupt the shared conversation history.
+                    with self._lock:
+                        for chunk in agent.stream_run(prepared_input, **kwargs):
+                            if not chunk:
+                                continue
+                            emitted = True
+                            yield chunk
+                finally:
+                    if (
+                        tool_calling_temporarily_disabled
+                        and original_tool_calling is not None
+                        and hasattr(agent, "enable_tool_calling")
+                    ):
+                        setattr(agent, "enable_tool_calling", original_tool_calling)
                 _cooldown_after_call()
                 return
             except Exception as exc:
                 # 上下文超限：只在未发送数据时重试，避免前端拼接重复/断裂
                 if _is_context_overflow_error(exc) and attempt < max_retries and not emitted:
+                    if clear_on_overflow and not cleared_session_once:
+                        cleared = self.clear_session_memory(session_id=session_key, drop_agent=True)
+                        if cleared:
+                            logger.warning(
+                                "LLM stream context overflow. Cleared session memory and retrying: agent=%s session_id=%s.",
+                                self.config.name,
+                                session_key,
+                            )
+                        cleared_session_once = True
                     input_text = _shrink_text(input_text, factor=0.8)
                     logger.warning(
                         "LLM stream context overflow. Shrinking input and retrying (attempt %s/%s).",
@@ -280,11 +464,28 @@ def _parse_float_env(name: str, default: float) -> float:
         return default
 
 
-def _truncate_input(text: str) -> str:
-    max_chars = _parse_int_env("LLM_MAX_INPUT_CHARS", default=0)
-    max_context = _parse_int_env("LLM_MAX_CONTEXT_TOKENS", default=0)
-    max_output = _parse_int_env("LLM_MAX_TOKENS", default=0)
-    safety_margin = _parse_int_env("LLM_INPUT_SAFETY_MARGIN", default=4000)
+def _truncate_input(
+    text: str,
+    *,
+    max_chars: int | None = None,
+    max_context_tokens: int | None = None,
+    max_output_tokens: int | None = None,
+    safety_margin: int | None = None,
+) -> str:
+    max_chars = max_chars if isinstance(max_chars, int) and max_chars >= 0 else _parse_int_env("LLM_MAX_INPUT_CHARS", default=0)
+    max_context = (
+        max_context_tokens
+        if isinstance(max_context_tokens, int) and max_context_tokens >= 0
+        else _parse_int_env("LLM_MAX_CONTEXT_TOKENS", default=0)
+    )
+    max_output = (
+        max_output_tokens
+        if isinstance(max_output_tokens, int) and max_output_tokens >= 0
+        else _parse_int_env("LLM_MAX_TOKENS", default=0)
+    )
+    safety_margin = (
+        safety_margin if isinstance(safety_margin, int) and safety_margin >= 0 else _parse_int_env("LLM_INPUT_SAFETY_MARGIN", default=4000)
+    )
     # Rough heuristic: with CJK text 1 token is often ~1 char, but prompts can contain
     # JSON/markdown/URLs; default to a conservative ratio to avoid context overflow.
     chars_per_token = _parse_float_env("LLM_CHARS_PER_TOKEN", default=0.5)
@@ -320,6 +521,65 @@ def _truncate_input(text: str) -> str:
     return truncated
 
 
+def _history_chars(agent: Any) -> int:
+    if not hasattr(agent, "get_history"):
+        return 0
+    try:
+        history = agent.get_history() or []
+    except Exception:
+        return 0
+    total = 0
+    for msg in history:
+        total += len(getattr(msg, "content", "") or "")
+    return total
+
+
+def _maybe_disable_tool_prompt(agent: Any, *, upcoming_user_chars: int) -> bool:
+    """
+    Prevent tool schema bloat from exploding prompt tokens.
+
+    ToolAwareSimpleAgent injects all tool descriptions into the system prompt.
+    When MCP expands many tools, this can exceed provider max_prompt_tokens even
+    if user input/history were already truncated.
+    """
+    if not hasattr(agent, "enable_tool_calling") or not getattr(agent, "enable_tool_calling", False):
+        return False
+    if not hasattr(agent, "_get_enhanced_system_prompt"):
+        return False
+
+    try:
+        enhanced_prompt = agent._get_enhanced_system_prompt()
+    except Exception:
+        return False
+
+    chars_per_token = _parse_float_env("LLM_CHARS_PER_TOKEN", default=0.5)
+    system_tokens = _estimate_tokens(len(enhanced_prompt), chars_per_token)
+    history_tokens = _estimate_tokens(_history_chars(agent), chars_per_token)
+    input_tokens = _estimate_tokens(upcoming_user_chars, chars_per_token)
+    projected_total = system_tokens + history_tokens + input_tokens
+
+    max_tool_prompt_tokens = _parse_int_env("LLM_TOOL_PROMPT_MAX_TOKENS", default=4000)
+    max_context_tokens = _parse_int_env("LLM_MAX_CONTEXT_TOKENS", default=0)
+    context_ratio = _parse_float_env("LLM_TOOL_PROMPT_CONTEXT_RATIO", default=0.8)
+
+    oversize_system = system_tokens > max_tool_prompt_tokens
+    near_context = max_context_tokens > 0 and projected_total > int(max_context_tokens * context_ratio)
+    if not (oversize_system or near_context):
+        return False
+
+    setattr(agent, "enable_tool_calling", False)
+    logger.warning(
+        "Temporarily disabled tool calling due to oversized tool prompt: "
+        "system_tokens=%s history_tokens=%s input_tokens=%s projected=%s max_context=%s.",
+        system_tokens,
+        history_tokens,
+        input_tokens,
+        projected_total,
+        max_context_tokens if max_context_tokens > 0 else "unset",
+    )
+    return True
+
+
 def _shrink_text(text: str, factor: float = 0.8) -> str:
     # Emergency shrink for provider-side context overflow errors. Keep head+tail to
     # preserve instruction + recent content.
@@ -337,16 +597,33 @@ def _shrink_text(text: str, factor: float = 0.8) -> str:
     return truncated
 
 
-def _prune_agent_history(agent: Any, *, upcoming_user_chars: int) -> None:
+def _prune_agent_history(
+    agent: Any,
+    *,
+    upcoming_user_chars: int,
+    max_context_tokens: int | None = None,
+    max_output_tokens: int | None = None,
+    safety_margin: int | None = None,
+) -> None:
     """
     Keep conversation memory, but bound it so the provider context window isn't exceeded.
 
     hello_agents SimpleAgent stores history in-memory; since our services are singletons,
     this history can grow across requests and eventually hit max_seq_len.
     """
-    max_context = _parse_int_env("LLM_MAX_CONTEXT_TOKENS", default=0)
-    max_output = _parse_int_env("LLM_MAX_TOKENS", default=0)
-    safety_margin = _parse_int_env("LLM_INPUT_SAFETY_MARGIN", default=4000)
+    max_context = (
+        max_context_tokens
+        if isinstance(max_context_tokens, int) and max_context_tokens >= 0
+        else _parse_int_env("LLM_MAX_CONTEXT_TOKENS", default=0)
+    )
+    max_output = (
+        max_output_tokens
+        if isinstance(max_output_tokens, int) and max_output_tokens >= 0
+        else _parse_int_env("LLM_MAX_TOKENS", default=0)
+    )
+    safety_margin = (
+        safety_margin if isinstance(safety_margin, int) and safety_margin >= 0 else _parse_int_env("LLM_INPUT_SAFETY_MARGIN", default=4000)
+    )
     chars_per_token = _parse_float_env("LLM_CHARS_PER_TOKEN", default=0.5)
 
     # Optional hard cap for history size (chars). If unset, derive from context budget.
@@ -380,6 +657,7 @@ def _prune_agent_history(agent: Any, *, upcoming_user_chars: int) -> None:
         return
 
     sanitized, deferred, forgotten = _apply_memory_policy(history)
+    _log_memory_policy_stats(sanitized, deferred, forgotten, context="prune")
     if deferred:
         _push_cold_memory(agent, deferred)
     if forgotten:
@@ -388,19 +666,32 @@ def _prune_agent_history(agent: Any, *, upcoming_user_chars: int) -> None:
     pinned = [msg for msg, action in sanitized if action == "pin"]
     normal = [msg for msg, action in sanitized if action in ("normal", "compress")]
 
+    # Bound pinned ratio first, otherwise pin-only history can starve normal context.
+    max_pin_ratio = _parse_float_env("LLM_MEMORY_MAX_PIN_RATIO", default=0.35)
+    max_pinned_count = max(1, int(len(sanitized) * _clamp(max_pin_ratio, 0.05, 0.95)))
+    if len(pinned) > max_pinned_count:
+        pinned = pinned[-max_pinned_count:]
+
     pinned_chars = sum(len(getattr(m, "content", "") or "") for m in pinned)
     if pinned and pinned_chars > allowed_history_chars:
-        # Truncate pinned messages proportionally to fit the budget.
-        per = max(200, int(allowed_history_chars / max(len(pinned), 1)))
-        new_pinned: list[Any] = []
-        for msg in pinned:
+        # Keep newest pinned messages and trim the last one as needed so total <= allowed.
+        kept_pinned: list[Any] = []
+        used = 0
+        for msg in reversed(pinned):
+            if used >= allowed_history_chars:
+                break
             content = getattr(msg, "content", "") or ""
-            if len(content) > per:
-                content = _truncate_text_tail(content, per)
+            room = allowed_history_chars - used
+            if room <= 0:
+                break
+            if len(content) > room:
+                content = _truncate_text_tail(content, room)
                 msg = _clone_message(msg, content)
-            new_pinned.append(msg)
-        pinned = new_pinned
-        pinned_chars = sum(len(getattr(m, "content", "") or "") for m in pinned)
+            kept_pinned.append(msg)
+            used += len(getattr(msg, "content", "") or "")
+        kept_pinned.reverse()
+        pinned = kept_pinned
+        pinned_chars = used
 
     available = max(0, allowed_history_chars - pinned_chars)
     kept_norm: list[Any] = []
@@ -436,6 +727,59 @@ def _prune_agent_history(agent: Any, *, upcoming_user_chars: int) -> None:
         sum(len(getattr(m, "content", "") or "") for m in kept),
         sum(len(getattr(m, "content", "") or "") for m in history),
         allowed_history_chars,
+    )
+
+
+def _hard_cap_agent_history(agent: Any) -> None:
+    if not hasattr(agent, "get_history") or not hasattr(agent, "clear_history") or not hasattr(agent, "add_message"):
+        return
+    max_messages = max(0, _parse_int_env("LLM_SESSION_MAX_HISTORY_MESSAGES", default=80))
+    max_chars = max(0, _parse_int_env("LLM_SESSION_MAX_HISTORY_CHARS", default=12000))
+    if max_messages <= 0 and max_chars <= 0:
+        return
+
+    history = agent.get_history() or []
+    if not history:
+        return
+    total_chars = sum(len(getattr(m, "content", "") or "") for m in history)
+    if (max_messages <= 0 or len(history) <= max_messages) and (max_chars <= 0 or total_chars <= max_chars):
+        return
+
+    summary_prefix = ("[LONG_TERM_SUMMARY]", "[RECENT_SUMMARY]")
+    pinned_summaries = [m for m in history if (getattr(m, "content", "") or "").startswith(summary_prefix)]
+    normal = [m for m in history if m not in pinned_summaries]
+
+    kept_rev: list[Any] = []
+    used_chars = sum(len(getattr(m, "content", "") or "") for m in pinned_summaries)
+    max_normal_messages = max_messages - len(pinned_summaries) if max_messages > 0 else 0
+    for msg in reversed(normal):
+        if max_messages > 0 and len(kept_rev) >= max(0, max_normal_messages):
+            break
+        content = getattr(msg, "content", "") or ""
+        if max_chars > 0 and used_chars + len(content) > max_chars:
+            if not kept_rev:
+                room = max(0, max_chars - used_chars)
+                if room > 0:
+                    trimmed = _truncate_text_tail(content, room)
+                    kept_rev.append(_clone_message(msg, trimmed))
+                    used_chars += len(trimmed)
+            break
+        kept_rev.append(msg)
+        used_chars += len(content)
+    kept_rev.reverse()
+    rebuilt = [*pinned_summaries, *kept_rev]
+
+    agent.clear_history()
+    for msg in rebuilt:
+        agent.add_message(msg)
+    logger.info(
+        "Hard-capped session history: kept_msgs=%s/%s kept_chars=%s/%s max_msgs=%s max_chars=%s",
+        len(rebuilt),
+        len(history),
+        sum(len(getattr(m, "content", "") or "") for m in rebuilt),
+        total_chars,
+        max_messages if max_messages > 0 else "unset",
+        max_chars if max_chars > 0 else "unset",
     )
 
 
@@ -499,6 +843,7 @@ def _maybe_compress_history(agent: Any, llm: HelloAgentsLLM) -> None:
         return
 
     sanitized, deferred, forgotten = _apply_memory_policy(history)
+    _log_memory_policy_stats(sanitized, deferred, forgotten, context="compress")
     if deferred:
         _push_cold_memory(agent, deferred)
     if forgotten:
@@ -567,6 +912,9 @@ def _maybe_compress_history(agent: Any, llm: HelloAgentsLLM) -> None:
     # Merge into long-term summary if we already have one and recent summary grows too big.
     merge_threshold = _parse_float_env("LLM_CONTEXT_COMPRESS_MERGE_THRESHOLD", default=0.6)
     merge_target = _parse_float_env("LLM_CONTEXT_COMPRESS_MERGE_TARGET", default=0.35)
+    layered_long_ratio = _parse_float_env("LLM_LAYERED_LONG_RATIO", default=0.35)
+    layered_recent_ratio = _parse_float_env("LLM_LAYERED_RECENT_RATIO", default=0.25)
+    layered_tail_ratio = _parse_float_env("LLM_LAYERED_TAIL_RATIO", default=0.4)
     long_summary_text = long_summary or ""
     if long_summary_text and recent_summary_text:
         combined_len = len(long_summary_text) + len(recent_summary_text)
@@ -586,6 +934,15 @@ def _maybe_compress_history(agent: Any, llm: HelloAgentsLLM) -> None:
                 long_summary_text = _truncate_text_tail(long_summary_text, int(budget_chars * merge_target))
             recent_summary_text = ""
 
+    long_cap = int(budget_chars * max(0.05, min(layered_long_ratio, 0.9)))
+    recent_cap = int(budget_chars * max(0.05, min(layered_recent_ratio, 0.9)))
+    tail_cap = int(budget_chars * max(0.05, min(layered_tail_ratio, 0.9)))
+    if long_summary_text and len(long_summary_text) > long_cap:
+        long_summary_text = _truncate_text_tail(long_summary_text, long_cap)
+    if recent_summary_text and len(recent_summary_text) > recent_cap:
+        recent_summary_text = _truncate_text_tail(recent_summary_text, recent_cap)
+    tail = _truncate_tail_messages(tail, tail_cap)
+
     # Rebuild history with layered summaries + tail messages.
     agent.clear_history()
     for msg in pinned:
@@ -598,12 +955,15 @@ def _maybe_compress_history(agent: Any, llm: HelloAgentsLLM) -> None:
         agent.add_message(msg)
 
     logger.info(
-        "Layered compression: total=%s chars (est_tokens=%s). long=%s recent=%s kept_tail=%s msgs.",
+        "Layered compression: total=%s chars (est_tokens=%s). long=%s/%s recent=%s/%s kept_tail=%s msgs (tail_cap=%s).",
         total_chars,
         history_tokens_est,
         len(long_summary_text),
+        long_cap,
         len(recent_summary_text),
+        recent_cap,
         len(tail),
+        tail_cap,
     )
 
 
@@ -617,7 +977,7 @@ def _extract_layered_memory(history: list[Any], summary_tags: tuple[str, str]) -
     long_summary = None
     recent_summary = None
     normal_msgs: list[Any] = []
-    for msg in history:
+    for idx, msg in enumerate(history):
         content = getattr(msg, "content", "") or ""
         if content.startswith(summary_tags[0]):
             long_summary = content[len(summary_tags[0]):].lstrip()
@@ -666,7 +1026,7 @@ def _apply_memory_policy(history: list[Any]) -> tuple[list[tuple[Any, str]], lis
     deferred: list[Any] = []
     forgotten: list[Any] = []
 
-    for msg in history:
+    for idx, msg in enumerate(history):
         content = getattr(msg, "content", "") or ""
         meta = getattr(msg, "metadata", None) or {}
         action = meta.get("memory") if prefer_meta else None
@@ -688,6 +1048,9 @@ def _apply_memory_policy(history: list[Any]) -> tuple[list[tuple[Any, str]], lis
             else:
                 action = "normal"
 
+        if action == "normal":
+            action = _auto_memory_action(msg, idx=idx, total=max(1, len(history)))
+
         if action == "forget":
             forgotten.append(msg)
             continue
@@ -704,6 +1067,120 @@ def _apply_memory_policy(history: list[Any]) -> tuple[list[tuple[Any, str]], lis
         sanitized.append((msg, action))
 
     return sanitized, deferred, forgotten
+
+
+def _truncate_tail_messages(messages: list[Any], max_chars: int) -> list[Any]:
+    if max_chars <= 0 or not messages:
+        return []
+    kept: list[Any] = []
+    total = 0
+    for msg in reversed(messages):
+        content = getattr(msg, "content", "") or ""
+        size = len(content)
+        if kept and total + size > max_chars:
+            break
+        if not kept and size > max_chars:
+            trimmed = _truncate_text_tail(content, max_chars)
+            kept.append(_clone_message(msg, trimmed))
+            total = len(trimmed)
+            break
+        kept.append(msg)
+        total += size
+    kept.reverse()
+    return kept
+
+
+def _log_memory_policy_stats(
+    sanitized: list[tuple[Any, str]],
+    deferred: list[Any],
+    forgotten: list[Any],
+    *,
+    context: str,
+) -> None:
+    verbose = os.getenv("LLM_MEMORY_LOG_VERBOSE", "true").lower() in ("1", "true", "yes")
+    if not verbose:
+        return
+    counts = {"pin": 0, "compress": 0, "normal": 0}
+    for _, action in sanitized:
+        counts[action] = counts.get(action, 0) + 1
+    total = len(sanitized) + len(deferred) + len(forgotten)
+    logger.info(
+        "Memory policy (%s): total=%s pin=%s compress=%s normal=%s defer=%s forget=%s",
+        context,
+        total,
+        counts.get("pin", 0),
+        counts.get("compress", 0),
+        counts.get("normal", 0),
+        len(deferred),
+        len(forgotten),
+    )
+
+
+def _auto_memory_action(msg: Any, *, idx: int, total: int) -> str:
+    enabled = os.getenv("LLM_MEMORY_AUTO_POLICY_ENABLED", "true").lower() in ("1", "true", "yes")
+    if not enabled:
+        return "normal"
+
+    content = (getattr(msg, "content", "") or "").strip()
+    if not content:
+        return "forget"
+
+    min_chars = max(0, _parse_int_env("LLM_MEMORY_MIN_CHARS", default=16))
+    if len(content) < min_chars:
+        return "forget"
+
+    score = _memory_score(msg, idx=idx, total=total)
+    pin_threshold = _parse_float_env("LLM_MEMORY_PIN_THRESHOLD", default=0.82)
+    compress_threshold = _parse_float_env("LLM_MEMORY_COMPRESS_THRESHOLD", default=0.56)
+    defer_threshold = _parse_float_env("LLM_MEMORY_DEFER_THRESHOLD", default=0.3)
+
+    if score >= pin_threshold:
+        return "pin"
+    if score >= compress_threshold:
+        return "compress"
+    if score >= defer_threshold:
+        return "defer"
+    return "forget"
+
+
+def _memory_score(msg: Any, *, idx: int, total: int) -> float:
+    role = (getattr(msg, "role", "") or "").lower()
+    content = (getattr(msg, "content", "") or "")
+    lc = content.lower()
+
+    role_score_map = {
+        "system": 1.0,
+        "user": 0.95,
+        "tool": 0.8,
+        "assistant": 0.65,
+    }
+    role_score = role_score_map.get(role, 0.5)
+
+    recency = (idx + 1) / max(1, total)
+    length_score = min(1.0, len(content) / max(1.0, _parse_float_env("LLM_MEMORY_LENGTH_BASE", default=1200.0)))
+
+    keywords_raw = os.getenv(
+        "LLM_MEMORY_IMPORTANT_KEYWORDS",
+        "constraint,requirements,must,style,format,citation,source,topic,goal,不要,必须,约束,风格,引用,目标",
+    )
+    keywords = [item.strip().lower() for item in keywords_raw.split(",") if item.strip()]
+    hits = sum(1 for kw in keywords if kw in lc)
+    keyword_score = min(1.0, hits / max(1.0, _parse_float_env("LLM_MEMORY_KEYWORD_HITS_BASE", default=3.0)))
+
+    recency_w = _parse_float_env("LLM_MEMORY_RECENCY_WEIGHT", default=0.4)
+    role_w = _parse_float_env("LLM_MEMORY_ROLE_WEIGHT", default=0.2)
+    length_w = _parse_float_env("LLM_MEMORY_LENGTH_WEIGHT", default=0.1)
+    keyword_w = _parse_float_env("LLM_MEMORY_KEYWORD_WEIGHT", default=0.3)
+    weighted = (recency * recency_w) + (role_score * role_w) + (length_score * length_w) + (keyword_score * keyword_w)
+    return _clamp(weighted, 0.0, 1.0)
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    if value < low:
+        return low
+    if value > high:
+        return high
+    return value
 
 
 def _push_cold_memory(agent: Any, messages: list[Any]) -> None:
@@ -735,6 +1212,7 @@ def _persist_cold_memory(agent: Any, messages: list[Any]) -> None:
             CREATE TABLE IF NOT EXISTS cold_memory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_name TEXT NOT NULL,
+                session_id TEXT,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 metadata TEXT,
@@ -742,9 +1220,14 @@ def _persist_cold_memory(agent: Any, messages: list[Any]) -> None:
             )
             """
         )
+        cols = conn.execute("PRAGMA table_info(cold_memory)").fetchall()
+        col_names = {str(row[1]).lower() for row in cols}
+        if "session_id" not in col_names:
+            conn.execute("ALTER TABLE cold_memory ADD COLUMN session_id TEXT")
         now = datetime.utcnow().isoformat()
         cur = conn.cursor()
         agent_name = getattr(agent, "name", "unknown")
+        session_id = getattr(agent, "_session_id", "__default__")
         for msg in messages:
             role = getattr(msg, "role", "assistant")
             content = getattr(msg, "content", "") or ""
@@ -758,13 +1241,91 @@ def _persist_cold_memory(agent: Any, messages: list[Any]) -> None:
                     metadata = None
             cur.execute(
                 """
-                INSERT INTO cold_memory (agent_name, role, content, metadata, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO cold_memory (agent_name, session_id, role, content, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (agent_name, role, content, metadata, now),
+                (agent_name, session_id, role, content, metadata, now),
             )
         conn.commit()
         conn.close()
         logger.info("Persisted %s cold memory items to SQLite.", len(messages))
     except Exception as exc:
         logger.warning("Failed to persist cold memory: %s", exc)
+
+
+def _delete_cold_memory_rows(*, agent_name: str, session_id: str) -> None:
+    db_path = os.getenv("LLM_COLD_STORE_PATH") or os.getenv("STORAGE_PATH") or ""
+    if not db_path:
+        return
+    try:
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.execute(
+            "DELETE FROM cold_memory WHERE agent_name = ? AND session_id = ?",
+            (agent_name, session_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning("Failed to clear cold memory rows: %s", exc)
+
+
+def _augment_with_cold_recall(agent: Any, input_text: str) -> str:
+    if not input_text:
+        return input_text
+    enabled = os.getenv("LLM_COLD_RECALL_ENABLED", "true").lower() in ("1", "true", "yes")
+    if not enabled:
+        return input_text
+    recalled = _recall_cold_memory(agent, input_text)
+    if not recalled:
+        return input_text
+    block = "\n\n[Recovered memory]\n" + "\n".join(f"- {item}" for item in recalled)
+    merged = input_text + block
+    logger.info("Injected cold memory into prompt: %s snippets", len(recalled))
+    return merged
+
+
+def _recall_cold_memory(agent: Any, query: str) -> list[str]:
+    db_path = os.getenv("LLM_COLD_STORE_PATH") or os.getenv("STORAGE_PATH") or ""
+    if not db_path:
+        return []
+    top_k = max(1, _parse_int_env("LLM_COLD_RECALL_TOP_K", default=3))
+    max_chars = max(200, _parse_int_env("LLM_COLD_RECALL_MAX_CHARS", default=300))
+    lookback = max(20, _parse_int_env("LLM_COLD_RECALL_LOOKBACK", default=200))
+    agent_name = getattr(agent, "name", "unknown")
+    session_id = getattr(agent, "_session_id", "__default__")
+    query_terms = tokenize(query, lowercase=True)
+    if not query_terms:
+        return []
+
+    try:
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT content FROM cold_memory
+            WHERE agent_name = ? AND session_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (agent_name, session_id, lookback),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+
+    scored: list[tuple[float, str]] = []
+    for row in rows:
+        content = (row["content"] or "").strip()
+        if not content:
+            continue
+        terms = tokenize(content, lowercase=True)
+        if not terms:
+            continue
+        overlap = len(query_terms & terms)
+        if overlap <= 0:
+            continue
+        score = overlap / max(1, len(query_terms))
+        scored.append((score, content))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected = [text[:max_chars] for _, text in scored[:top_k]]
+    return selected

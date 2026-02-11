@@ -174,8 +174,7 @@ onMounted(loadVersions);
 
 <style scoped>
 .page {
-  max-width: 1320px;
-  margin: 0 auto;
+  width: 100%;
 }
 
 .section-header {

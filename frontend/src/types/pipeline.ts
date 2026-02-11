@@ -32,6 +32,7 @@ export interface PipelineRequest {
   key_points?: string;
   review_criteria?: string;
   sources?: SourceDocumentInput[];
+  session_id?: string;
 }
 
 export interface PipelineResponse {

@@ -40,6 +40,8 @@ export const runPipelineStream = async (
   const activityTimeout = 600000; // 10分钟无数据才认为连接断开
   let receivedResult = false;
   let receivedAny = false;
+  let receivedError = false;
+  let errorDetail = "";
 
     try {
       while (true) {
@@ -67,6 +69,10 @@ export const runPipelineStream = async (
             if (evt?.type === "result") {
               receivedResult = true;
             }
+            if (evt?.type === "error") {
+              receivedError = true;
+              errorDetail = String(evt?.detail || "Pipeline stream failed");
+            }
             onEvent(evt);
           } catch {
             // ignore parse errors
@@ -92,6 +98,10 @@ export const runPipelineStream = async (
               if (evt?.type === "result") {
                 receivedResult = true;
               }
+              if (evt?.type === "error") {
+                receivedError = true;
+                errorDetail = String(evt?.detail || "Pipeline stream failed");
+              }
               onEvent(evt);
             } catch {
               // ignore parse errors
@@ -102,10 +112,13 @@ export const runPipelineStream = async (
     }
 
     if (!receivedResult) {
-      if (receivedAny) {
-        return;
+      if (receivedError) {
+        throw new Error(errorDetail || "Pipeline stream failed");
       }
-      throw new Error("Stream ended before final result");
+      if (receivedAny) {
+        throw new Error("Pipeline stream ended before final result");
+      }
+      throw new Error("Stream ended before receiving any pipeline event");
     }
   } finally {
     clearTimeout(timeoutId); // 清除超时定时器

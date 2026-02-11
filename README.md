@@ -54,6 +54,8 @@
 - **动态 RAG 检索**：`top_k` 与候选集按语料规模自动调整（50/500 阈值分桶）
 - **RAG 引用与拒答机制**：支持 `RAG_CITATION_ENFORCE` 强制引用；检索不足时可触发拒答
 - **两段式证据生成**：强制引用开启时，先抽取证据，再基于证据生成内容
+- **会话记忆隔离与清理**：按 `session_id` 隔离 Agent 历史（TTL 回收），前端支持一键重置会话记忆
+- **冷存回忆注入**：延后/冷存记忆可按 query 召回，自动回注到上下文
 - **GitHub MCP 接入**：支持将 GitHub 结果注入研究素材，并提供显式 MCP API
 - **评测可视化与失败样本分析**：前端直接展示各 K 曲线与逐 query 失败样本
 - **历史页可收起详情**：版本详情/差异对比/评测详情支持展开与收起
@@ -395,6 +397,7 @@ STORAGE_PATH=./data/app.db
 - `POST /api/citations` - 生成引用与参考文献
 - `GET /api/settings/citation` - 获取强制引用开关
 - `POST /api/settings/citation` - 设置强制引用开关
+- `POST /api/settings/session-memory/clear` - 清理指定会话记忆（支持删除会话 Agent/清冷存）
 
 #### MCP（GitHub）
 - `GET /api/mcp/github/tools` - 列出可用 GitHub MCP 工具
@@ -438,6 +441,23 @@ Agent 的 Prompt 定义在各自的类中，可以通过修改 `system_prompt` �
 - 极小文档集（<10 个文档）的质量过滤策略可进一步改进
 
 ## 📝 更新日志
+
+### v0.5.0 (2026-02-11)
+**🧠 记忆与链路稳定性增强版**
+
+#### 会话记忆与模式拆分
+- ✨ 新增 `RETRIEVAL_MODE`（`sqlite_only` / `hybrid`）与 `CONVERSATION_MEMORY_MODE`（`session` / `global`）双开关
+- ✨ 新增会话级 Agent 隔离与 TTL 回收（避免跨任务历史串扰）
+- ✨ 新增会话记忆清理接口 `POST /api/settings/session-memory/clear`，前端工作区支持“一键重置会话记忆”
+
+#### 冷存记忆闭环
+- ✨ 新增冷存召回（cold recall）并回注上下文，解决“能冷存但不回忆”的问题
+- ✨ 新增分层记忆注入策略（最近历史 + 压缩摘要 + 冷存召回）
+
+#### Pipeline 与流式稳定性
+- 🔧 修复一键 Pipeline 前端阶段进度与后端链路不同步问题
+- 🔧 修复部分场景下非流式回退导致页面提前结束的问题
+- 🔧 增加阶段级输入预算与提示词裁剪保护，降低超长上下文导致的 400 报错风险
 
 ### v0.4.0 (2026-02-10)
 **📊 评测与体验增强版**
