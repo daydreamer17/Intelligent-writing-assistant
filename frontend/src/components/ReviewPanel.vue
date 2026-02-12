@@ -1,7 +1,7 @@
 <template>
   <section class="card">
     <h3>审校</h3>
-    <div class="markdown" v-text="review" />
+    <div class="markdown writing-content" v-text="review" />
   </section>
 </template>
 

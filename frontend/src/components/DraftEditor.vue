@@ -4,7 +4,7 @@
       <h3>草稿</h3>
       <button class="btn ghost" @click="emit('update', localDraft)">保存编辑</button>
     </div>
-    <textarea v-model="localDraft" rows="14"></textarea>
+    <textarea class="writing-content" v-model="localDraft" rows="14"></textarea>
   </section>
 </template>
 
@@ -40,6 +40,5 @@ textarea {
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px;
-  font: inherit;
 }
 </style>
