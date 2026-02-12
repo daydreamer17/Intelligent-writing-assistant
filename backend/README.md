@@ -1,305 +1,152 @@
-﻿# Writing Assistant Backend
+# Writing Assistant Backend
 
-FastAPI backend for a multi-agent writing pipeline (plan -> draft -> review -> rewrite) with optional RAG and version history.
+基于 FastAPI 的多 Agent 写作后端，提供分步写作、一键 Pipeline、RAG 检索、引用约束、会话记忆和离线检索评测能力。
 
-## Architecture Overview
-- Agents: WritingAgent, ReviewerAgent, EditorAgent (hello-agents)
-- Services: PlanningService, DraftingService, ReviewingService, RewritingService, WritingPipeline
-- RAG: RAGService + optional Qdrant vector store (HashEmbedding fallback)
-- Storage: SQLite for documents, draft versions, citations
-- API: FastAPI routers for writing, pipeline, rag, citations, versions
+## 1. 核心能力
 
-## Recent Enhancements
-- Dynamic RAG retrieval plan by corpus size (`RAG_DYNAMIC_TOPK_*`)
-- Dynamic research notes count in pipeline (`RAG_NOTES_DYNAMIC_*`)
-- Optional citation enforcement toggle (`RAG_CITATION_ENFORCE`) for pipeline and step-by-step routes
-- Refusal guardrail when retrieval quality is too low (`RAG_REFUSAL_*`)
-- Two-pass evidence-first generation when citation enforcement is enabled
-- Coverage metrics returned from pipeline (`coverage` + `coverage_detail`)
-- GitHub MCP integration and explicit MCP APIs (`/api/mcp/github/*`)
-- Unified Chinese tokenization via `jieba` for retrieval and citation matching
-- Offline retrieval evaluation API (`/api/rag/evaluate`) with Recall/Precision/HitRate/MRR/nDCG
-- Retrieval evaluation history persistence in SQLite (`/api/rag/evaluations*`)
-- RAG file upload now supports `.txt / .pdf / .docx / .md / .markdown` with markdown-to-plain-text extraction
-- Session-isolated conversation memory with TTL cleanup (`CONVERSATION_MEMORY_MODE=session`)
-- Cold-store recall injection (deferred memory can be retrieved back into prompt context)
-- Session memory reset API (`POST /api/settings/session-memory/clear`) and frontend reset button
-- Retrieval mode split (`RETRIEVAL_MODE=sqlite_only|hybrid`) decoupled from conversation memory mode
+- 写作流程：`plan -> draft -> review -> rewrite -> citations`
+- 流式接口：分步与 Pipeline 均支持 SSE
+- RAG：文档上传、检索、动态 `top_k`、HyDE（可选）、Rerank（可选）
+- 引用机制：可选强制引用、两段式证据生成、覆盖率评估与拒答保护
+- 记忆机制：会话隔离（`session_id`）、上下文压缩、冷存写入与冷存召回
+- 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化
+- MCP：可选 GitHub MCP 显式工具调用
 
-## Project Layout
-```
+## 2. 目录结构（简版）
+
+```text
 backend/
   app/
-    agents/        # LLM agents and prompts
-    api/           # FastAPI app + routers
-    models/        # Pydantic schemas + entities
-    services/      # Pipeline, RAG, storage, embeddings
-    config.py      # Env configuration
-  data/            # SQLite db file (default)
-  main.py          # Uvicorn entry
+    agents/        # Writing / Reviewer / Editor
+    api/routes/    # writing / pipeline / rag / versions / settings / mcp_github
+    services/      # pipeline, rag, citation, retrieval_eval, storage...
+    models/
+    config.py
+  data/
+  main.py
   requirements.txt
-  README.md
+  .env.example
 ```
 
-## Requirements
-- Python 3.10+
+## 3. 快速启动
 
-## Setup
 ```bash
 cd backend
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-## Configuration
-Create a `.env` file in `backend/` (or copy from `.env.example` if you have one) and set what you need.
-
-### LLM
-- `LLM_PROVIDER`
-- `LLM_MODEL`
-- `LLM_API_KEY`
-- `LLM_API_BASE`
-- `LLM_TIMEOUT` (seconds)
-- `LLM_MAX_TOKENS` (max output tokens)
-
-### LLM reliability (optional)
-- `LLM_RETRY_MAX`
-- `LLM_RETRY_BACKOFF` (seconds)
-- `LLM_COOLDOWN_SECONDS` (seconds)
-
-### LLM context control (recommended)
-- `LLM_MAX_INPUT_CHARS` (hard cap for prompt input)
-- `LLM_MAX_CONTEXT_TOKENS` (model context window)
-- `LLM_INPUT_SAFETY_MARGIN` (reserved tokens to avoid overflow)
-- `LLM_CHARS_PER_TOKEN` (heuristic, e.g. 0.6)
-- `LLM_HISTORY_MAX_CHARS` (cap in-memory history)
-
-### LLM context compression (optional)
-- `LLM_CONTEXT_COMPRESS_ENABLED=true|false`
-- `LLM_CONTEXT_COMPRESS_THRESHOLD` (trigger ratio, e.g. 0.85)
-- `LLM_CONTEXT_COMPRESS_TARGET` (target ratio after compression, e.g. 0.5)
-- `LLM_CONTEXT_COMPRESS_KEEP_LAST` (keep last N messages verbatim)
-- `LLM_CONTEXT_COMPRESS_MAX_TOKENS` (summary max tokens)
-- `LLM_CONTEXT_COMPRESS_INPUT_CHARS` (summary input cap)
-- `LLM_CONTEXT_COMPRESS_MERGE_THRESHOLD` (merge summaries ratio)
-- `LLM_CONTEXT_COMPRESS_MERGE_TARGET` (merged summary target ratio)
-
-### Storage
-- `STORAGE_PATH` (default `data/app.db`)
-
-### Retrieval + Conversation Memory
-- `RETRIEVAL_MODE=sqlite_only|hybrid`
-- `CONVERSATION_MEMORY_MODE=session|global`
-- `MEMORY_MODE` remains as a legacy compatibility flag (auto-derived from `RETRIEVAL_MODE`)
-
-Conversation memory controls:
-- `LLM_SESSION_MAX_AGENTS` (session agent pool size)
-- `LLM_SESSION_TTL_SECONDS` (session agent TTL)
-- `LLM_SESSION_MAX_HISTORY_MESSAGES` (per-session history cap)
-- `LLM_SESSION_MAX_HISTORY_CHARS` (per-session character cap)
-
-Cold-store memory controls:
-- `LLM_COLD_STORE_ENABLED`
-- `LLM_COLD_STORE_PATH`
-- `LLM_COLD_STORE_MAX_CHARS`
-- `LLM_COLD_RECALL_ENABLED`
-- `LLM_COLD_RECALL_TOP_K`
-- `LLM_COLD_RECALL_MAX_CHARS`
-- `LLM_COLD_RECALL_LOOKBACK`
-
-**RAG storage behavior**
-- SQLite always stores the document text, titles, metadata, and version history.
-- Qdrant is used for vector retrieval when `RETRIEVAL_MODE=hybrid` and `QDRANT_URL` is set.
-- If Qdrant is unavailable, the system falls back to SQLite keyword search, but still stores all documents in SQLite.
-
-Qdrant (enabled when `RETRIEVAL_MODE=hybrid` and `QDRANT_URL` is set):
-- `QDRANT_URL`
-- `QDRANT_API_KEY` (optional)
-- `QDRANT_COLLECTION` (default `writing_memory`)
-- `QDRANT_EMBED_DIM` (default 256)
-- `QDRANT_DISTANCE` (cosine | dot | euclid)
-- `QDRANT_TIMEOUT` (seconds, default 30)
-
-Embeddings (used by Qdrant when `EMBEDDING_PROVIDER` is not `hash`):
-- `EMBEDDING_PROVIDER` (default `openai_compatible`)
-- `EMBEDDING_MODEL`
-- `EMBEDDING_API_BASE` (falls back to `LLM_API_BASE` if empty)
-- `EMBEDDING_API_KEY`
-- `EMBEDDING_TIMEOUT` (seconds, default 20)
-- `EMBEDDING_PROBE=true|false` (probe embedding dim at startup)
-- `AUTO_UPDATE_ENV=true|false` (update `.env` QDRANT_EMBED_DIM when probe differs)
-
-### Upload limits
-- `UPLOAD_MAX_MB` (default 10)
-
-### Pipeline throttling (optional)
-- `PIPELINE_STAGE_SLEEP` (seconds between stages)
-- `PIPELINE_EFFECTIVE_OUTPUT_MIN_CHARS` (minimum chars considered effective output)
-
-### RAG retrieval strategy (optional)
-- `RAG_HYDE_ENABLED`
-- `RAG_QUERY_MAX_CHARS`
-- `RAG_HYDE_MAX_CHARS`
-- `RAG_HYDE_MAX_TOKENS`
-- `RAG_MAX_EXPANSION_QUERIES`
-- `RAG_RERANK_ENABLED`
-- `RAG_RERANK_TOP_K`
-- `RAG_RERANK_MAX_CANDIDATES`
-- `RAG_RERANK_SNIPPET_CHARS`
-- `RAG_RERANK_MAX_PROMPT_CHARS`
-- `RAG_RERANK_MAX_TOKENS`
-
-### RAG dynamic retrieval by corpus size (optional)
-- `RAG_DYNAMIC_TOPK_ENABLED`
-- `RAG_DYNAMIC_SMALL_THRESHOLD`
-- `RAG_DYNAMIC_LARGE_THRESHOLD`
-- `RAG_DYNAMIC_TOPK_SMALL`
-- `RAG_DYNAMIC_TOPK_MEDIUM`
-- `RAG_DYNAMIC_TOPK_LARGE`
-- `RAG_DYNAMIC_CANDIDATES_SMALL`
-- `RAG_DYNAMIC_CANDIDATES_MEDIUM`
-- `RAG_DYNAMIC_CANDIDATES_LARGE`
-
-### RAG dynamic notes count (pipeline)
-- `RAG_NOTES_DYNAMIC_ENABLED`
-- `RAG_NOTES_TOP_K`
-- `RAG_NOTES_SMALL_THRESHOLD`
-- `RAG_NOTES_LARGE_THRESHOLD`
-- `RAG_NOTES_TOP_K_SMALL`
-- `RAG_NOTES_TOP_K_MEDIUM`
-- `RAG_NOTES_TOP_K_LARGE`
-
-### Citation/coverage/refusal (optional)
-- `RAG_CITATION_ENFORCE`
-- `RAG_CITATION_REQUIRE_ALL_LABELS`
-- `RAG_CITATION_APPEND_MISSING_TO_TAIL`
-- `RAG_CITATION_TAIL_PREFIX`
-- `RAG_CITATION_TOP_K`
-- `RAG_COVERAGE_THRESHOLD`
-- `RAG_COVERAGE_SEMANTIC_ENABLED`
-- `RAG_COVERAGE_SEMANTIC_THRESHOLD`
-- `RAG_COVERAGE_SEMANTIC_MAX_PARAGRAPHS`
-- `RAG_COVERAGE_SEMANTIC_MAX_NOTES`
-- `RAG_COVERAGE_SEMANTIC_BATCH_SIZE`
-- `RAG_COVERAGE_SEMANTIC_MAX_TEXT_CHARS`
-- `RAG_REFUSAL_ENABLED`
-- `RAG_REFUSAL_MODE` (`strict` | `fallback`)
-- `RAG_REFUSAL_MIN_QUERY_TERMS`
-- `RAG_REFUSAL_MIN_DOCS`
-- `RAG_REFUSAL_MIN_RECALL`
-- `RAG_REFUSAL_MIN_AVG_RECALL`
-- `RAG_REFUSAL_FALLBACK_TOP_K`
-- `RAG_REFUSAL_FALLBACK_MIN_DOCS`
-- `RAG_REFUSAL_FALLBACK_MIN_RECALL`
-- `RAG_REFUSAL_FALLBACK_MIN_AVG_RECALL`
-- `RAG_EVIDENCE_MAX_ITEMS`
-- `RAG_EVIDENCE_MAX_CHARS`
-- `RAG_EVIDENCE_MAX_TOKENS`
-
-### GitHub MCP (optional)
-- `MCP_GITHUB_ENABLED=true|false`
-- `GITHUB_PERSONAL_ACCESS_TOKEN` (required when enabled)
-- `MCP_GITHUB_TOOL_SCOPE` (`search` | `all`)
-- `MCP_GITHUB_MAX_TOOLS` (limit expanded tool count)
-- `LLM_AGENT_TOOL_CALLING_ENABLED` (enable/disable agent-side tool calling in generation pipeline)
-
-### Example `.env`
-```env
-LLM_PROVIDER=openai
-LLM_MODEL=gpt-4
-LLM_API_KEY=your_key
-LLM_API_BASE=https://api.openai.com/v1
-LLM_TIMEOUT=300
-LLM_MAX_TOKENS=1200
-LLM_MAX_INPUT_CHARS=12000
-LLM_MAX_CONTEXT_TOKENS=32768
-LLM_INPUT_SAFETY_MARGIN=8000
-LLM_CHARS_PER_TOKEN=0.6
-
-RETRIEVAL_MODE=hybrid
-CONVERSATION_MEMORY_MODE=session
-QDRANT_URL=http://localhost:6333
-QDRANT_COLLECTION=writing_memory
-QDRANT_EMBED_DIM=256
-
-EMBEDDING_PROVIDER=openai_compatible
-EMBEDDING_MODEL=text-embedding-3-large
-EMBEDDING_API_BASE=https://api.openai.com/v1
-EMBEDDING_API_KEY=your_key
-PIPELINE_STAGE_SLEEP=3
-```
-
-## Run
-```bash
+copy .env.example .env
 python main.py
 ```
 
-## Health Check
-- `GET /healthz`
-- `GET /healthz/detail`
-- `GET /healthz/llm`
+服务地址：`http://localhost:8000`
 
-## API
-All routes are prefixed with `/api`.
+## 4. 最小配置
 
-### Writing
+完整配置见 `backend/.env.example`。
+
+### LLM
+
+```env
+LLM_PROVIDER=openai
+LLM_MODEL=YOUR_MODEL
+LLM_API_KEY=YOUR_API_KEY
+LLM_API_BASE=YOUR_BASE_URL
+LLM_TIMEOUT=600
+LLM_MAX_TOKENS=8000
+```
+
+### 检索与记忆
+
+```env
+RETRIEVAL_MODE=sqlite_only          # 或 hybrid
+CONVERSATION_MEMORY_MODE=session    # 或 global
+STORAGE_PATH=data/app.db
+```
+
+### Qdrant（可选）
+
+```env
+QDRANT_URL=YOUR_QDRANT_URL
+QDRANT_API_KEY=YOUR_QDRANT_KEY
+QDRANT_COLLECTION=hello_agents_vectors
+QDRANT_EMBED_DIM=1024
+QDRANT_DISTANCE=cosine
+```
+
+### RAG（建议）
+
+```env
+RAG_DYNAMIC_TOPK_ENABLED=true
+RAG_RERANK_ENABLED=true
+RAG_HYDE_ENABLED=false
+RAG_CITATION_ENFORCE=false
+RAG_REFUSAL_ENABLED=true
+```
+
+### GitHub MCP（可选）
+
+```env
+MCP_GITHUB_ENABLED=false
+GITHUB_PERSONAL_ACCESS_TOKEN=YOUR_GITHUB_TOKEN
+MCP_GITHUB_TOOL_SCOPE=search
+MCP_GITHUB_MAX_TOOLS=5
+```
+
+## 5. API 概览
+
+所有接口前缀：`/api`
+
+### 写作分步
 - `POST /api/plan`
-- `POST /api/draft`
-- `POST /api/draft/stream` (SSE)
-- `POST /api/review`
-- `POST /api/review/stream` (SSE)
-- `POST /api/rewrite`
-- `POST /api/rewrite/stream` (SSE)
+- `POST /api/draft` / `POST /api/draft/stream`
+- `POST /api/review` / `POST /api/review/stream`
+- `POST /api/rewrite` / `POST /api/rewrite/stream`
 
-### Pipeline (plan -> research -> draft -> review -> rewrite -> citations)
+### 一键流程
 - `POST /api/pipeline`
-- `POST /api/pipeline/stream` (SSE)
+- `POST /api/pipeline/stream`
 
 ### RAG
-- `POST /api/rag/upload` (JSON documents)
-- `POST /api/rag/upload-file` (files: .txt / .pdf / .docx / .md / .markdown)
+- `POST /api/rag/upload`
+- `POST /api/rag/upload-file`（`.txt / .pdf / .docx / .md / .markdown`）
 - `POST /api/rag/search`
+- `GET /api/rag/documents`
+- `DELETE /api/rag/documents/{doc_id}`
+
+### 离线评测
 - `POST /api/rag/evaluate`
 - `GET /api/rag/evaluations`
 - `GET /api/rag/evaluations/{run_id}`
 - `DELETE /api/rag/evaluations/{run_id}`
-- `GET /api/rag/documents`
-- `DELETE /api/rag/documents/{doc_id}`
 
-### Citations
+### 引用与设置
 - `POST /api/citations`
-
-### Settings
 - `GET /api/settings/citation`
 - `POST /api/settings/citation`
 - `POST /api/settings/session-memory/clear`
 
-### Versions
+### 版本管理
 - `GET /api/versions`
 - `GET /api/versions/{version_id}`
 - `GET /api/versions/{version_id}/diff`
 - `DELETE /api/versions/{version_id}`
 
-### MCP (GitHub)
+### MCP（GitHub）
 - `GET /api/mcp/github/tools`
 - `POST /api/mcp/github/call`
 
-## Streaming (SSE)
-Streaming endpoints return `text/event-stream` with JSON events like:
-- `status` (step updates)
-- `ping` (keepalive)
-- `result` (final payload)
-- `error` (error detail)
+## 6. 健康检查与文档
 
-## Notes
-- File uploads enforce `UPLOAD_MAX_MB` and reject larger payloads.
-- PDF and DOCX parsing requires `pypdf` and `python-docx` (already in `requirements.txt`).
-- Qdrant collections must match `QDRANT_EMBED_DIM` and `QDRANT_DISTANCE`.
-- Pipeline logs include Task Success Rate and RAG refusal check details.
-- Retrieval evaluation runs are saved in SQLite table `retrieval_eval_runs`.
-- In `session` mode, pass `session_id` from frontend to keep memory isolated per task/user.
-
-## Docs
-- Swagger UI: `http://localhost:8000/docs`
+- `GET /healthz`
+- `GET /healthz/detail`
+- `GET /healthz/llm`
+- Swagger: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
+
+## 7. 运维注意项
+
+- `session` 记忆模式下，请从前端持续传同一个 `session_id`，避免会话历史丢失。
+- `hybrid` 模式下，Qdrant 不可用会自动降级到 SQLite 检索。
+- 流式链路依赖 SSE，代理层需允许 `text/event-stream`。
+- 离线评测结果持久化在 SQLite 表 `retrieval_eval_runs`。
