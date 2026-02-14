@@ -6,6 +6,8 @@ import os
 import logging
 from typing import Iterable, List
 
+from hello_agents.tools import ToolRegistry
+
 from .drafting_service import DraftResult, DraftingService
 from .planner_service import OutlinePlan, PlanningService
 from .research_service import ResearchNote, ResearchService, SourceDocument
@@ -52,6 +54,14 @@ class WritingPipeline:
         review_max_input_chars: int | None = None,
         rewrite_max_input_chars: int | None = None,
         session_id: str = "",
+        plan_tool_profile_id: str | None = None,
+        plan_tool_registry_override: ToolRegistry | None = None,
+        draft_tool_profile_id: str | None = None,
+        draft_tool_registry_override: ToolRegistry | None = None,
+        review_tool_profile_id: str | None = None,
+        review_tool_registry_override: ToolRegistry | None = None,
+        rewrite_tool_profile_id: str | None = None,
+        rewrite_tool_registry_override: ToolRegistry | None = None,
     ) -> PipelineResult:
         outline = self.planner.plan_outline(
             topic=topic,
@@ -63,6 +73,8 @@ class WritingPipeline:
             max_tokens=plan_max_tokens,
             max_input_chars=plan_max_input_chars,
             session_id=session_id,
+            tool_profile_id=plan_tool_profile_id,
+            tool_registry_override=plan_tool_registry_override,
         )
 
         _pipeline_throttle()
@@ -90,6 +102,12 @@ class WritingPipeline:
             review_max_input_chars=review_max_input_chars,
             rewrite_max_input_chars=rewrite_max_input_chars,
             session_id=session_id,
+            draft_tool_profile_id=draft_tool_profile_id,
+            draft_tool_registry_override=draft_tool_registry_override,
+            review_tool_profile_id=review_tool_profile_id,
+            review_tool_registry_override=review_tool_registry_override,
+            rewrite_tool_profile_id=rewrite_tool_profile_id,
+            rewrite_tool_registry_override=rewrite_tool_registry_override,
         )
 
         return PipelineResult(outline=outline, research_notes=notes, draft_result=draft_result)

@@ -74,18 +74,32 @@
       </div>
       <div style="display:flex; gap:12px; align-items:center; margin-top:12px;">
         <label style="display:flex; align-items:center; gap:8px;">
+          调用模式
+          <select
+            :value="generationMode || 'rag_only'"
+            :disabled="modeUpdating"
+            @change="handleGenerationModeChange"
+          >
+            <option value="rag_only">RAG-only（默认）</option>
+            <option value="hybrid">Hybrid</option>
+            <option value="creative">Creative</option>
+          </select>
+        </label>
+        <span v-if="generationMode === null" class="muted">设置加载失败</span>
+        <span v-else class="muted">{{ generationModeDescription }}</span>
+      </div>
+      <div v-if="generationMode === 'creative'" style="display:flex; gap:12px; align-items:center; margin-top:8px;">
+        <label style="display:flex; align-items:center; gap:8px;" class="muted">
           <input
             type="checkbox"
-            :checked="citationEnforce || false"
-            :disabled="citationUpdating"
-            @change="handleCitationToggle"
+            :checked="creativeMcpEnabled"
+            :disabled="modeUpdating"
+            @change="handleCreativeMcpToggle"
           />
-          强制引用（仅在启用时要求输出引用）
+          Creative 模式启用 MCP
         </label>
-        <span v-if="citationEnforce === null" class="muted">设置加载失败</span>
-        <span v-else class="muted">当前：{{ citationEnforce ? "开启" : "关闭" }}</span>
       </div>
-      <div v-if="output.coverage_detail || output.coverage !== undefined" class="muted">
+      <div v-if="showCoverageMetrics" class="muted">
         <div>
           引用覆盖率：{{ Math.round(((output.coverage_detail?.semantic_coverage ?? output.coverage) || 0) * 100) }}%
         </div>
@@ -131,13 +145,18 @@
 </template>
 
 <script setup lang="ts">
-import { reactive, ref, watch } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { useAppStore } from "../store";
 import { draftStream, plan, reviewStream, rewriteStream } from "../services/writing";
 import { runPipelineStream } from "../services/pipeline";
 import { getHealthDetail } from "../services/health";
-import { clearSessionMemory, getCitationSetting, setCitationSetting } from "../services/settings";
+import {
+  clearSessionMemory,
+  getGenerationMode,
+  setGenerationMode,
+  type GenerationMode,
+} from "../services/settings";
 import { handleApiError } from "../utils/errorHandler";
 import { validatePipelineRequest, validateDraftRequest, validateReviewRequest, validateRewriteRequest } from "../utils/validation";
 import { debounce } from "../utils/debounce";
@@ -214,8 +233,9 @@ const loading = reactive({
 const error = ref("");
 const toast = ref("");
 const health = ref<HealthDetailResponse | null>(null);
-const citationEnforce = ref<boolean | null>(null);
-const citationUpdating = ref(false);
+const generationMode = ref<GenerationMode | null>(null);
+const creativeMcpEnabled = ref(true);
+const modeUpdating = ref(false);
 const sessionMemoryResetting = ref(false);
 const sessionId = ref(getOrCreateSessionId());
 const store = useAppStore();
@@ -233,8 +253,41 @@ const pipelineStageIndex: Record<string, number> = {
   citations: 5,
 };
 
+const generationModeDescriptionMap: Record<GenerationMode, string> = {
+  rag_only: "RAG-only：仅证据输出、禁外部资料、缺证据会停",
+  hybrid: "Hybrid：允许补全，非证据段落自动标注 [推断]",
+  creative: "Creative：自由生成，不强制引用与拒答（默认启用 MCP）",
+};
+
+const generationModeDescription = computed(() => {
+  if (!generationMode.value) return "";
+  return generationModeDescriptionMap[generationMode.value];
+});
+
+const showCoverageMetrics = computed(() => {
+  if (!generationMode.value || generationMode.value === "creative") return false;
+  return Boolean(output.coverage_detail || output.coverage !== undefined);
+});
+
+const hasText = (value: string | null | undefined) => Boolean((value || "").trim());
+
+const buildRewriteGuidance = () => {
+  const parts = [output.review, form.review_criteria]
+    .map((item) => (item || "").trim())
+    .filter((item, idx, arr) => Boolean(item) && arr.indexOf(item) === idx);
+  return parts.join("\n\n");
+};
+
 const resetError = () => {
   error.value = "";
+};
+
+const resetSessionMemoryForNewTask = async () => {
+  await clearSessionMemory({
+    session_id: sessionId.value,
+    drop_agent: true,
+    clear_cold: true,
+  });
 };
 
 const clearGenerated = () => {
@@ -263,6 +316,7 @@ const handlePlan = async () => {
       return;
     }
 
+    await resetSessionMemoryForNewTask();
     loading.plan = true;
     const res = await plan({
       topic: form.topic,
@@ -296,6 +350,7 @@ const handleDraft = async () => {
       return;
     }
 
+    await resetSessionMemoryForNewTask();
     loading.draft = true;
     output.draft = "";
     await draftStream(
@@ -314,7 +369,7 @@ const handleDraft = async () => {
         }
         if (evt.type === "result") {
           // 只在流式内容为空时才使用 result（兜底）
-          if (!output.draft) {
+          if (!hasText(output.draft)) {
             output.draft = evt.payload?.draft || "";
           }
           showToast("草稿已生成");
@@ -342,6 +397,7 @@ const handleReview = async () => {
       return;
     }
 
+    await resetSessionMemoryForNewTask();
     loading.review = true;
     output.review = "";
     await reviewStream(
@@ -358,7 +414,7 @@ const handleReview = async () => {
         }
         if (evt.type === "result") {
           // 只在流式内容为空时才使用 result（兜底）
-          if (!output.review) {
+          if (!hasText(output.review)) {
             output.review = evt.payload?.review || "";
           }
           showToast("审校完成");
@@ -378,20 +434,26 @@ const handleReview = async () => {
 const handleRewrite = async () => {
   try {
     resetError();
+    const rewriteGuidance = buildRewriteGuidance();
 
     // 表单验证
-    const validation = validateRewriteRequest({ draft: output.draft, guidance: output.review || form.review_criteria });
+    const validation = validateRewriteRequest({ draft: output.draft, guidance: rewriteGuidance });
     if (!validation.valid) {
       error.value = validation.errors.join('; ');
       return;
     }
 
+    await resetSessionMemoryForNewTask();
     loading.rewrite = true;
     output.revised = "";
+    output.bibliography = "";
+    output.citations = [];
+    output.coverage = undefined;
+    output.coverage_detail = undefined;
     await rewriteStream(
       {
         draft: output.draft,
-        guidance: output.review || form.review_criteria,
+        guidance: rewriteGuidance,
         style: form.style,
         target_length: form.target_length,
         session_id: sessionId.value,
@@ -401,9 +463,19 @@ const handleRewrite = async () => {
           output.revised += evt.content || "";
         }
         if (evt.type === "result") {
-          // 只在流式内容为空时才使用 result（兜底）
-          if (!output.revised) {
-            output.revised = evt.payload?.revised || "";
+          // 结果事件是后端后处理后的最终稿（含引用补全），必须覆盖流式中间文本
+          output.revised = evt.payload?.revised || output.revised;
+          if (Array.isArray(evt.payload?.citations)) {
+            output.citations = evt.payload.citations;
+          }
+          if (typeof evt.payload?.bibliography === "string") {
+            output.bibliography = evt.payload.bibliography;
+          }
+          if (typeof evt.payload?.coverage === "number") {
+            output.coverage = evt.payload.coverage;
+          }
+          if (evt.payload?.coverage_detail) {
+            output.coverage_detail = evt.payload.coverage_detail;
           }
           showToast("改写完成");
         }
@@ -435,6 +507,7 @@ const handlePipeline = async () => {
       return;
     }
 
+    await resetSessionMemoryForNewTask();
     loading.pipeline = true;
     currentPipelineStep.value = 0;
     output.outline = "";
@@ -498,10 +571,8 @@ const handlePipeline = async () => {
       }
       if (evt.type === "draft") {
         currentPipelineStep.value = 3;
-        // 优先使用已经通过 delta 累积的内容，只在为空时才使用 payload（兜底）
-        if (!output.draft) {
-          output.draft = evt.payload?.draft || "";
-        }
+        // 阶段结果事件视为权威结果，覆盖当前草稿（避免流式丢尾）
+        output.draft = evt.payload?.draft || output.draft;
       }
       if (evt.type === "delta" && evt.stage === "draft") {
         currentPipelineStep.value = pipelineStageIndex.draft;
@@ -509,10 +580,8 @@ const handlePipeline = async () => {
       }
       if (evt.type === "review") {
         currentPipelineStep.value = 4;
-        // 优先使用已经通过 delta 累积的内容，只在为空时才使用 payload（兜底）
-        if (!output.review) {
-          output.review = evt.payload?.review || "";
-        }
+        // 阶段结果事件视为权威结果，覆盖当前审校（避免流式丢尾）
+        output.review = evt.payload?.review || output.review;
       }
       if (evt.type === "delta" && evt.stage === "review") {
         currentPipelineStep.value = pipelineStageIndex.review;
@@ -528,7 +597,8 @@ const handlePipeline = async () => {
           if (evt.payload?.coverage_detail) {
             output.coverage_detail = evt.payload.coverage_detail;
           }
-        } else if (!output.revised) {
+        } else if (!hasText(output.revised)) {
+          // 非最终事件兜底：仅当当前没有有效文本时覆盖
           output.revised = evt.payload?.revised || "";
         }
       }
@@ -549,16 +619,10 @@ const handlePipeline = async () => {
         output.open_questions = res.open_questions;
         output.research_notes = res.research_notes || [];
 
-        // 只在流式内容为空时才使用 result 中的值（兜底）
-        if (!output.draft) {
-          output.draft = res.draft;
-        }
-        if (!output.review) {
-          output.review = res.review;
-        }
-        if (!output.revised) {
-          output.revised = res.revised;
-        }
+        // 最终结果事件是服务端权威结果，统一覆盖，避免前端状态停留在中间态
+        output.draft = res.draft || output.draft;
+        output.review = res.review || output.review;
+        output.revised = res.revised || output.revised;
 
         output.bibliography = res.bibliography;
         output.version_id = res.version_id;
@@ -573,6 +637,10 @@ const handlePipeline = async () => {
           output.coverage_detail = res.coverage_detail;
         }
         showToast("Pipeline 完成");
+      }
+      if (evt.type === "done") {
+        loading.pipeline = false;
+        currentPipelineStep.value = 0;
       }
     });
   } catch (err) {
@@ -605,7 +673,7 @@ const handleResetSessionMemory = async () => {
     const res = await clearSessionMemory({
       session_id: sessionId.value,
       drop_agent: true,
-      clear_cold: false,
+      clear_cold: true,
     });
     if (res.cleared) {
       showToast("当前会话记忆已重置");
@@ -682,30 +750,51 @@ const loadHealth = async () => {
 
 loadHealth();
 
-const loadCitationSetting = async () => {
+const loadGenerationModeSetting = async () => {
   try {
-    const res = await getCitationSetting();
-    citationEnforce.value = res.enabled;
+    const res = await getGenerationMode();
+    generationMode.value = res.mode;
+    creativeMcpEnabled.value = res.creative_mcp_enabled;
   } catch {
-    citationEnforce.value = null;
+    generationMode.value = null;
+    creativeMcpEnabled.value = true;
   }
 };
 
-loadCitationSetting();
+loadGenerationModeSetting();
 
-const handleCitationToggle = async (event: Event) => {
-  const target = event.target as HTMLInputElement;
-  const nextValue = target.checked;
-  citationUpdating.value = true;
+const handleGenerationModeChange = async (event: Event) => {
+  const target = event.target as HTMLSelectElement;
+  const nextValue = target.value as GenerationMode;
+  modeUpdating.value = true;
   try {
-    const res = await setCitationSetting(nextValue);
-    citationEnforce.value = res.enabled;
-    showToast(`强制引用已${res.enabled ? "开启" : "关闭"}`);
+    const res = await setGenerationMode(nextValue);
+    generationMode.value = res.mode;
+    creativeMcpEnabled.value = res.creative_mcp_enabled;
+    showToast(`调用模式已切换为 ${res.mode}`);
   } catch (err) {
     error.value = handleApiError(err);
-    target.checked = citationEnforce.value || false;
+    target.value = generationMode.value || "rag_only";
   } finally {
-    citationUpdating.value = false;
+    modeUpdating.value = false;
+  }
+};
+
+const handleCreativeMcpToggle = async (event: Event) => {
+  const target = event.target as HTMLInputElement;
+  const checked = target.checked;
+  const currentMode = generationMode.value || "creative";
+  modeUpdating.value = true;
+  try {
+    const res = await setGenerationMode(currentMode, checked);
+    generationMode.value = res.mode;
+    creativeMcpEnabled.value = res.creative_mcp_enabled;
+    showToast(`Creative MCP 已${res.creative_mcp_enabled ? "开启" : "关闭"}`);
+  } catch (err) {
+    error.value = handleApiError(err);
+    target.checked = creativeMcpEnabled.value;
+  } finally {
+    modeUpdating.value = false;
   }
 };
 

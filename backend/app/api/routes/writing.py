@@ -7,9 +7,12 @@ import logging
 from queue import Empty, Queue
 from threading import Thread
 
+from hello_agents.tools import ToolRegistry
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from ...models.schemas import (
+    CitationItemResponse,
+    CoverageDetail,
     DraftRequest,
     DraftResponse,
     PlanRequest,
@@ -19,9 +22,18 @@ from ...models.schemas import (
     RewriteRequest,
     RewriteResponse,
 )
-from ...services.citation_enforcer import CitationEnforcer
+from ...services.citation_enforcer import CitationEnforcer, CoverageReport
+from ...services.generation_mode import (
+    citation_labels_enabled,
+    get_generation_mode,
+    inference_mark_required,
+    mcp_allowed_for_mode,
+    refusal_enabled_for_mode,
+)
 from ...services.github_context import maybe_fetch_github_context
-from ...services.research_service import ResearchService, RelevanceReport, SourceDocument
+from ...services.inference_marker import mark_inference_paragraphs
+from ...services.research_service import ResearchNote, ResearchService, RelevanceReport, SourceDocument
+from ...services.tool_policy import ToolDecision, build_stage_tool_registry, decide_tools
 from ..deps import AppServices, get_services
 
 router = APIRouter(tags=["writing"])
@@ -31,11 +43,28 @@ _researcher = ResearchService()
 
 
 def _citations_enabled() -> bool:
-    return os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes")
+    return citation_labels_enabled(get_generation_mode())
+
+
+def _strict_citation_labels() -> bool:
+    return get_generation_mode() == "rag_only"
 
 
 def _refusal_enabled() -> bool:
+    if not refusal_enabled_for_mode(get_generation_mode()):
+        return False
     return os.getenv("RAG_REFUSAL_ENABLED", "true").lower() in ("1", "true", "yes")
+
+
+def _mcp_enabled() -> bool:
+    return mcp_allowed_for_mode(get_generation_mode())
+
+
+def _postprocess_final_text(text: str) -> str:
+    mode = get_generation_mode()
+    if inference_mark_required(mode):
+        return mark_inference_paragraphs(text)
+    return text
 
 
 def _refusal_mode() -> str:
@@ -129,6 +158,49 @@ def _citation_top_k() -> int:
         return 5
 
 
+def _coverage_detail(report: CoverageReport | None) -> CoverageDetail | None:
+    if report is None:
+        return None
+    paragraph_coverage = (
+        report.covered_paragraphs / report.total_paragraphs if report.total_paragraphs > 0 else 0.0
+    )
+    return CoverageDetail(
+        token_coverage=report.token_coverage,
+        paragraph_coverage=paragraph_coverage,
+        covered_tokens=report.covered_tokens,
+        total_tokens=report.total_tokens,
+        covered_paragraphs=report.covered_paragraphs,
+        total_paragraphs=report.total_paragraphs,
+        semantic_coverage=report.semantic_coverage or 0.0,
+    )
+
+
+def _citation_payload(
+    *,
+    text: str,
+    notes: list[ResearchNote],
+    services: AppServices,
+    apply_labels: bool,
+) -> tuple[str, CoverageReport, list[CitationItemResponse], str, bool]:
+    enforced_text, report = _citation_enforcer.enforce(
+        text,
+        notes,
+        apply_labels=apply_labels,
+        strict_labels=_strict_citation_labels(),
+        embedder=services.rag.get_embedder(),
+    )
+    enforced_text = _postprocess_final_text(enforced_text)
+    citations = services.citations.build_citations(notes)
+    bibliography = services.citations.format_bibliography(citations)
+    return (
+        enforced_text,
+        report,
+        [CitationItemResponse(label=item.label, title=item.title, url=item.url) for item in citations],
+        bibliography,
+        apply_labels and enforced_text != text,
+    )
+
+
 def _enforce_with_rag(
     text: str,
     *,
@@ -142,7 +214,12 @@ def _enforce_with_rag(
     if not docs:
         return text
     notes = _researcher.collect_notes(query=query, sources=docs, top_k=min(len(docs), _citation_top_k()))
-    enforced, _ = _citation_enforcer.enforce(text, notes, apply_labels=True)
+    enforced, _ = _citation_enforcer.enforce(
+        text,
+        notes,
+        apply_labels=True,
+        strict_labels=_strict_citation_labels(),
+    )
     return enforced
 
 
@@ -212,6 +289,94 @@ def _append_block(text: str, block: str, label: str) -> str:
     return f"[{label}]\n{block}"
 
 
+def _empty_tool_decision(stage: str, reason: str) -> ToolDecision:
+    return ToolDecision(enabled=False, allowed_tools=[], reason=reason, profile_id=f"{stage}:none")
+
+
+def _resolve_stage_tools(
+    *,
+    services: AppServices,
+    stage: str,
+    topic: str = "",
+    outline: str = "",
+    draft: str = "",
+    guidance: str = "",
+    constraints: str = "",
+    research_notes: str = "",
+    rag_enforced: bool = False,
+    source_count: int = 0,
+) -> tuple[ToolDecision, ToolRegistry | None]:
+    if not _mcp_enabled():
+        decision = _empty_tool_decision(stage, "generation_mode_disables_mcp")
+        logger.info(
+            "stage_tool_decision: stage=%s enabled=%s tools=%s reason=%s profile_id=%s",
+            stage,
+            decision.enabled,
+            decision.allowed_tools,
+            decision.reason,
+            decision.profile_id,
+        )
+        return decision, None
+
+    if not services.agent_tool_calling_enabled or not services.agent_tools_catalog:
+        decision = _empty_tool_decision(stage, "agent_tool_calling_disabled")
+        logger.info(
+            "stage_tool_decision: stage=%s enabled=%s tools=%s reason=%s profile_id=%s",
+            stage,
+            decision.enabled,
+            decision.allowed_tools,
+            decision.reason,
+            decision.profile_id,
+        )
+        return decision, None
+
+    decision = decide_tools(
+        stage=stage,  # type: ignore[arg-type]
+        topic=topic,
+        outline=outline,
+        draft=draft,
+        guidance=guidance,
+        constraints=constraints,
+        research_notes=research_notes,
+        rag_enforced=rag_enforced,
+        source_count=source_count,
+    )
+    registry = build_stage_tool_registry(
+        tool_catalog=services.agent_tools_catalog,
+        allowed_tool_names=decision.allowed_tools,
+    )
+    if decision.enabled and registry is None:
+        decision = _empty_tool_decision(stage, decision.reason + "|tools_not_available")
+
+    logger.info(
+        "stage_tool_decision: stage=%s enabled=%s tools=%s reason=%s profile_id=%s",
+        stage,
+        decision.enabled,
+        decision.allowed_tools,
+        decision.reason,
+        decision.profile_id,
+    )
+    return decision, registry
+
+
+def _runtime_tool_profile_id(
+    services: AppServices,
+    decision: ToolDecision,
+) -> str | None:
+    if not services.agent_tool_calling_enabled:
+        return None
+    return decision.profile_id
+
+
+def _runtime_tool_registry(
+    services: AppServices,
+    registry: ToolRegistry | None,
+) -> ToolRegistry | None:
+    if not services.agent_tool_calling_enabled:
+        return None
+    return registry
+
+
 @router.post("/plan", response_model=PlanResponse)
 def create_plan(
     payload: PlanRequest,
@@ -230,12 +395,25 @@ def create_plan(
             _step_max_tokens("plan"),
             _step_max_input_chars("plan"),
         )
-        github_context = maybe_fetch_github_context(
-            services.github_mcp_tool,
-            query=payload.topic,
-            context="\n".join([payload.constraints, payload.key_points, payload.style, payload.audience]),
+        github_context = (
+            maybe_fetch_github_context(
+                services.github_mcp_tool,
+                query=payload.topic,
+                context="\n".join([payload.constraints, payload.key_points, payload.style, payload.audience]),
+            )
+            if _mcp_enabled()
+            else ""
         )
         key_points = _append_block(payload.key_points, github_context, "GitHub参考")
+        plan_tool_decision, plan_tool_registry = _resolve_stage_tools(
+            services=services,
+            stage="plan",
+            topic=payload.topic,
+            constraints=payload.constraints,
+            research_notes=key_points,
+            rag_enforced=_citations_enabled(),
+            source_count=1 if key_points.strip() else 0,
+        )
         plan = services.planner.plan_outline(
             topic=payload.topic,
             audience=payload.audience,
@@ -246,6 +424,8 @@ def create_plan(
             max_tokens=_step_max_tokens("plan"),
             max_input_chars=_step_max_input_chars("plan"),
             session_id=payload.session_id,
+            tool_profile_id=_runtime_tool_profile_id(services, plan_tool_decision),
+            tool_registry_override=_runtime_tool_registry(services, plan_tool_registry),
         )
         response = PlanResponse(
             outline=plan.outline,
@@ -282,12 +462,26 @@ def create_draft(
             _step_max_tokens("draft"),
             _step_max_input_chars("draft"),
         )
-        github_context = maybe_fetch_github_context(
-            services.github_mcp_tool,
-            query=payload.topic,
-            context="\n".join([payload.outline, payload.constraints, payload.style, payload.target_length]),
+        github_context = (
+            maybe_fetch_github_context(
+                services.github_mcp_tool,
+                query=payload.topic,
+                context="\n".join([payload.outline, payload.constraints, payload.style, payload.target_length]),
+            )
+            if _mcp_enabled()
+            else ""
         )
         research_notes = _append_block(payload.research_notes, github_context, "GitHub参考")
+        draft_tool_decision, draft_tool_registry = _resolve_stage_tools(
+            services=services,
+            stage="draft",
+            topic=payload.topic,
+            outline=payload.outline,
+            constraints=payload.constraints,
+            research_notes=research_notes,
+            rag_enforced=_citations_enabled(),
+            source_count=1 if research_notes.strip() else 0,
+        )
         refusal_query = f"{payload.topic}\n{payload.outline}"
         refused, docs = _rag_refusal_check(query=refusal_query, services=services)
         if refused:
@@ -302,6 +496,8 @@ def create_draft(
             max_tokens=_step_max_tokens("draft"),
             max_input_chars=_step_max_input_chars("draft"),
             session_id=payload.session_id,
+            tool_profile_id=_runtime_tool_profile_id(services, draft_tool_decision),
+            tool_registry_override=_runtime_tool_registry(services, draft_tool_registry),
         )
         draft = _enforce_with_rag(
             draft,
@@ -331,12 +527,26 @@ def create_draft_stream(
 
     q: Queue[dict | None] = Queue()
 
-    github_context = maybe_fetch_github_context(
-        services.github_mcp_tool,
-        query=payload.topic,
-        context="\n".join([payload.outline, payload.constraints, payload.style, payload.target_length]),
+    github_context = (
+        maybe_fetch_github_context(
+            services.github_mcp_tool,
+            query=payload.topic,
+            context="\n".join([payload.outline, payload.constraints, payload.style, payload.target_length]),
+        )
+        if _mcp_enabled()
+        else ""
     )
     research_notes = _append_block(payload.research_notes, github_context, "GitHub参考")
+    draft_tool_decision, draft_tool_registry = _resolve_stage_tools(
+        services=services,
+        stage="draft",
+        topic=payload.topic,
+        outline=payload.outline,
+        constraints=payload.constraints,
+        research_notes=research_notes,
+        rag_enforced=_citations_enabled(),
+        source_count=1 if research_notes.strip() else 0,
+    )
 
     def worker() -> None:
         t0 = time.perf_counter()
@@ -368,6 +578,8 @@ def create_draft_stream(
                 max_tokens=_step_max_tokens("draft"),
                 max_input_chars=_step_max_input_chars("draft"),
                 session_id=payload.session_id,
+                tool_profile_id=_runtime_tool_profile_id(services, draft_tool_decision),
+                tool_registry_override=_runtime_tool_registry(services, draft_tool_registry),
             ):
                 if not chunk:
                     continue
@@ -435,12 +647,25 @@ def review_draft(
             _step_max_tokens("review"),
             _step_max_input_chars("review"),
         )
-        github_context = maybe_fetch_github_context(
-            services.github_mcp_tool,
-            query=(payload.criteria or payload.draft[:200]),
-            context="\n".join([payload.sources, payload.audience]),
+        github_context = (
+            maybe_fetch_github_context(
+                services.github_mcp_tool,
+                query=(payload.criteria or payload.draft[:200]),
+                context="\n".join([payload.sources, payload.audience]),
+            )
+            if _mcp_enabled()
+            else ""
         )
         sources = _append_block(payload.sources, github_context, "GitHub参考")
+        review_tool_decision, review_tool_registry = _resolve_stage_tools(
+            services=services,
+            stage="review",
+            draft=payload.draft,
+            guidance=payload.criteria,
+            research_notes=sources,
+            rag_enforced=_citations_enabled(),
+            source_count=1 if sources.strip() else 0,
+        )
         review = services.reviewer.review(
             draft=payload.draft,
             criteria=payload.criteria,
@@ -449,6 +674,8 @@ def review_draft(
             max_tokens=_step_max_tokens("review"),
             max_input_chars=_step_max_input_chars("review"),
             session_id=payload.session_id,
+            tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
+            tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
         )
         response = ReviewResponse(review=review.review)
         logger.info(
@@ -472,12 +699,25 @@ def review_draft_stream(
 
     q: Queue[dict | None] = Queue()
 
-    github_context = maybe_fetch_github_context(
-        services.github_mcp_tool,
-        query=(payload.criteria or payload.draft[:200]),
-        context="\n".join([payload.sources, payload.audience]),
+    github_context = (
+        maybe_fetch_github_context(
+            services.github_mcp_tool,
+            query=(payload.criteria or payload.draft[:200]),
+            context="\n".join([payload.sources, payload.audience]),
+        )
+        if _mcp_enabled()
+        else ""
     )
     sources = _append_block(payload.sources, github_context, "GitHub参考")
+    review_tool_decision, review_tool_registry = _resolve_stage_tools(
+        services=services,
+        stage="review",
+        draft=payload.draft,
+        guidance=payload.criteria,
+        research_notes=sources,
+        rag_enforced=_citations_enabled(),
+        source_count=1 if sources.strip() else 0,
+    )
 
     def worker() -> None:
         t0 = time.perf_counter()
@@ -497,6 +737,8 @@ def review_draft_stream(
                 max_tokens=_step_max_tokens("review"),
                 max_input_chars=_step_max_input_chars("review"),
                 session_id=payload.session_id,
+                tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
+                tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
             ):
                 if not chunk:
                     continue
@@ -558,16 +800,36 @@ def rewrite_draft(
             _step_max_tokens("rewrite"),
             _step_max_input_chars("rewrite"),
         )
-        github_context = maybe_fetch_github_context(
-            services.github_mcp_tool,
-            query=(payload.guidance or payload.draft[:200]),
-            context=payload.style,
+        github_context = (
+            maybe_fetch_github_context(
+                services.github_mcp_tool,
+                query=(payload.guidance or payload.draft[:200]),
+                context=payload.style,
+            )
+            if _mcp_enabled()
+            else ""
         )
         guidance = _append_block(payload.guidance, github_context, "GitHub参考")
+        rewrite_tool_decision, rewrite_tool_registry = _resolve_stage_tools(
+            services=services,
+            stage="rewrite",
+            draft=payload.draft,
+            guidance=guidance,
+            constraints=payload.style,
+            rag_enforced=_citations_enabled(),
+            source_count=1 if guidance.strip() else 0,
+        )
         refusal_query = payload.draft
         refused, docs = _rag_refusal_check(query=refusal_query, services=services)
         if refused:
-            return RewriteResponse(revised=_refusal_message())
+            return RewriteResponse(
+                revised=_refusal_message(),
+                citations=[],
+                bibliography="",
+                coverage=0.0,
+                coverage_detail=CoverageDetail(),
+                citation_enforced=False,
+            )
         evidence_text = _build_evidence_from_rag(query=payload.draft, services=services)
         if evidence_text:
             guidance = (guidance + "\n\nOnly use the evidence below:\n" + evidence_text).strip()
@@ -579,14 +841,29 @@ def rewrite_draft(
             max_tokens=_step_max_tokens("rewrite"),
             max_input_chars=_step_max_input_chars("rewrite"),
             session_id=payload.session_id,
+            tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
+            tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
         )
-        text = _enforce_with_rag(
-            revised.revised,
+        notes = _researcher.collect_notes(
             query=refusal_query,
-            services=services,
-            docs=docs,
+            sources=docs,
+            top_k=min(len(docs), _citation_top_k()),
         )
-        response = RewriteResponse(revised=text)
+        apply_labels = _citations_enabled()
+        text, report, citations, bibliography, citation_enforced = _citation_payload(
+            text=revised.revised,
+            notes=notes,
+            services=services,
+            apply_labels=apply_labels,
+        )
+        response = RewriteResponse(
+            revised=text,
+            citations=citations,
+            bibliography=bibliography,
+            coverage=report.coverage,
+            coverage_detail=_coverage_detail(report),
+            citation_enforced=citation_enforced,
+        )
         logger.info(
             "rewrite done: session_id=%s revised_len=%s elapsed_ms=%.2f",
             payload.session_id or "__default__",
@@ -608,12 +885,25 @@ def rewrite_draft_stream(
 
     q: Queue[dict | None] = Queue()
 
-    github_context = maybe_fetch_github_context(
-        services.github_mcp_tool,
-        query=(payload.guidance or payload.draft[:200]),
-        context=payload.style,
+    github_context = (
+        maybe_fetch_github_context(
+            services.github_mcp_tool,
+            query=(payload.guidance or payload.draft[:200]),
+            context=payload.style,
+        )
+        if _mcp_enabled()
+        else ""
     )
     guidance = _append_block(payload.guidance, github_context, "GitHub参考")
+    rewrite_tool_decision, rewrite_tool_registry = _resolve_stage_tools(
+        services=services,
+        stage="rewrite",
+        draft=payload.draft,
+        guidance=guidance,
+        constraints=payload.style,
+        rag_enforced=_citations_enabled(),
+        source_count=1 if guidance.strip() else 0,
+    )
 
     def worker() -> None:
         t0 = time.perf_counter()
@@ -627,7 +917,19 @@ def rewrite_draft_stream(
             refusal_query = payload.draft
             refused, docs = _rag_refusal_check(query=refusal_query, services=services)
             if refused:
-                q.put({"type": "result", "payload": {"revised": _refusal_message()}})
+                q.put(
+                    {
+                        "type": "result",
+                        "payload": {
+                            "revised": _refusal_message(),
+                            "citations": [],
+                            "bibliography": "",
+                            "coverage": 0.0,
+                            "coverage_detail": CoverageDetail().model_dump(),
+                            "citation_enforced": False,
+                        },
+                    }
+                )
                 return
             evidence_text = _build_evidence_from_rag(query=payload.draft, services=services)
             if evidence_text:
@@ -643,19 +945,40 @@ def rewrite_draft_stream(
                 max_tokens=_step_max_tokens("rewrite"),
                 max_input_chars=_step_max_input_chars("rewrite"),
                 session_id=payload.session_id,
+                tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
+                tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
             ):
                 if not chunk:
                     continue
                 chunks.append(chunk)
                 q.put({"type": "delta", "content": chunk})
             revised_text = "".join(chunks)
-            revised_text = _enforce_with_rag(
-                revised_text,
+            notes = _researcher.collect_notes(
                 query=refusal_query,
-                services=services,
-                docs=docs,
+                sources=docs,
+                top_k=min(len(docs), _citation_top_k()),
             )
-            q.put({"type": "result", "payload": {"revised": revised_text}})
+            apply_labels = _citations_enabled()
+            revised_text, report, citations, bibliography, citation_enforced = _citation_payload(
+                text=revised_text,
+                notes=notes,
+                services=services,
+                apply_labels=apply_labels,
+            )
+            detail = _coverage_detail(report)
+            q.put(
+                {
+                    "type": "result",
+                    "payload": {
+                        "revised": revised_text,
+                        "citations": [item.model_dump() for item in citations],
+                        "bibliography": bibliography,
+                        "coverage": report.coverage,
+                        "coverage_detail": detail.model_dump() if detail else None,
+                        "citation_enforced": citation_enforced,
+                    },
+                }
+            )
             logger.info(
                 "rewrite stream done: session_id=%s revised_len=%s elapsed_ms=%.2f",
                 payload.session_id or "__default__",

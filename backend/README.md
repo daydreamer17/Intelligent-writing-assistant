@@ -7,8 +7,12 @@
 - 写作流程：`plan -> draft -> review -> rewrite -> citations`
 - 流式接口：分步与 Pipeline 均支持 SSE
 - RAG：文档上传、检索、动态 `top_k`、HyDE（可选）、Rerank（可选）
-- 引用机制：可选强制引用、两段式证据生成、覆盖率评估与拒答保护
-- 记忆机制：会话隔离（`session_id`）、上下文压缩、冷存写入与冷存召回
+- 三态调用模式：`rag_only / hybrid / creative`
+- 引用机制：
+  - `rag_only`：严格证据约束、可拒答
+  - `hybrid`：有证据段落加 `[n]`，无证据段落加 `[推断]`
+  - `creative`：不强制引用，支持运行时开关 MCP
+- 记忆机制：会话隔离（`session_id`）、上下文压缩、冷存写入与冷存召回；支持任务前自动重置
 - 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化
 - MCP：可选 GitHub MCP 显式工具调用
 
@@ -80,7 +84,11 @@ QDRANT_DISTANCE=cosine
 RAG_DYNAMIC_TOPK_ENABLED=true
 RAG_RERANK_ENABLED=true
 RAG_HYDE_ENABLED=false
-RAG_CITATION_ENFORCE=false
+RAG_GENERATION_MODE=rag_only        # rag_only / hybrid / creative
+RAG_CREATIVE_MCP_ENABLED=true       # creative 模式下是否启用 MCP
+RAG_CREATIVE_MEMORY_ENABLED=false   # creative 模式是否启用会话记忆
+RAG_HYBRID_INFERENCE_TAG=[推断]
+RAG_HYBRID_MIN_PARAGRAPH_CHARS=12
 RAG_REFUSAL_ENABLED=true
 ```
 
@@ -91,6 +99,21 @@ MCP_GITHUB_ENABLED=false
 GITHUB_PERSONAL_ACCESS_TOKEN=YOUR_GITHUB_TOKEN
 MCP_GITHUB_TOOL_SCOPE=search
 MCP_GITHUB_MAX_TOOLS=5
+```
+
+### 分阶段工具路由（可选，建议配合 MCP）
+
+```env
+LLM_AGENT_TOOL_CALLING_ENABLED=false   # 关闭则仅显式 MCP API 可用
+LLM_STAGE_BASED_TOOLS_ENABLED=true
+LLM_TOOLS_PLAN_STAGE=github_search_repositories,github_search_code
+LLM_TOOLS_DRAFT_STAGE=github_search_repositories,github_search_code,github_get_file_contents
+LLM_TOOLS_REVIEW_STAGE=github_search_repositories,github_search_code
+LLM_TOOLS_REWRITE_STAGE=
+LLM_TOOL_POLICY_MODE=rules
+LLM_TOOL_POLICY_SEARCH_KEYWORDS=github,repo,repository,issue,pr,commit,code,readme
+LLM_TOOL_POLICY_READ_KEYWORDS=owner/repo,path,README,.md,.py
+LLM_TOOL_POLICY_DISABLE_WHEN_RAG_STRONG=true
 ```
 
 ## 5. API 概览
@@ -122,6 +145,8 @@ MCP_GITHUB_MAX_TOOLS=5
 
 ### 引用与设置
 - `POST /api/citations`
+- `GET /api/settings/generation-mode`
+- `POST /api/settings/generation-mode`
 - `GET /api/settings/citation`
 - `POST /api/settings/citation`
 - `POST /api/settings/session-memory/clear`
@@ -147,6 +172,9 @@ MCP_GITHUB_MAX_TOOLS=5
 ## 7. 运维注意项
 
 - `session` 记忆模式下，请从前端持续传同一个 `session_id`，避免会话历史丢失。
+- `POST /api/settings/generation-mode` 支持 `creative_mcp_enabled`，用于运行时切换 creative 模式 MCP。
+- 会话重置会同时清理内存历史与 SQLite 冷存（按会话作用域，包含 `session_id::tool_profile` 变体）。
 - `hybrid` 模式下，Qdrant 不可用会自动降级到 SQLite 检索。
+- `hybrid` 模式会优先注入可匹配的 `[n]`，仅对无证据段落补 `[推断]`。
 - 流式链路依赖 SSE，代理层需允许 `text/event-stream`。
 - 离线评测结果持久化在 SQLite 表 `retrieval_eval_runs`。

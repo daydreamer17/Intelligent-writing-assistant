@@ -78,6 +78,11 @@ class RewriteRequest(BaseModel):
 
 class RewriteResponse(BaseModel):
     revised: str
+    citations: list["CitationItemResponse"] = Field(default_factory=list)
+    bibliography: str = ""
+    coverage: float | None = None
+    coverage_detail: CoverageDetail | None = None
+    citation_enforced: bool = False
 
 
 class PipelineRequest(BaseModel):
@@ -251,6 +256,21 @@ class CitationSettingRequest(BaseModel):
 
 class CitationSettingResponse(BaseModel):
     enabled: bool
+
+
+class GenerationModeSettingRequest(BaseModel):
+    mode: str = Field(..., description="生成模式：rag_only | hybrid | creative")
+    creative_mcp_enabled: bool | None = Field(
+        default=None, description="仅 creative 模式使用：是否启用 MCP"
+    )
+
+
+class GenerationModeSettingResponse(BaseModel):
+    mode: str
+    citation_enforce: bool
+    mcp_allowed: bool
+    inference_mark_required: bool
+    creative_mcp_enabled: bool
 
 
 class SessionMemoryClearRequest(BaseModel):

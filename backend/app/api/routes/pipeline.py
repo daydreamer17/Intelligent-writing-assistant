@@ -7,6 +7,7 @@ import os
 from queue import Empty, Queue
 from threading import Thread
 
+from hello_agents.tools import ToolRegistry
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
@@ -19,9 +20,18 @@ from ...models.schemas import (
 )
 from ...services.citation_enforcer import CitationEnforcer, CoverageReport
 from ...services.drafting_service import DraftResult
+from ...services.generation_mode import (
+    citation_labels_enabled,
+    get_generation_mode,
+    inference_mark_required,
+    mcp_allowed_for_mode,
+    refusal_enabled_for_mode,
+)
 from ...services.github_context import maybe_fetch_github_context
+from ...services.inference_marker import mark_inference_paragraphs
 from ...services.pipeline_service import PipelineResult
 from ...services.research_service import ResearchNote, SourceDocument
+from ...services.tool_policy import ToolDecision, build_stage_tool_registry, decide_tools
 from ..deps import AppServices, get_services
 
 router = APIRouter(tags=["pipeline"])
@@ -116,7 +126,28 @@ def _pipeline_max_input_chars(stage: str) -> int | None:
 
 
 def _refusal_enabled() -> bool:
+    if not refusal_enabled_for_mode(get_generation_mode()):
+        return False
     return os.getenv("RAG_REFUSAL_ENABLED", "true").lower() in ("1", "true", "yes")
+
+
+def _citations_enabled() -> bool:
+    return citation_labels_enabled(get_generation_mode())
+
+
+def _strict_citation_labels() -> bool:
+    return get_generation_mode() == "rag_only"
+
+
+def _mcp_enabled() -> bool:
+    return mcp_allowed_for_mode(get_generation_mode())
+
+
+def _postprocess_final_text(text: str) -> str:
+    mode = get_generation_mode()
+    if inference_mark_required(mode):
+        return mark_inference_paragraphs(text)
+    return text
 
 
 def _refusal_mode() -> str:
@@ -216,6 +247,94 @@ def _github_note(context: str) -> ResearchNote:
     )
 
 
+def _empty_tool_decision(stage: str, reason: str) -> ToolDecision:
+    return ToolDecision(enabled=False, allowed_tools=[], reason=reason, profile_id=f"{stage}:none")
+
+
+def _resolve_stage_tools(
+    *,
+    services: AppServices,
+    stage: str,
+    topic: str = "",
+    outline: str = "",
+    draft: str = "",
+    guidance: str = "",
+    constraints: str = "",
+    research_notes: str = "",
+    rag_enforced: bool = False,
+    source_count: int = 0,
+) -> tuple[ToolDecision, ToolRegistry | None]:
+    if not _mcp_enabled():
+        decision = _empty_tool_decision(stage, "generation_mode_disables_mcp")
+        logger.info(
+            "stage_tool_decision: stage=%s enabled=%s tools=%s reason=%s profile_id=%s",
+            stage,
+            decision.enabled,
+            decision.allowed_tools,
+            decision.reason,
+            decision.profile_id,
+        )
+        return decision, None
+
+    if not services.agent_tool_calling_enabled or not services.agent_tools_catalog:
+        decision = _empty_tool_decision(stage, "agent_tool_calling_disabled")
+        logger.info(
+            "stage_tool_decision: stage=%s enabled=%s tools=%s reason=%s profile_id=%s",
+            stage,
+            decision.enabled,
+            decision.allowed_tools,
+            decision.reason,
+            decision.profile_id,
+        )
+        return decision, None
+
+    decision = decide_tools(
+        stage=stage,  # type: ignore[arg-type]
+        topic=topic,
+        outline=outline,
+        draft=draft,
+        guidance=guidance,
+        constraints=constraints,
+        research_notes=research_notes,
+        rag_enforced=rag_enforced,
+        source_count=source_count,
+    )
+    registry = build_stage_tool_registry(
+        tool_catalog=services.agent_tools_catalog,
+        allowed_tool_names=decision.allowed_tools,
+    )
+    if decision.enabled and registry is None:
+        decision = _empty_tool_decision(stage, decision.reason + "|tools_not_available")
+
+    logger.info(
+        "stage_tool_decision: stage=%s enabled=%s tools=%s reason=%s profile_id=%s",
+        stage,
+        decision.enabled,
+        decision.allowed_tools,
+        decision.reason,
+        decision.profile_id,
+    )
+    return decision, registry
+
+
+def _runtime_tool_profile_id(
+    services: AppServices,
+    decision: ToolDecision,
+) -> str | None:
+    if not services.agent_tool_calling_enabled:
+        return None
+    return decision.profile_id
+
+
+def _runtime_tool_registry(
+    services: AppServices,
+    registry: ToolRegistry | None,
+) -> ToolRegistry | None:
+    if not services.agent_tool_calling_enabled:
+        return None
+    return registry
+
+
 def _log_task_success_rate(
     task_status: dict[str, bool | None],
     *,
@@ -302,11 +421,13 @@ def run_pipeline(
     try:
         t0 = time.perf_counter()
         logger.info(
-            "pipeline start: session_id=%s topic_len=%s source_count=%s citation_enforce=%s",
+            "pipeline start: session_id=%s topic_len=%s source_count=%s mode=%s citation_enforce=%s mcp_allowed=%s",
             payload.session_id or "__default__",
             len(payload.topic or ""),
             len(payload.sources or []),
-            os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes"),
+            get_generation_mode(),
+            _citations_enabled(),
+            _mcp_enabled(),
         )
         logger.info(
             "pipeline budget: plan(t=%s,c=%s) draft(t=%s,c=%s) review(t=%s,c=%s) rewrite(t=%s,c=%s)",
@@ -319,18 +440,22 @@ def run_pipeline(
             _pipeline_max_tokens("rewrite"),
             _pipeline_max_input_chars("rewrite"),
         )
-        github_context = maybe_fetch_github_context(
-            services.github_mcp_tool,
-            query=payload.topic,
-            context="\n".join(
-                [
-                    payload.constraints,
-                    payload.key_points,
-                    payload.style,
-                    payload.audience,
-                    payload.review_criteria,
-                ]
-            ),
+        github_context = (
+            maybe_fetch_github_context(
+                services.github_mcp_tool,
+                query=payload.topic,
+                context="\n".join(
+                    [
+                        payload.constraints,
+                        payload.key_points,
+                        payload.style,
+                        payload.audience,
+                        payload.review_criteria,
+                    ]
+                ),
+            )
+            if _mcp_enabled()
+            else ""
         )
         constraints = _append_block(payload.constraints, github_context, "GitHub参考")
         sources = [
@@ -351,6 +476,44 @@ def run_pipeline(
                     url="",
                 )
             )
+        apply_labels = _citations_enabled()
+        source_count_for_policy = len(sources)
+        plan_tool_decision, plan_tool_registry = _resolve_stage_tools(
+            services=services,
+            stage="plan",
+            topic=payload.topic,
+            constraints=constraints,
+            research_notes=payload.key_points,
+            rag_enforced=apply_labels,
+            source_count=source_count_for_policy,
+        )
+        draft_tool_decision, draft_tool_registry = _resolve_stage_tools(
+            services=services,
+            stage="draft",
+            topic=payload.topic,
+            constraints=constraints,
+            research_notes=payload.key_points,
+            rag_enforced=apply_labels,
+            source_count=source_count_for_policy,
+        )
+        review_tool_decision, review_tool_registry = _resolve_stage_tools(
+            services=services,
+            stage="review",
+            topic=payload.topic,
+            guidance=payload.review_criteria,
+            constraints=constraints,
+            rag_enforced=apply_labels,
+            source_count=source_count_for_policy,
+        )
+        rewrite_tool_decision, rewrite_tool_registry = _resolve_stage_tools(
+            services=services,
+            stage="rewrite",
+            topic=payload.topic,
+            guidance=payload.review_criteria,
+            constraints=constraints,
+            rag_enforced=apply_labels,
+            source_count=source_count_for_policy,
+        )
         result = services.pipeline.run(
             topic=payload.topic,
             audience=payload.audience,
@@ -369,11 +532,18 @@ def run_pipeline(
             review_max_input_chars=_pipeline_max_input_chars("review"),
             rewrite_max_input_chars=_pipeline_max_input_chars("rewrite"),
             session_id=payload.session_id,
+            plan_tool_profile_id=_runtime_tool_profile_id(services, plan_tool_decision),
+            plan_tool_registry_override=_runtime_tool_registry(services, plan_tool_registry),
+            draft_tool_profile_id=_runtime_tool_profile_id(services, draft_tool_decision),
+            draft_tool_registry_override=_runtime_tool_registry(services, draft_tool_registry),
+            review_tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
+            review_tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
+            rewrite_tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
+            rewrite_tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
         )
-        apply_labels = os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes")
         refusal_query = f"{payload.topic}\n{result.outline.outline}"
         effective_sources = list(sources)
-        if apply_labels:
+        if _refusal_enabled():
             refused, effective_sources = _refusal_check_with_fallback(
                 query=refusal_query,
                 sources=effective_sources,
@@ -441,6 +611,12 @@ def run_pipeline(
                 review_max_input_chars=_pipeline_max_input_chars("review"),
                 rewrite_max_input_chars=_pipeline_max_input_chars("rewrite"),
                 session_id=payload.session_id,
+                draft_tool_profile_id=_runtime_tool_profile_id(services, draft_tool_decision),
+                draft_tool_registry_override=_runtime_tool_registry(services, draft_tool_registry),
+                review_tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
+                review_tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
+                rewrite_tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
+                rewrite_tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
             )
             result = PipelineResult(
                 outline=result.outline,
@@ -453,8 +629,10 @@ def run_pipeline(
             result.draft_result.revised or result.draft_result.draft,
             result.research_notes,
             apply_labels=apply_labels,
+            strict_labels=_strict_citation_labels(),
             embedder=services.rag.get_embedder(),
         )
+        enforced_text = _postprocess_final_text(enforced_text)
         citation_enforced = apply_labels and enforced_text != result.draft_result.revised
         draft_result = DraftResult(
             outline=result.draft_result.outline,
@@ -551,12 +729,15 @@ def run_pipeline_stream(
             stage_start = now
         try:
             logger.info(
-                "pipeline stream start: session_id=%s topic_len=%s source_count=%s citation_enforce=%s",
+                "pipeline stream start: session_id=%s topic_len=%s source_count=%s mode=%s citation_enforce=%s mcp_allowed=%s",
                 payload.session_id or "__default__",
                 len(payload.topic or ""),
                 len(payload.sources or []),
-                os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes"),
+                get_generation_mode(),
+                _citations_enabled(),
+                _mcp_enabled(),
             )
+            apply_labels = _citations_enabled()
             logger.info(
                 "pipeline stream budget: plan(t=%s,c=%s) draft(t=%s,c=%s) review(t=%s,c=%s) rewrite(t=%s,c=%s)",
                 _pipeline_max_tokens("plan"),
@@ -569,18 +750,22 @@ def run_pipeline_stream(
                 _pipeline_max_input_chars("rewrite"),
             )
             current_stage = "plan"
-            github_context = maybe_fetch_github_context(
-                services.github_mcp_tool,
-                query=payload.topic,
-                context="\n".join(
-                    [
-                        payload.constraints,
-                        payload.key_points,
-                        payload.style,
-                        payload.audience,
-                        payload.review_criteria,
-                    ]
-                ),
+            github_context = (
+                maybe_fetch_github_context(
+                    services.github_mcp_tool,
+                    query=payload.topic,
+                    context="\n".join(
+                        [
+                            payload.constraints,
+                            payload.key_points,
+                            payload.style,
+                            payload.audience,
+                            payload.review_criteria,
+                        ]
+                    ),
+                )
+                if _mcp_enabled()
+                else ""
             )
             constraints = _append_block(payload.constraints, github_context, "GitHub参考")
             sources = [
@@ -601,6 +786,16 @@ def run_pipeline_stream(
                         url="",
                     )
                 )
+            source_count_for_policy = len(sources)
+            plan_tool_decision, plan_tool_registry = _resolve_stage_tools(
+                services=services,
+                stage="plan",
+                topic=payload.topic,
+                constraints=constraints,
+                research_notes=payload.key_points,
+                rag_enforced=apply_labels,
+                source_count=source_count_for_policy,
+            )
             q.put({"type": "status", "step": "plan"})
             outline = services.pipeline.planner.plan_outline_stream(
                 topic=payload.topic,
@@ -612,6 +807,8 @@ def run_pipeline_stream(
                 max_tokens=_pipeline_max_tokens("plan"),
                 max_input_chars=_pipeline_max_input_chars("plan"),
                 session_id=payload.session_id,
+                tool_profile_id=_runtime_tool_profile_id(services, plan_tool_decision),
+                tool_registry_override=_runtime_tool_registry(services, plan_tool_registry),
                 on_chunk=lambda chunk: q.put({"type": "delta", "stage": "plan", "content": chunk}),
             )
             task_status["plan"] = bool(outline.outline.strip())
@@ -627,10 +824,9 @@ def run_pipeline_stream(
                 }
             )
 
-            apply_labels = os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes")
             refusal_query = f"{payload.topic}\n{outline.outline}"
             effective_sources = list(sources)
-            if apply_labels and effective_sources:
+            if _refusal_enabled() and effective_sources:
                 refused, effective_sources = _refusal_check_with_fallback(
                     query=refusal_query,
                     sources=effective_sources,
@@ -650,6 +846,16 @@ def run_pipeline_stream(
             task_status["research"] = None if not effective_sources else bool(notes)
             _log_stage("research")
             notes_text = services.pipeline.researcher.format_notes(notes)
+            draft_tool_decision, draft_tool_registry = _resolve_stage_tools(
+                services=services,
+                stage="draft",
+                topic=payload.topic,
+                outline=outline.outline,
+                constraints=constraints,
+                research_notes=notes_text,
+                rag_enforced=apply_labels,
+                source_count=len(effective_sources),
+            )
             q.put(
                 {
                     "type": "research",
@@ -706,6 +912,7 @@ def run_pipeline_stream(
                 succeeded = True
                 effective_output = False
                 q.put({"type": "result", "payload": response.model_dump()})
+                q.put({"type": "done", "ok": True})
                 return
 
             current_stage = "draft"
@@ -726,6 +933,8 @@ def run_pipeline_stream(
                 max_tokens=_pipeline_max_tokens("draft"),
                 max_input_chars=_pipeline_max_input_chars("draft"),
                 session_id=payload.session_id,
+                tool_profile_id=_runtime_tool_profile_id(services, draft_tool_decision),
+                tool_registry_override=_runtime_tool_registry(services, draft_tool_registry),
             ):
                 if not chunk:
                     continue
@@ -746,6 +955,8 @@ def run_pipeline_stream(
                     max_tokens=_pipeline_max_tokens("draft"),
                     max_input_chars=_pipeline_max_input_chars("draft"),
                     session_id=payload.session_id,
+                    tool_profile_id=_runtime_tool_profile_id(services, draft_tool_decision),
+                    tool_registry_override=_runtime_tool_registry(services, draft_tool_registry),
                 )
                 _emit_text_deltas("draft", draft)
             task_status["draft"] = _is_effective(draft)
@@ -755,6 +966,17 @@ def run_pipeline_stream(
             current_stage = "review"
             q.put({"type": "status", "step": "review"})
             review_chunks: list[str] = []
+            review_tool_decision, review_tool_registry = _resolve_stage_tools(
+                services=services,
+                stage="review",
+                topic=payload.topic,
+                outline=outline.outline,
+                draft=draft,
+                guidance=payload.review_criteria,
+                research_notes=notes_text,
+                rag_enforced=apply_labels,
+                source_count=len(effective_sources),
+            )
             # 根据 draft 长度动态设置 max_tokens，避免截断
             review_max_tokens = min(8000, max(2000, int(len(draft) * 0.8)))
             for chunk in services.reviewer.agent.review_stream(
@@ -765,6 +987,8 @@ def run_pipeline_stream(
                 max_tokens=review_max_tokens,
                 max_input_chars=_pipeline_max_input_chars("review"),
                 session_id=payload.session_id,
+                tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
+                tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
             ):
                 if not chunk:
                     continue
@@ -783,6 +1007,8 @@ def run_pipeline_stream(
                     max_tokens=review_max_tokens,
                     max_input_chars=_pipeline_max_input_chars("review"),
                     session_id=payload.session_id,
+                    tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
+                    tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
                 ).review
                 _emit_text_deltas("review", review)
             task_status["review"] = bool(review.strip())
@@ -792,11 +1018,24 @@ def run_pipeline_stream(
             current_stage = "rewrite"
             q.put({"type": "status", "step": "rewrite"})
             rewrite_chunks: list[str] = []
+            rewrite_tool_decision, rewrite_tool_registry = _resolve_stage_tools(
+                services=services,
+                stage="rewrite",
+                topic=payload.topic,
+                outline=outline.outline,
+                draft=draft,
+                guidance=(review + "\n\n" + payload.review_criteria).strip(),
+                constraints=payload.style,
+                research_notes=notes_text,
+                rag_enforced=apply_labels,
+                source_count=len(effective_sources),
+            )
             # 根据 draft 长度动态设置 max_tokens，避免截断
             rewrite_max_tokens = min(8000, max(2000, int(len(draft) * 1.5)))
-            rewrite_guidance = review
+            rewrite_guidance_parts = [part.strip() for part in [review, payload.review_criteria] if part and part.strip()]
+            rewrite_guidance = "\n\n".join(dict.fromkeys(rewrite_guidance_parts))
             if evidence_text:
-                rewrite_guidance = (review + "\n\nOnly use the evidence below:\n" + evidence_text).strip()
+                rewrite_guidance = (rewrite_guidance + "\n\nOnly use the evidence below:\n" + evidence_text).strip()
             for chunk in services.rewriter.agent.rewrite_stream(
                 draft=draft,
                 guidance=rewrite_guidance,
@@ -805,6 +1044,8 @@ def run_pipeline_stream(
                 max_tokens=rewrite_max_tokens,
                 max_input_chars=_pipeline_max_input_chars("rewrite"),
                 session_id=payload.session_id,
+                tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
+                tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
             ):
                 if not chunk:
                     continue
@@ -823,15 +1064,19 @@ def run_pipeline_stream(
                     max_tokens=rewrite_max_tokens,
                     max_input_chars=_pipeline_max_input_chars("rewrite"),
                     session_id=payload.session_id,
+                    tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
+                    tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
                 ).revised
                 _emit_text_deltas("rewrite", revised)
-            apply_labels = os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes")
+            apply_labels = _citations_enabled()
             enforced_text, report = _citation_enforcer.enforce(
                 revised or draft,
                 notes,
                 apply_labels=apply_labels,
+                strict_labels=_strict_citation_labels(),
                 embedder=services.rag.get_embedder(),
             )
+            enforced_text = _postprocess_final_text(enforced_text)
             citation_enforced = apply_labels and enforced_text != revised
             revised = enforced_text
             task_status["rewrite"] = _is_effective(revised)
@@ -877,6 +1122,7 @@ def run_pipeline_stream(
                 len(notes or []),
             )
             q.put({"type": "result", "payload": response.model_dump()})
+            q.put({"type": "done", "ok": True})
         except Exception as exc:  # pragma: no cover
             logger.exception(
                 "pipeline stream failed: session_id=%s stage=%s",
@@ -888,6 +1134,7 @@ def run_pipeline_stream(
                 if value is None:
                     task_status[key] = False
             q.put({"type": "error", "detail": str(exc), "stage": current_stage})
+            q.put({"type": "done", "ok": False})
         finally:
             if any(v is not None for v in task_status.values()):
                 _log_task_success_rate(

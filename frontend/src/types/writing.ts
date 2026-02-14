@@ -50,4 +50,17 @@ export interface RewriteRequest {
 
 export interface RewriteResponse {
   revised: string;
+  citations?: { label: string; title: string; url?: string }[];
+  bibliography?: string;
+  coverage?: number;
+  coverage_detail?: {
+    token_coverage: number;
+    paragraph_coverage: number;
+    semantic_coverage: number;
+    covered_tokens: number;
+    total_tokens: number;
+    covered_paragraphs: number;
+    total_paragraphs: number;
+  };
+  citation_enforced?: boolean;
 }

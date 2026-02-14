@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
+from hello_agents.tools import ToolRegistry
+
 from ..agents.editor_agent import EditorAgent
 
 
@@ -25,6 +27,8 @@ class RewritingService:
         max_tokens: int | None = None,
         max_input_chars: int | None = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ) -> RewriteResult:
         if _should_chunk(draft, target_length):
             revised = self._rewrite_long(
@@ -35,6 +39,8 @@ class RewritingService:
                 max_tokens=max_tokens,
                 max_input_chars=max_input_chars,
                 session_id=session_id,
+                tool_profile_id=tool_profile_id,
+                tool_registry_override=tool_registry_override,
             )
         else:
             revised = self.agent.rewrite(
@@ -45,6 +51,8 @@ class RewritingService:
                 max_tokens=max_tokens,
                 max_input_chars=max_input_chars,
                 session_id=session_id,
+                tool_profile_id=tool_profile_id,
+                tool_registry_override=tool_registry_override,
             )
         return RewriteResult(revised=revised)
 
@@ -58,6 +66,8 @@ class RewritingService:
         max_tokens: int | None = None,
         max_input_chars: int | None = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ) -> str:
         chunks = _split_draft(draft, max_chars=1200)
         outputs: list[str] = []
@@ -84,6 +94,8 @@ class RewritingService:
                 max_tokens=section_max_tokens,
                 max_input_chars=max_input_chars,
                 session_id=session_id,
+                tool_profile_id=tool_profile_id,
+                tool_registry_override=tool_registry_override,
             )
             outputs.append(section_text.strip())
             context_tail = "\n\n".join(outputs)

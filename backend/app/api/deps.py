@@ -5,6 +5,7 @@ from functools import lru_cache
 import logging
 from pathlib import Path
 import threading
+from typing import Any
 
 from ..agents.editor_agent import EditorAgent
 from ..agents.reviewer_agent import ReviewerAgent
@@ -64,6 +65,8 @@ class AppServices:
     upload_max_bytes: int
     github_mcp_enabled: bool
     github_mcp_tool: MCPTool | None
+    agent_tool_calling_enabled: bool
+    agent_tools_catalog: tuple[Any, ...]
 
 
 @lru_cache(maxsize=1)
@@ -73,15 +76,22 @@ def get_services() -> AppServices:
 
 
 def _tool_name(tool: object) -> str:
-    try:
-        getter = getattr(tool, "get", None)
-        if callable(getter):
-            name = getter("name")
-            return str(name) if name else ""
-    except Exception:
-        pass
-    name = getattr(tool, "name", None)
-    return str(name) if name else ""
+    if isinstance(tool, dict):
+        name = tool.get("name")
+        return str(name) if name else ""
+    for attr in ("name", "tool_name", "id"):
+        try:
+            value = getattr(tool, attr, None)
+        except Exception:
+            value = None
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                value = None
+        if value:
+            return str(value)
+    return ""
 
 
 def _build_services() -> AppServices:
@@ -133,6 +143,7 @@ def _build_services() -> AppServices:
     )
 
     tool_registry: ToolRegistry | None = None
+    tools_to_register: list[Any] = []
     github_mcp_tool: MCPTool | None = None
     if config.github_mcp_enabled:
         tool_registry = ToolRegistry()
@@ -177,18 +188,26 @@ def _build_services() -> AppServices:
                 )
             else:
                 tool_registry.register_tool(github_mcp_tool)
+                tools_to_register = [github_mcp_tool]
                 logger.info("GitHub MCP tool enabled with 1 tool (raw).")
         except Exception as exc:
             logger.warning("Failed to initialize GitHub MCP tool: %s", exc)
             tool_registry = None
+            tools_to_register = []
             github_mcp_tool = None
 
     agent_tool_calling_enabled = _env_flag("LLM_AGENT_TOOL_CALLING_ENABLED", False)
     agent_tool_registry = tool_registry if agent_tool_calling_enabled else None
+
     if tool_registry is not None and not agent_tool_calling_enabled:
         logger.info(
             "Agent-level tool calling disabled (LLM_AGENT_TOOL_CALLING_ENABLED=false); "
             "GitHub MCP remains available via explicit service calls."
+        )
+    if tool_registry is not None and agent_tool_calling_enabled:
+        logger.info(
+            "Agent-level tool calling enabled with %s tool(s). Stage routing is applied at runtime.",
+            len(tools_to_register),
         )
 
     writing_agent = WritingAgent(
@@ -381,6 +400,8 @@ def _build_services() -> AppServices:
         upload_max_bytes=max(1, config.upload_max_mb) * 1024 * 1024,
         github_mcp_enabled=config.github_mcp_enabled and github_mcp_tool is not None,
         github_mcp_tool=github_mcp_tool,
+        agent_tool_calling_enabled=agent_tool_calling_enabled and bool(tools_to_register),
+        agent_tools_catalog=tuple(tools_to_register),
     )
 
 

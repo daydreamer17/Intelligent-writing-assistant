@@ -8,9 +8,13 @@
 - 流式生成：支持分步与一键 Pipeline 的 SSE 实时状态与结果推送
 - RAG 检索增强：支持 `.txt / .pdf / .docx / .md / .markdown` 上传与检索
 - 动态检索策略：按语料规模动态调整 `top_k`、候选数、研究笔记注入量
-- 可选强制引用：`RAG_CITATION_ENFORCE` 开启后使用两段式“先证据、后生成”
+- 调用模式三态：`RAG-only / Hybrid / Creative`
+- 引用策略：
+  - `RAG-only`：严格证据约束与拒答保护
+  - `Hybrid`：优先打 `[n]` 引用；无证据段落自动标注 `[推断]`
+  - `Creative`：自由生成，不强制引用；支持前端开关控制是否启用 MCP
 - 拒答保护：检索质量不足时拒答，避免低可信幻觉输出
-- 记忆机制：会话隔离（`session_id`）、历史压缩、冷存写入与冷存召回回注
+- 记忆机制：会话隔离（`session_id`）、历史压缩、冷存写入与冷存召回回注；支持任务前自动重置会话记忆（含冷存）
 - 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化
 - 外部知识接入：GitHub MCP（可选）及显式工具 API
 
@@ -105,7 +109,11 @@ QDRANT_DISTANCE=cosine
 RAG_DYNAMIC_TOPK_ENABLED=true
 RAG_RERANK_ENABLED=true
 RAG_HYDE_ENABLED=false
-RAG_CITATION_ENFORCE=false
+RAG_GENERATION_MODE=rag_only        # rag_only / hybrid / creative
+RAG_CREATIVE_MCP_ENABLED=true       # creative 模式下是否启用 MCP
+RAG_CREATIVE_MEMORY_ENABLED=false   # creative 模式是否启用会话记忆
+RAG_HYBRID_INFERENCE_TAG=[推断]
+RAG_HYBRID_MIN_PARAGRAPH_CHARS=12
 RAG_REFUSAL_ENABLED=true
 ```
 
@@ -114,6 +122,16 @@ RAG_REFUSAL_ENABLED=true
 ```env
 MCP_GITHUB_ENABLED=false
 GITHUB_PERSONAL_ACCESS_TOKEN=YOUR_GITHUB_TOKEN
+LLM_AGENT_TOOL_CALLING_ENABLED=false
+LLM_STAGE_BASED_TOOLS_ENABLED=true
+LLM_TOOLS_PLAN_STAGE=github_search_repositories,github_search_code
+LLM_TOOLS_DRAFT_STAGE=github_search_repositories,github_search_code,github_get_file_contents
+LLM_TOOLS_REVIEW_STAGE=github_search_repositories,github_search_code
+LLM_TOOLS_REWRITE_STAGE=
+LLM_TOOL_POLICY_MODE=rules
+LLM_TOOL_POLICY_SEARCH_KEYWORDS=github,repo,repository,issue,pr,commit,code,readme
+LLM_TOOL_POLICY_READ_KEYWORDS=owner/repo,path,README,.md,.py
+LLM_TOOL_POLICY_DISABLE_WHEN_RAG_STRONG=true
 ```
 
 ## 6. 关键 API
@@ -124,7 +142,7 @@ GITHUB_PERSONAL_ACCESS_TOKEN=YOUR_GITHUB_TOKEN
 - RAG：`/api/rag/upload`、`/api/rag/upload-file`、`/api/rag/search`
 - 评测：`/api/rag/evaluate`、`/api/rag/evaluations`、`/api/rag/evaluations/{run_id}`
 - 版本：`/api/versions`、`/api/versions/{id}`、`/api/versions/{id}/diff`
-- 设置：`/api/settings/citation`、`/api/settings/session-memory/clear`
+- 设置：`/api/settings/generation-mode`、`/api/settings/citation`（兼容旧开关）、`/api/settings/session-memory/clear`
 - MCP：`/api/mcp/github/tools`、`/api/mcp/github/call`
 
 接口文档：
@@ -132,6 +150,23 @@ GITHUB_PERSONAL_ACCESS_TOKEN=YOUR_GITHUB_TOKEN
 - `http://localhost:8000/redoc`
 
 ## 7. 更新日志
+
+### v0.5.2 (2026-02-14)
+**🧩 Creative 模式可控与会话重置增强**
+
+- ✨ 新增 Creative 模式 MCP 前端显示开关（运行时生效）
+- ✨ 新增 `RAG_CREATIVE_MCP_ENABLED`、`RAG_CREATIVE_MEMORY_ENABLED` 配置项
+- 🔧 工作台分步/一键任务执行前自动重置会话记忆（含冷存）
+- 🔧 修复“显示无可用记忆但仍会污染”问题：会话重置改为按会话作用域清理 SQLite 冷存（含 `session_id::tool_profile`）
+
+### v0.5.1 (2026-02-14)
+**🔧 引用与改写链路对齐版**
+
+- ✨ 新增三态调用模式落地：`RAG-only / Hybrid / Creative`
+- ✨ Hybrid 模式调整为“有证据打 `[n]`，无证据打 `[推断]`”
+- 🔧 修复改写流式最终结果与引用面板不同步问题（最终稿统一回传并覆盖）
+- 🔧 改写阶段 guidance 合并“审校输出 + 审校标准”，提升按审校意见改写的一致性
+- 🔧 设置接口补充 `GET/POST /api/settings/generation-mode`，旧 citation 开关保持兼容映射
 
 ### v0.5.0 (2026-02-11)
 **🧠 记忆与链路稳定性增强版**

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import sqlite3
+import re
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional
 import logging
@@ -16,6 +17,9 @@ from hello_agents.tools import ToolRegistry
 from ..utils.tokenizer import tokenize
 
 logger = logging.getLogger("app.llm")
+_TOOL_REGISTRY_UNSET = object()
+_TOOL_CALL_PATTERN = re.compile(r"\[TOOL_CALL:[^\]]+\]")
+_TOOL_CALL_PREFIX = "[TOOL_CALL:"
 
 @dataclass(frozen=True)
 class AgentRuntimeConfig:
@@ -78,12 +82,431 @@ def build_llm(config: AgentRuntimeConfig) -> HelloAgentsLLM:
         )
 
     try:
-        return HelloAgentsLLM(**llm_kwargs)
+        llm = HelloAgentsLLM(**llm_kwargs)
     except TypeError:
         if "timeout" in llm_kwargs:
             llm_kwargs.pop("timeout", None)
-            return HelloAgentsLLM(**llm_kwargs)
-        raise
+            llm = HelloAgentsLLM(**llm_kwargs)
+        else:
+            raise
+    _patch_llm_think(llm)
+    return llm
+
+
+def _patch_llm_think(llm: HelloAgentsLLM) -> None:
+    """Replace framework ``think()`` so raw ``[TOOL_CALL:]`` markers are never
+    printed to stdout.
+
+    The upstream ``HelloAgentsLLM.think()`` does ``print(content, end="",
+    flush=True)`` for every streamed chunk.  When a small model emits hundreds
+    of ``[TOOL_CALL:]`` markers the console becomes unreadable and it looks as
+    if the pipeline is broken (even though our agent-level guards DO filter the
+    markers before they reach pipeline output).
+
+    This patch:
+    * Redirects the informational prints to the logger.
+    * Strips ``[TOOL_CALL:…]`` markers from chunks before printing so the
+      console only shows real content.
+    * Still **yields** every raw chunk unchanged so that the downstream
+      ``ToolAwareSimpleAgent.stream_run()`` can parse tool calls normally.
+    """
+    import types
+    from hello_agents.core.exceptions import HelloAgentsException
+
+    original_client_attr = "_client"  # OpenAI client attribute
+
+    def _patched_think(
+        self: Any,
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        max_tokens = kwargs.get("max_tokens", self.max_tokens)
+        logger.info("Calling %s …", self.model)
+        visible_buffer = ""
+
+        def _drain_visible(*, final_pass: bool = False) -> str:
+            """Drop TOOL_CALL markers from a streaming buffer, including split chunks."""
+            nonlocal visible_buffer
+            parts: list[str] = []
+
+            while True:
+                marker_index = visible_buffer.find(_TOOL_CALL_PREFIX)
+                if marker_index == -1:
+                    safe_len = len(visible_buffer)
+                    if not final_pass:
+                        safe_len = max(0, safe_len - (len(_TOOL_CALL_PREFIX) - 1))
+                    if safe_len <= 0:
+                        break
+                    parts.append(visible_buffer[:safe_len])
+                    visible_buffer = visible_buffer[safe_len:]
+                    break
+
+                if marker_index > 0:
+                    parts.append(visible_buffer[:marker_index])
+                    visible_buffer = visible_buffer[marker_index:]
+                    continue
+
+                marker_end = visible_buffer.find("]")
+                if marker_end == -1:
+                    break
+                visible_buffer = visible_buffer[marker_end + 1 :]
+
+            return "".join(parts)
+
+        try:
+            response = getattr(self, original_client_attr).chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature if temperature is not None else self.temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            logger.info("LLM stream opened (max_tokens=%s).", max_tokens)
+            for chunk in response:
+                content = chunk.choices[0].delta.content or ""
+                if content:
+                    visible_buffer += content
+                    # Print only non-tool-call text so the console stays clean.
+                    visible = _drain_visible(final_pass=False)
+                    if visible.strip():
+                        print(visible, end="", flush=True)
+                    # Always yield the raw content so the agent layer can parse
+                    # tool calls from it.
+                    yield content
+            tail_visible = _drain_visible(final_pass=True)
+            if tail_visible.strip():
+                print(tail_visible, end="", flush=True)
+            print()  # newline after stream ends
+        except Exception as e:
+            logger.error("LLM API error: %s", e)
+            raise HelloAgentsException(f"LLM调用失败: {e}")
+
+    def _patched_stream_invoke(
+        self: Any,
+        messages: list[dict[str, str]],
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        # Upstream stream_invoke only forwards temperature; we preserve all kwargs
+        # so stage-level max_tokens/max_input policies actually take effect.
+        yield from self.think(messages, **kwargs)
+
+    llm.think = types.MethodType(_patched_think, llm)
+
+
+def _resolve_conversation_memory_enabled(explicit: Any | None = None) -> tuple[bool, str]:
+    if explicit is not None:
+        return bool(explicit), "explicit"
+    try:
+        from ..services.generation_mode import (
+            conversation_memory_enabled_for_mode,
+            get_generation_mode,
+        )
+
+        mode = get_generation_mode()
+        return conversation_memory_enabled_for_mode(mode), f"mode:{mode}"
+    except Exception:
+        return True, "fallback"
+    llm.stream_invoke = types.MethodType(_patched_stream_invoke, llm)
+    logger.debug("Patched LLM.think() to suppress [TOOL_CALL:] console noise.")
+
+
+def _patch_tool_call_limit(agent: Any) -> None:
+    """Monkey-patch ToolAwareSimpleAgent to limit tool calls per LLM response.
+
+    Qwen3-8B (and similar small models) may generate hundreds of identical
+    [TOOL_CALL:...] markers in a single response instead of producing one or two
+    calls and waiting for results.  Without a guard, the framework will execute
+    every single call, accumulate massive tool-result text, and blow up the
+    context window on the next LLM round-trip.
+
+    This patch wraps ``_parse_tool_calls`` so that:
+    1. Duplicate calls (same tool_name + parameters) are collapsed.
+    2. At most ``LLM_MAX_TOOL_CALLS_PER_RESPONSE`` unique calls are kept.
+    """
+    max_calls = max(1, _parse_int_env("LLM_MAX_TOOL_CALLS_PER_RESPONSE", default=2))
+    max_calls_per_request = max(max_calls, _parse_int_env("LLM_MAX_TOOL_CALLS_PER_REQUEST", default=4))
+    max_repeated_calls = max(1, _parse_int_env("LLM_MAX_REPEATED_TOOL_CALLS", default=2))
+
+    if not hasattr(agent, "_parse_tool_calls"):
+        return
+
+    # Capture the *bound* method before we overwrite the instance attribute,
+    # so the closure calls the original implementation correctly.
+    original_parse = agent._parse_tool_calls
+
+    def _call_key(tool_name: str, parameters: str) -> str:
+        normalized_name = (tool_name or "").strip().lower()
+        normalized_parameters = re.sub(r"\s+", " ", (parameters or "").strip()).lower()
+        return f"{normalized_name}::{normalized_parameters}"
+
+    def _limited_parse(text: str) -> list:
+        calls = original_parse(text)
+        if not calls:
+            return calls
+        # Deduplicate by (tool_name, parameters)
+        seen: set[tuple[str, str]] = set()
+        unique: list = []
+        for call in calls:
+            key = (call.get("tool_name", ""), call.get("parameters", ""))
+            if key not in seen:
+                seen.add(key)
+                unique.append(call)
+        if len(unique) > max_calls:
+            logger.warning(
+                "Truncated tool calls from %s unique (%s raw) to %s per response "
+                "(LLM_MAX_TOOL_CALLS_PER_RESPONSE=%s).",
+                len(unique),
+                len(calls),
+                max_calls,
+                max_calls,
+            )
+            unique = unique[:max_calls]
+        elif len(calls) > len(unique):
+            logger.info(
+                "De-duplicated tool calls: %s raw -> %s unique.",
+                len(calls),
+                len(unique),
+            )
+        unique = unique[:max_calls]
+
+        state = getattr(agent, "_tool_guard_state", None)
+        if not isinstance(state, dict):
+            return unique
+
+        repeat_counts = state.setdefault("seen_counts", {})
+        planned_total = int(state.get("planned_total", 0))
+        filtered: list[dict[str, Any]] = []
+        suppressed_repeat = 0
+        suppressed_budget = 0
+
+        for call in unique:
+            key = _call_key(call.get("tool_name", ""), call.get("parameters", ""))
+            next_repeat = int(repeat_counts.get(key, 0)) + 1
+            repeat_counts[key] = next_repeat
+
+            if next_repeat > max_repeated_calls:
+                suppressed_repeat += 1
+                continue
+            if planned_total >= max_calls_per_request:
+                suppressed_budget += 1
+                state["loop_detected"] = True
+                continue
+
+            filtered.append(call)
+            planned_total += 1
+
+        state["planned_total"] = planned_total
+
+        if suppressed_repeat > 0:
+            state["loop_detected"] = True
+            logger.warning(
+                "Suppressed %s repeated tool call(s) in one request "
+                "(LLM_MAX_REPEATED_TOOL_CALLS=%s).",
+                suppressed_repeat,
+                max_repeated_calls,
+            )
+        if suppressed_budget > 0:
+            logger.warning(
+                "Suppressed %s tool call(s) due to request-level budget "
+                "(LLM_MAX_TOOL_CALLS_PER_REQUEST=%s).",
+                suppressed_budget,
+                max_calls_per_request,
+            )
+        return filtered
+
+    max_iterations = max(1, _parse_int_env("LLM_MAX_TOOL_ITERATIONS", default=2))
+
+    # Bind as instance method so ``self._parse_tool_calls(text)`` hits our wrapper
+    import types
+    agent._parse_tool_calls = types.MethodType(lambda self, text: _limited_parse(text), agent)
+
+    # ── Truncate tool results to prevent token overflow ──────────────────
+    # GitHub search results can be enormous (hundreds of KB).  When they are
+    # fed back into the messages for the next LLM iteration the context
+    # explodes (483K tokens observed).  Truncating each individual tool
+    # result is the most targeted way to prevent this.
+    max_result_chars = max(500, _parse_int_env("LLM_MAX_TOOL_RESULT_CHARS", default=3000))
+
+    if hasattr(agent, "_execute_tool_call"):
+        original_execute = agent._execute_tool_call
+
+        def _limited_execute(tool_name: str, parameters: str) -> str:
+            state = getattr(agent, "_tool_guard_state", None)
+            if isinstance(state, dict):
+                key = _call_key(tool_name, parameters)
+                executed_total = int(state.get("executed_total", 0))
+                if executed_total >= max_calls_per_request:
+                    state["loop_detected"] = True
+                    logger.warning(
+                        "Skip tool %s: request-level tool budget reached (%s).",
+                        tool_name,
+                        max_calls_per_request,
+                    )
+                    return "⚠️ 本轮工具调用次数已达上限，请直接输出最终答案，不要继续调用工具。"
+
+                executed_counts = state.setdefault("executed_counts", {})
+                repeat = int(executed_counts.get(key, 0)) + 1
+                if repeat > max_repeated_calls:
+                    state["loop_detected"] = True
+                    logger.warning(
+                        "Skip repeated tool %s call: repeat=%s limit=%s.",
+                        tool_name,
+                        repeat,
+                        max_repeated_calls,
+                    )
+                    return f"⚠️ 工具 {tool_name} 出现重复调用，请直接输出最终答案，不要继续调用工具。"
+
+                executed_counts[key] = repeat
+                state["executed_total"] = executed_total + 1
+
+            result = original_execute(tool_name, parameters)
+            if result and len(result) > max_result_chars:
+                logger.warning(
+                    "Truncated tool result for %s from %s to %s chars "
+                    "(LLM_MAX_TOOL_RESULT_CHARS=%s).",
+                    tool_name, len(result), max_result_chars, max_result_chars,
+                )
+                result = result[:max_result_chars] + "\n…[结果已截断]"
+            return result
+
+        agent._execute_tool_call = types.MethodType(
+            lambda self, tool_name, parameters: _limited_execute(tool_name, parameters),
+            agent,
+        )
+
+    # ── Guard run / stream_run from endless tool-call loops ──────────────
+    if hasattr(agent, "run"):
+        original_run = agent.run
+
+        def _guarded_run(input_text: str, *args: Any, **kwargs: Any) -> str:
+            setattr(
+                agent,
+                "_tool_guard_state",
+                {
+                    "seen_counts": {},
+                    "planned_total": 0,
+                    "executed_counts": {},
+                    "executed_total": 0,
+                    "loop_detected": False,
+                },
+            )
+            kwargs.setdefault("max_tool_iterations", max_iterations)
+            response = original_run(input_text, *args, **kwargs)
+            cleaned = _strip_tool_markers(response, trim=True)
+            state = getattr(agent, "_tool_guard_state", None)
+            loop_detected = bool(isinstance(state, dict) and state.get("loop_detected"))
+            if cleaned.strip():
+                if loop_detected and len(cleaned) < 80:
+                    logger.warning(
+                        "Likely tool loop detected with short final response (run). Forcing no-tool fallback."
+                    )
+                    fallback = _force_answer_without_tools(agent, input_text, kwargs)
+                    if fallback:
+                        return fallback
+                if cleaned != response:
+                    logger.info("Stripped tool-call markers from final response (run).")
+                return cleaned
+            if "[TOOL_CALL:" in (response or ""):
+                logger.warning(
+                    "Tool-call-only response detected (run). Forcing final answer without tools."
+                )
+                return _force_answer_without_tools(agent, input_text, kwargs)
+            return response
+
+        agent.run = types.MethodType(lambda self, input_text, *args, **kwargs: _guarded_run(input_text, *args, **kwargs), agent)
+
+    if hasattr(agent, "stream_run"):
+        original_stream_run = agent.stream_run
+
+        def _guarded_stream_run(input_text: str, *args: Any, **kwargs: Any) -> Iterator[str]:
+            setattr(
+                agent,
+                "_tool_guard_state",
+                {
+                    "seen_counts": {},
+                    "planned_total": 0,
+                    "executed_counts": {},
+                    "executed_total": 0,
+                    "loop_detected": False,
+                },
+            )
+            kwargs.setdefault("max_tool_iterations", max_iterations)
+            emitted_any = False
+            for chunk in original_stream_run(input_text, *args, **kwargs):
+                cleaned = _strip_tool_markers(chunk, trim=False)
+                if not cleaned or not cleaned.strip():
+                    continue
+                emitted_any = True
+                yield cleaned
+            if not emitted_any:
+                logger.warning(
+                    "Stream run emitted no content after tool calls. Forcing final answer without tools."
+                )
+                fallback = _force_answer_without_tools(agent, input_text, kwargs)
+                if fallback:
+                    yield fallback
+
+        agent.stream_run = types.MethodType(
+            lambda self, input_text, *args, **kwargs: _guarded_stream_run(input_text, *args, **kwargs),
+            agent,
+        )
+
+
+def _strip_tool_markers(text: str, *, trim: bool = False) -> str:
+    if not text:
+        return text
+    # Remove [TOOL_CALL:...] directives that the model may leave in final output.
+    cleaned = _TOOL_CALL_PATTERN.sub("", text)
+    return cleaned.strip() if trim else cleaned
+
+
+def _force_answer_without_tools(agent: Any, input_text: str, kwargs: dict[str, Any]) -> str:
+    llm = getattr(agent, "llm", None)
+    if llm is None:
+        return ""
+
+    system_prompt = getattr(agent, "system_prompt", "") or ""
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": (
+                system_prompt
+                + "\n\n当前回合禁止任何工具调用。请直接给出最终答案，不要输出任何 [TOOL_CALL:...] 标记。"
+            ),
+        }
+    ]
+
+    history = getattr(agent, "_history", None) or []
+    # Keep only a small recent window to avoid prompt explosion in fallback.
+    for msg in history[-6:]:
+        role = getattr(msg, "role", "assistant")
+        content = getattr(msg, "content", "") or ""
+        if content:
+            messages.append({"role": role, "content": content})
+
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "请基于已获得的信息直接回答，不要再调用工具。\n\n"
+                f"原始请求：\n{input_text}"
+            ),
+        }
+    )
+
+    invoke_kwargs: dict[str, Any] = {}
+    for key in ("max_tokens", "temperature"):
+        value = kwargs.get(key)
+        if value is not None:
+            invoke_kwargs[key] = value
+
+    try:
+        response = llm.invoke(messages, **invoke_kwargs)
+    except Exception as exc:
+        logger.warning("Forced no-tool fallback failed: %s", exc)
+        return ""
+    return _strip_tool_markers(response, trim=True)
 
 
 class BaseWritingAgent:
@@ -101,37 +524,68 @@ class BaseWritingAgent:
         self._session_last_seen["__default__"] = time.time()
         self.agent = default
 
-    def _create_agent(self) -> Any:
-        if self._tool_registry is not None:
-            return ToolAwareSimpleAgent(
+    def _create_agent(self, tool_registry_override: Any = _TOOL_REGISTRY_UNSET) -> Any:
+        if tool_registry_override is _TOOL_REGISTRY_UNSET:
+            registry = self._tool_registry
+        else:
+            registry = tool_registry_override
+        if registry is not None:
+            agent = ToolAwareSimpleAgent(
                 name=self.config.name,
                 llm=self.llm,
                 system_prompt=self.config.system_prompt,
                 enable_tool_calling=True,
-                tool_registry=self._tool_registry,
+                tool_registry=registry,
             )
+            _patch_tool_call_limit(agent)
+            return agent
         return SimpleAgent(
             name=self.config.name,
             llm=self.llm,
             system_prompt=self.config.system_prompt,
         )
 
-    def _session_key(self, session_id: Optional[str]) -> str:
+    def _session_key(self, session_id: Optional[str], tool_profile_id: Optional[str] = None) -> str:
         mode = (os.getenv("CONVERSATION_MEMORY_MODE", "session") or "session").strip().lower()
         if mode == "global":
-            return "__default__"
-        raw = (session_id or "").strip()
-        if not raw:
-            return "__default__"
-        return raw[:64]
+            base = "__default__"
+        else:
+            raw = (session_id or "").strip()
+            if not raw:
+                base = "__default__"
+            else:
+                base = raw[:64]
+        profile = (tool_profile_id or "").strip()
+        if profile:
+            return f"{base}::{profile[:64]}"
+        return base
 
-    def _get_session_agent(self, session_id: Optional[str]) -> tuple[str, Any]:
-        key = self._session_key(session_id)
+    def _matches_session_scope(self, key: str, session_id: Optional[str]) -> bool:
+        base = self._session_key(session_id)
+        return key == base or key.startswith(base + "::")
+
+    def _get_session_agent(
+        self,
+        session_id: Optional[str],
+        *,
+        tool_profile_id: Optional[str] = None,
+        tool_registry_override: ToolRegistry | None = None,
+    ) -> tuple[str, Any]:
+        key = self._session_key(session_id, tool_profile_id)
         agent = self._session_agents.get(key)
         if agent is None:
-            agent = self._create_agent()
+            if tool_profile_id is not None:
+                selected_registry = tool_registry_override
+            else:
+                selected_registry = _TOOL_REGISTRY_UNSET
+            agent = self._create_agent(tool_registry_override=selected_registry)
             self._session_agents[key] = agent
-            logger.info("Created isolated LLM session: agent=%s session_id=%s", self.config.name, key)
+            logger.info(
+                "Created isolated LLM session: agent=%s session_id=%s tool_profile=%s",
+                self.config.name,
+                key,
+                tool_profile_id or "default",
+            )
         self._session_last_seen[key] = time.time()
         self._evict_old_sessions()
         return key, agent
@@ -168,38 +622,78 @@ class BaseWritingAgent:
         drop_agent: bool = False,
         clear_cold: bool = False,
     ) -> bool:
-        key = self._session_key(session_id)
         with self._lock:
-            agent = self._session_agents.get(key)
-            if agent is None:
-                return False
+            base_session_key = self._session_key(session_id)
+            target_keys = [
+                key
+                for key in self._session_agents.keys()
+                if self._matches_session_scope(key, session_id)
+            ]
 
             cleared = False
-            if hasattr(agent, "clear_history"):
-                try:
-                    agent.clear_history()
+            cold_deleted_rows = 0
+            for key in target_keys:
+                agent = self._session_agents.get(key)
+                if agent is None:
+                    continue
+                if hasattr(agent, "clear_history"):
+                    try:
+                        agent.clear_history()
+                        cleared = True
+                    except Exception:
+                        pass
+
+                if clear_cold:
+                    if hasattr(agent, "_cold_memory"):
+                        try:
+                            setattr(agent, "_cold_memory", [])
+                            cleared = True
+                        except Exception:
+                            pass
+                    # Always clear SQLite rows for this concrete key.
+                    deleted_before = cold_deleted_rows
+                    cold_deleted_rows += _delete_cold_memory_scope(
+                        agent_name=getattr(agent, "name", self.config.name),
+                        session_base=key,
+                    )
+                    if cold_deleted_rows > deleted_before:
+                        cleared = True
+
+                if drop_agent and key != "__default__":
+                    self._session_agents.pop(key, None)
+                    self._session_last_seen.pop(key, None)
                     cleared = True
-                except Exception:
-                    pass
+                    logger.info("Dropped LLM session: agent=%s session_id=%s", self.config.name, key)
 
-            if clear_cold and hasattr(agent, "_cold_memory"):
-                try:
-                    setattr(agent, "_cold_memory", [])
-                    _delete_cold_memory_rows(agent_name=getattr(agent, "name", "unknown"), session_id=key)
+            # Even if no in-memory session exists, still clear cold-memory rows for this session scope.
+            if clear_cold:
+                deleted_before = cold_deleted_rows
+                cold_deleted_rows += _delete_cold_memory_scope(
+                    agent_name=self.config.name,
+                    session_base=base_session_key,
+                )
+                if cold_deleted_rows > deleted_before:
                     cleared = True
-                except Exception:
-                    pass
 
-            if drop_agent and key != "__default__":
-                self._session_agents.pop(key, None)
-                self._session_last_seen.pop(key, None)
-                cleared = True
-                logger.info("Dropped LLM session: agent=%s session_id=%s", self.config.name, key)
+            if not target_keys and not cleared:
+                return False
 
+            if clear_cold:
+                logger.info(
+                    "Cleared session memory: agent=%s base_session=%s keys=%s cold_rows=%s drop_agent=%s",
+                    self.config.name,
+                    base_session_key,
+                    len(target_keys),
+                    cold_deleted_rows,
+                    drop_agent,
+                )
             return cleared
 
     def run(self, input_text: str, **kwargs: Any) -> str:
         session_id = kwargs.pop("session_id", None)
+        tool_profile_id = kwargs.pop("tool_profile_id", None)
+        tool_registry_override = kwargs.pop("tool_registry_override", None)
+        conversation_memory_enabled_arg = kwargs.pop("conversation_memory_enabled", None)
         max_input_chars = kwargs.pop("max_input_chars", None)
         max_context_tokens = kwargs.pop("max_context_tokens", None)
         input_safety_margin = kwargs.pop("input_safety_margin", None)
@@ -212,9 +706,23 @@ class BaseWritingAgent:
             tool_calling_temporarily_disabled = False
             original_tool_calling = None
             with self._lock:
-                session_key, agent = self._get_session_agent(session_id)
+                session_key, agent = self._get_session_agent(
+                    session_id,
+                    tool_profile_id=tool_profile_id,
+                    tool_registry_override=tool_registry_override,
+                )
                 setattr(agent, "_session_id", session_key)
-                prepared_input = _augment_with_cold_recall(agent, input_text)
+                memory_enabled, memory_source = _resolve_conversation_memory_enabled(
+                    conversation_memory_enabled_arg
+                )
+                if not memory_enabled and hasattr(agent, "clear_history"):
+                    try:
+                        agent.clear_history()
+                    except Exception:
+                        pass
+                prepared_input = input_text
+                if memory_enabled:
+                    prepared_input = _augment_with_cold_recall(agent, prepared_input)
                 prepared_input = _truncate_input(
                     prepared_input,
                     max_chars=max_input_chars,
@@ -222,15 +730,23 @@ class BaseWritingAgent:
                     max_output_tokens=kwargs.get("max_tokens"),
                     safety_margin=input_safety_margin,
                 )
-                _maybe_compress_history(agent, self.llm)
-                _prune_agent_history(
-                    agent,
-                    upcoming_user_chars=len(prepared_input),
-                    max_context_tokens=max_context_tokens,
-                    max_output_tokens=kwargs.get("max_tokens"),
-                    safety_margin=input_safety_margin,
-                )
-                _hard_cap_agent_history(agent)
+                if memory_enabled:
+                    _maybe_compress_history(agent, self.llm)
+                    _prune_agent_history(
+                        agent,
+                        upcoming_user_chars=len(prepared_input),
+                        max_context_tokens=max_context_tokens,
+                        max_output_tokens=kwargs.get("max_tokens"),
+                        safety_margin=input_safety_margin,
+                    )
+                    _hard_cap_agent_history(agent)
+                else:
+                    logger.info(
+                        "Conversation memory disabled for this call: agent=%s session_id=%s source=%s",
+                        self.config.name,
+                        session_key,
+                        memory_source,
+                    )
                 if hasattr(agent, "enable_tool_calling"):
                     original_tool_calling = getattr(agent, "enable_tool_calling", None)
                 tool_calling_temporarily_disabled = _maybe_disable_tool_prompt(
@@ -240,7 +756,13 @@ class BaseWritingAgent:
             try:
                 try:
                     with self._lock:
-                        response = agent.run(prepared_input, **kwargs)
+                        run_kwargs = dict(kwargs)
+                        if hasattr(agent, "enable_tool_calling"):
+                            run_kwargs.setdefault(
+                                "max_tool_iterations",
+                                max(1, _parse_int_env("LLM_MAX_TOOL_ITERATIONS", default=2)),
+                            )
+                        response = agent.run(prepared_input, **run_kwargs)
                 finally:
                     if (
                         tool_calling_temporarily_disabled
@@ -300,6 +822,9 @@ class BaseWritingAgent:
 
     def stream(self, input_text: str, **kwargs: Any) -> Iterator[str]:
         session_id = kwargs.pop("session_id", None)
+        tool_profile_id = kwargs.pop("tool_profile_id", None)
+        tool_registry_override = kwargs.pop("tool_registry_override", None)
+        conversation_memory_enabled_arg = kwargs.pop("conversation_memory_enabled", None)
         max_input_chars = kwargs.pop("max_input_chars", None)
         max_context_tokens = kwargs.pop("max_context_tokens", None)
         input_safety_margin = kwargs.pop("input_safety_margin", None)
@@ -313,9 +838,23 @@ class BaseWritingAgent:
             tool_calling_temporarily_disabled = False
             original_tool_calling = None
             with self._lock:
-                session_key, agent = self._get_session_agent(session_id)
+                session_key, agent = self._get_session_agent(
+                    session_id,
+                    tool_profile_id=tool_profile_id,
+                    tool_registry_override=tool_registry_override,
+                )
                 setattr(agent, "_session_id", session_key)
-                prepared_input = _augment_with_cold_recall(agent, input_text)
+                memory_enabled, memory_source = _resolve_conversation_memory_enabled(
+                    conversation_memory_enabled_arg
+                )
+                if not memory_enabled and hasattr(agent, "clear_history"):
+                    try:
+                        agent.clear_history()
+                    except Exception:
+                        pass
+                prepared_input = input_text
+                if memory_enabled:
+                    prepared_input = _augment_with_cold_recall(agent, prepared_input)
                 prepared_input = _truncate_input(
                     prepared_input,
                     max_chars=max_input_chars,
@@ -323,15 +862,23 @@ class BaseWritingAgent:
                     max_output_tokens=kwargs.get("max_tokens"),
                     safety_margin=input_safety_margin,
                 )
-                _maybe_compress_history(agent, self.llm)
-                _prune_agent_history(
-                    agent,
-                    upcoming_user_chars=len(prepared_input),
-                    max_context_tokens=max_context_tokens,
-                    max_output_tokens=kwargs.get("max_tokens"),
-                    safety_margin=input_safety_margin,
-                )
-                _hard_cap_agent_history(agent)
+                if memory_enabled:
+                    _maybe_compress_history(agent, self.llm)
+                    _prune_agent_history(
+                        agent,
+                        upcoming_user_chars=len(prepared_input),
+                        max_context_tokens=max_context_tokens,
+                        max_output_tokens=kwargs.get("max_tokens"),
+                        safety_margin=input_safety_margin,
+                    )
+                    _hard_cap_agent_history(agent)
+                else:
+                    logger.info(
+                        "Conversation memory disabled for this stream: agent=%s session_id=%s source=%s",
+                        self.config.name,
+                        session_key,
+                        memory_source,
+                    )
                 if hasattr(agent, "enable_tool_calling"):
                     original_tool_calling = getattr(agent, "enable_tool_calling", None)
                 tool_calling_temporarily_disabled = _maybe_disable_tool_prompt(
@@ -343,7 +890,13 @@ class BaseWritingAgent:
                     # Hold the lock during the whole stream so concurrent requests don't
                     # interleave and corrupt the shared conversation history.
                     with self._lock:
-                        for chunk in agent.stream_run(prepared_input, **kwargs):
+                        stream_kwargs = dict(kwargs)
+                        if hasattr(agent, "enable_tool_calling"):
+                            stream_kwargs.setdefault(
+                                "max_tool_iterations",
+                                max(1, _parse_int_env("LLM_MAX_TOOL_ITERATIONS", default=2)),
+                            )
+                        for chunk in agent.stream_run(prepared_input, **stream_kwargs):
                             if not chunk:
                                 continue
                             emitted = True
@@ -436,11 +989,14 @@ def _is_context_overflow_error(exc: Exception) -> bool:
     message = str(exc).lower()
     # Common providers return an error like:
     # "max_total_tokens (...) must be less than or equal to max_seq_len (...)"
+    # SiliconFlow: "number of input tokens (N) have exceeded max_prompt_tokens (M) limit."
     return (
         ("max_total_tokens" in message and "max_seq_len" in message)
+        or ("input tokens" in message and "max_prompt_tokens" in message)
         or "context length" in message
         or "maximum context" in message
         or "prompt is too long" in message
+        or ("exceeded" in message and "token" in message and "limit" in message)
     )
 
 
@@ -1267,6 +1823,31 @@ def _delete_cold_memory_rows(*, agent_name: str, session_id: str) -> None:
         conn.close()
     except Exception as exc:
         logger.warning("Failed to clear cold memory rows: %s", exc)
+
+
+def _delete_cold_memory_scope(*, agent_name: str, session_base: str) -> int:
+    """Delete cold-memory rows for a base session and all its tool-profile variants."""
+    db_path = os.getenv("LLM_COLD_STORE_PATH") or os.getenv("STORAGE_PATH") or ""
+    if not db_path:
+        return 0
+    try:
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            DELETE FROM cold_memory
+            WHERE agent_name = ?
+              AND (session_id = ? OR session_id LIKE ?)
+            """,
+            (agent_name, session_base, f"{session_base}::%"),
+        )
+        deleted = int(cur.rowcount or 0)
+        conn.commit()
+        conn.close()
+        return deleted
+    except Exception as exc:
+        logger.warning("Failed to clear cold memory scope: %s", exc)
+        return 0
 
 
 def _augment_with_cold_recall(agent: Any, input_text: str) -> str:

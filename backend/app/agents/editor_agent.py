@@ -13,6 +13,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "Do NOT output review comments, critique, analysis, checklists, or meta explanations. "
     "Preserve factual meaning and avoid adding unsupported facts. "
     "Keep the same language as the draft unless explicitly requested otherwise. "
+    "When GUIDANCE is provided, it is mandatory and must be reflected in the rewritten text. "
     "If factual grounding is needed and tools are available, call tools first."
 )
 
@@ -55,6 +56,8 @@ class EditorAgent(BaseWritingAgent):
         max_tokens: Optional[int] = None,
         max_input_chars: Optional[int] = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ) -> str:
         # 截断过长的内容以避免超过模型限制
         max_draft_chars = 20000  # 约 8000 tokens
@@ -77,6 +80,8 @@ class EditorAgent(BaseWritingAgent):
             max_tokens=max_tokens,
             max_input_chars=max_input_chars,
             session_id=session_id,
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
         )
 
         # If model accidentally returns review/feedback text, force a repair pass.
@@ -93,6 +98,8 @@ class EditorAgent(BaseWritingAgent):
                 max_tokens=max_tokens,
                 max_input_chars=max_input_chars,
                 session_id=session_id,
+                tool_profile_id=tool_profile_id,
+                tool_registry_override=tool_registry_override,
             )
 
         return _clean_rewrite_output(rewritten)
@@ -107,6 +114,8 @@ class EditorAgent(BaseWritingAgent):
         max_tokens: Optional[int] = None,
         max_input_chars: Optional[int] = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ):
         # 截断过长的内容以避免超过模型限制
         max_draft_chars = 20000  # 约 8000 tokens
@@ -118,19 +127,24 @@ class EditorAgent(BaseWritingAgent):
         if len(guidance) > max_guidance_chars:
             guidance = guidance[:max_guidance_chars] + "\n...(指导意见过长已截断)"
 
-        # Reuse the exact same quality gate as non-stream path, then chunk-yield.
-        rewritten = self.rewrite(
+        # 真流式：直接走 BaseWritingAgent.stream，避免先 run 后分块导致前端长时间无增量。
+        prompt = self._build_rewrite_prompt(
             draft=draft,
             guidance=guidance,
             style=style,
             target_length=target_length,
+        )
+        for chunk in self.stream(
+            prompt,
             max_tokens=max_tokens,
             max_input_chars=max_input_chars,
             session_id=session_id,
-        )
-        chunk_size = 480
-        for start in range(0, len(rewritten), chunk_size):
-            yield rewritten[start : start + chunk_size]
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
+        ):
+            if not chunk:
+                continue
+            yield chunk
 
     def _build_rewrite_prompt(
         self,
@@ -148,6 +162,8 @@ class EditorAgent(BaseWritingAgent):
             "3. Keep factual content grounded in draft and guidance; do not invent facts.\n"
             "4. Keep the original language.\n"
             "5. Keep structure when possible, but optimize readability and coherence.\n"
+            "6. If [GUIDANCE] exists, you MUST apply its actionable points in the rewritten text.\n"
+            "7. Do not ignore [GUIDANCE] due to wording preference in [DRAFT].\n"
         )
         parts = [instruction, f"[DRAFT]\n{draft}\n[/DRAFT]"]
         if guidance:

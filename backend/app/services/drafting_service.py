@@ -4,7 +4,10 @@ from dataclasses import dataclass
 import os
 import re
 
+from hello_agents.tools import ToolRegistry
+
 from ..agents.writing_agent import WritingAgent
+from .generation_mode import citation_labels_enabled, get_generation_mode
 from .evidence_service import EvidenceExtractor
 from .reviewing_service import ReviewingService
 from .rewriting_service import RewritingService
@@ -47,6 +50,8 @@ class DraftingService:
         max_tokens: int | None = None,
         max_input_chars: int | None = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ) -> str:
         target_len = _parse_target_length(target_length)
         prompt_constraints = self.build_constraints(
@@ -67,6 +72,8 @@ class DraftingService:
                 max_tokens=max_tokens,
                 max_input_chars=max_input_chars,
                 session_id=session_id,
+                tool_profile_id=tool_profile_id,
+                tool_registry_override=tool_registry_override,
             )
 
         return self.writing_agent.draft(
@@ -78,6 +85,8 @@ class DraftingService:
             max_tokens=max_tokens,
             max_input_chars=max_input_chars,
             session_id=session_id,
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
         )
 
     def review_draft(
@@ -90,6 +99,8 @@ class DraftingService:
         max_tokens: int | None = None,
         max_input_chars: int | None = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ) -> str:
         if not self.reviewing_service:
             return ""
@@ -101,6 +112,8 @@ class DraftingService:
             max_tokens=max_tokens,
             max_input_chars=max_input_chars,
             session_id=session_id,
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
         ).review
 
     def revise_draft(
@@ -114,6 +127,8 @@ class DraftingService:
         max_tokens: int | None = None,
         max_input_chars: int | None = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ) -> str:
         if not self.rewriting_service:
             return draft
@@ -128,6 +143,8 @@ class DraftingService:
             max_tokens=max_tokens,
             max_input_chars=max_input_chars,
             session_id=session_id,
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
         ).revised
 
     def run_full(
@@ -150,6 +167,12 @@ class DraftingService:
         review_max_input_chars: int | None = None,
         rewrite_max_input_chars: int | None = None,
         session_id: str = "",
+        draft_tool_profile_id: str | None = None,
+        draft_tool_registry_override: ToolRegistry | None = None,
+        review_tool_profile_id: str | None = None,
+        review_tool_registry_override: ToolRegistry | None = None,
+        rewrite_tool_profile_id: str | None = None,
+        rewrite_tool_registry_override: ToolRegistry | None = None,
     ) -> DraftResult:
         _ = plan_max_tokens
         _ = plan_max_input_chars
@@ -165,6 +188,8 @@ class DraftingService:
             max_tokens=draft_max_tokens,
             max_input_chars=draft_max_input_chars,
             session_id=session_id,
+            tool_profile_id=draft_tool_profile_id,
+            tool_registry_override=draft_tool_registry_override,
         )
         review = self.review_draft(
             draft=draft,
@@ -174,16 +199,21 @@ class DraftingService:
             max_tokens=review_max_tokens,
             max_input_chars=review_max_input_chars,
             session_id=session_id,
+            tool_profile_id=review_tool_profile_id,
+            tool_registry_override=review_tool_registry_override,
         )
+        rewrite_guidance = _merge_guidance(review, review_criteria)
         revised = self.revise_draft(
             draft=draft,
-            guidance=review,
+            guidance=rewrite_guidance,
             style=style,
             target_length=target_length,
             evidence_text=evidence_text,
             max_tokens=rewrite_max_tokens,
             max_input_chars=rewrite_max_input_chars,
             session_id=session_id,
+            tool_profile_id=rewrite_tool_profile_id,
+            tool_registry_override=rewrite_tool_registry_override,
         )
         return DraftResult(
             outline=outline,
@@ -232,7 +262,7 @@ def _parse_target_length(value: str) -> int | None:
 
 
 def _citations_enabled() -> bool:
-    return os.getenv("RAG_CITATION_ENFORCE", "false").lower() in ("1", "true", "yes")
+    return citation_labels_enabled(get_generation_mode())
 
 
 def _sanitize_research_notes_for_prompt(notes: str, *, query: str = "") -> str:
@@ -314,3 +344,18 @@ def _note_relevance_score(note_text: str, query_tokens: set[str]) -> float:
         return 0.0
     overlap = len(tokens & query_tokens)
     return overlap / max(1, len(query_tokens))
+
+
+def _merge_guidance(*parts: str) -> str:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        value = (part or "").strip()
+        if not value:
+            continue
+        key = " ".join(value.split())
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(value)
+    return "\n\n".join(merged)

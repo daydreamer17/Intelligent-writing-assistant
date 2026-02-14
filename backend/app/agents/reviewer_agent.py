@@ -54,6 +54,8 @@ class ReviewerAgent(BaseWritingAgent):
         max_tokens: Optional[int] = None,
         max_input_chars: Optional[int] = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ) -> str:
         # 截断过长的内容以避免超过模型限制
         max_draft_chars = 15000  # 约 6000 tokens
@@ -83,6 +85,8 @@ class ReviewerAgent(BaseWritingAgent):
             session_id=session_id,
             max_tokens=max_tokens,
             max_input_chars=max_input_chars,
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
         )
 
     def review_stream(
@@ -95,6 +99,8 @@ class ReviewerAgent(BaseWritingAgent):
         max_tokens: Optional[int] = None,
         max_input_chars: Optional[int] = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ):
         # 截断过长的内容以避免超过模型限制
         max_draft_chars = 15000  # 约 6000 tokens
@@ -124,4 +130,6 @@ class ReviewerAgent(BaseWritingAgent):
             max_tokens=max_tokens,
             max_input_chars=max_input_chars,
             session_id=session_id,
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
         )

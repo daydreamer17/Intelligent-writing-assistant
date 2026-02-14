@@ -55,6 +55,8 @@ class WritingAgent(BaseWritingAgent):
         max_tokens: Optional[int] = None,
         max_input_chars: Optional[int] = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ) -> str:
         parts = [
             f"Topic:\n{topic}",
@@ -76,6 +78,8 @@ class WritingAgent(BaseWritingAgent):
             session_id=session_id,
             max_tokens=max_tokens,
             max_input_chars=max_input_chars,
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
         )
 
     def draft_stream(
@@ -89,6 +93,8 @@ class WritingAgent(BaseWritingAgent):
         max_tokens: Optional[int] = None,
         max_input_chars: Optional[int] = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ):
         # 截断过长的 outline 以避免超过模型限制
         max_outline_chars = 10000  # 约 4000 tokens
@@ -115,6 +121,8 @@ class WritingAgent(BaseWritingAgent):
                 session_id=session_id,
                 max_tokens=max_tokens,
                 max_input_chars=max_input_chars,
+                tool_profile_id=tool_profile_id,
+                tool_registry_override=tool_registry_override,
             )
             return
 
@@ -157,6 +165,8 @@ class WritingAgent(BaseWritingAgent):
                 max_tokens=section_max_tokens,
                 max_input_chars=max_input_chars,
                 session_id=session_id,
+                tool_profile_id=tool_profile_id,
+                tool_registry_override=tool_registry_override,
             ):
                 section_chunks.append(chunk)
                 yield chunk
@@ -206,6 +216,8 @@ class WritingAgent(BaseWritingAgent):
         max_tokens: Optional[int] = None,
         max_input_chars: Optional[int] = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ) -> str:
         sections = self._split_outline(outline)
         if len(sections) <= 1:
@@ -218,6 +230,8 @@ class WritingAgent(BaseWritingAgent):
                 max_tokens=max_tokens,
                 max_input_chars=max_input_chars,
                 session_id=session_id,
+                tool_profile_id=tool_profile_id,
+                tool_registry_override=tool_registry_override,
             )
 
         target_len = self._parse_target_length(target_length) or 0
@@ -258,6 +272,8 @@ class WritingAgent(BaseWritingAgent):
                 max_tokens=section_max_tokens,
                 max_input_chars=max_input_chars,
                 session_id=session_id,
+                tool_profile_id=tool_profile_id,
+                tool_registry_override=tool_registry_override,
             )
             outputs.append(section_text.strip())
             context_tail = "\n\n".join(outputs)

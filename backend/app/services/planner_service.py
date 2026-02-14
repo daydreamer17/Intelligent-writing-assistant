@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from hello_agents.tools import ToolRegistry
+
 from ..agents.writing_agent import WritingAgent
 
 
@@ -29,6 +31,8 @@ class PlanningService:
         max_tokens: int | None = None,
         max_input_chars: int | None = None,
         session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ) -> OutlinePlan:
         prompt = self._build_prompt(
             topic=topic,
@@ -43,6 +47,8 @@ class PlanningService:
             session_id=session_id,
             max_tokens=max_tokens,
             max_input_chars=max_input_chars,
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
         )
         outline, assumptions, questions = self._split_sections(response)
         return OutlinePlan(outline=outline, assumptions=assumptions, open_questions=questions)
@@ -60,6 +66,8 @@ class PlanningService:
         max_input_chars: int | None = None,
         session_id: str = "",
         on_chunk: Callable[[str], None] | None = None,
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
     ) -> OutlinePlan:
         prompt = self._build_prompt(
             topic=topic,
@@ -75,6 +83,8 @@ class PlanningService:
             session_id=session_id,
             max_tokens=max_tokens,
             max_input_chars=max_input_chars,
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
         ):
             if not chunk:
                 continue
@@ -88,6 +98,8 @@ class PlanningService:
                 session_id=session_id,
                 max_tokens=max_tokens,
                 max_input_chars=max_input_chars,
+                tool_profile_id=tool_profile_id,
+                tool_registry_override=tool_registry_override,
             )
             if on_chunk is not None and text:
                 on_chunk(text)

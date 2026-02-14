@@ -35,6 +35,7 @@ class CitationEnforcer:
         notes: Iterable[ResearchNote],
         *,
         apply_labels: bool = True,
+        strict_labels: bool = True,
         embedder: Embedder | None = None,
     ) -> Tuple[str, CoverageReport]:
         notes_list = list(notes)
@@ -81,11 +82,16 @@ class CitationEnforcer:
                 covered_tokens += len(tokens)
                 covered_paragraphs += 1
             if apply_labels and not _has_citation(stripped, labels) and labels:
-                label = labels[best_idx] if best_idx is not None else labels[0]
-                stripped = f"{stripped} {label}"
+                # strict: preserve legacy behavior (always backfill a label)
+                # non-strict: only label paragraphs with enough evidence overlap
+                if strict_labels:
+                    label = labels[best_idx] if best_idx is not None else labels[0]
+                    stripped = f"{stripped} {label}"
+                elif best_idx is not None and best_ratio >= self._threshold:
+                    stripped = f"{stripped} {labels[best_idx]}"
             enforced_paragraphs.append(stripped)
 
-        if apply_labels and _parse_bool_env("RAG_CITATION_REQUIRE_ALL_LABELS", True):
+        if apply_labels and strict_labels and _parse_bool_env("RAG_CITATION_REQUIRE_ALL_LABELS", True):
             enforced_paragraphs = self._ensure_all_labels(
                 paragraphs=enforced_paragraphs,
                 paragraph_tokens=paragraph_tokens,
