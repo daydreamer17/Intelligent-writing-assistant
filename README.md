@@ -1,6 +1,6 @@
 # 智能写作助手（Intelligent Writing Assistant）
 
-基于 Hello-Agents 的多 Agent 写作系统，提供从规划到改写的完整链路，并集成 RAG、引用约束、会话记忆与离线检索评测。
+基于 [Hello-Agents](https://github.com/jjyaoao/HelloAgents.git) 的多 Agent 写作系统，提供从规划到改写的完整链路，并集成 RAG、引用约束、会话记忆与离线检索评测。
 
 ## 1. 关键能力
 
