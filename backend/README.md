@@ -12,6 +12,8 @@
   - `rag_only`：严格证据约束、可拒答
   - `hybrid`：有证据段落加 `[n]`，无证据段落加 `[推断]`
   - `creative`：不强制引用，支持运行时开关 MCP
+- 拒答判定增强：拒答查询默认精简（不直接拼接超长大纲/草稿），并按 original/bilingual/HyDE 变体最优分数判定
+- 覆盖率明细增强：区分语义段落覆盖率与词面段落覆盖率
 - 记忆机制：会话隔离（`session_id`）、上下文压缩、冷存写入与冷存召回；支持任务前自动重置
 - 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化
 - MCP：可选 GitHub MCP 显式工具调用
@@ -90,6 +92,9 @@ RAG_CREATIVE_MEMORY_ENABLED=false   # creative 模式是否启用会话记忆
 RAG_HYBRID_INFERENCE_TAG=[推断]
 RAG_HYBRID_MIN_PARAGRAPH_CHARS=12
 RAG_REFUSAL_ENABLED=true
+RAG_REFUSAL_QUERY_MAX_CHARS=480
+RAG_REFUSAL_INCLUDE_OUTLINE=false
+RAG_REFUSAL_INCLUDE_DRAFT=false
 ```
 
 ### GitHub MCP（可选）
@@ -176,5 +181,7 @@ LLM_TOOL_POLICY_DISABLE_WHEN_RAG_STRONG=true
 - 会话重置会同时清理内存历史与 SQLite 冷存（按会话作用域，包含 `session_id::tool_profile` 变体）。
 - `hybrid` 模式下，Qdrant 不可用会自动降级到 SQLite 检索。
 - `hybrid` 模式会优先注入可匹配的 `[n]`，仅对无证据段落补 `[推断]`。
+- 覆盖率展示建议优先看语义段落覆盖率；词面段落覆盖率在中英混合语料下可能偏低。
+- 拒答日志会显示 `base:<variant>` / `fallback@k:<variant>`，用于定位本轮命中的查询变体。
 - 流式链路依赖 SSE，代理层需允许 `text/event-stream`。
 - 离线评测结果持久化在 SQLite 表 `retrieval_eval_runs`。

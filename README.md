@@ -14,6 +14,7 @@
   - `Hybrid`：优先打 `[n]` 引用；无证据段落自动标注 `[推断]`
   - `Creative`：自由生成，不强制引用；支持前端开关控制是否启用 MCP
 - 拒答保护：检索质量不足时拒答，避免低可信幻觉输出
+- 拒答判定增强：拒答查询默认精简（不再直接拼接超长大纲/草稿），并对 original/bilingual/HyDE 变体取最优评分后再判定
 - 记忆机制：会话隔离（`session_id`）、历史压缩、冷存写入与冷存召回回注；支持任务前自动重置会话记忆（含冷存）
 - 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化
 - 外部知识接入：GitHub MCP（可选）及显式工具 API
@@ -115,6 +116,9 @@ RAG_CREATIVE_MEMORY_ENABLED=false   # creative 模式是否启用会话记忆
 RAG_HYBRID_INFERENCE_TAG=[推断]
 RAG_HYBRID_MIN_PARAGRAPH_CHARS=12
 RAG_REFUSAL_ENABLED=true
+RAG_REFUSAL_QUERY_MAX_CHARS=480
+RAG_REFUSAL_INCLUDE_OUTLINE=false
+RAG_REFUSAL_INCLUDE_DRAFT=false
 ```
 
 ### GitHub MCP（可选）
@@ -150,6 +154,15 @@ LLM_TOOL_POLICY_DISABLE_WHEN_RAG_STRONG=true
 - `http://localhost:8000/redoc`
 
 ## 7. 更新日志
+
+### v0.5.3 (2026-02-21)
+**🛡️ 拒答判定与覆盖率展示修正**
+
+- ✨ 新增拒答查询精简策略：默认不拼接超长 outline/draft，降低 query_terms 膨胀导致的误拒答
+- ✨ 新增拒答多变体评估：基于 original + bilingual rewrite + HyDE 变体取最优相关性再判定
+- ✨ 新增配置项：`RAG_REFUSAL_QUERY_MAX_CHARS`、`RAG_REFUSAL_INCLUDE_OUTLINE`、`RAG_REFUSAL_INCLUDE_DRAFT`
+- 🔧 覆盖率明细新增语义段落计数（`semantic_covered_paragraphs/semantic_total_paragraphs`）
+- 🔧 前端指标展示拆分为“语义段落覆盖率（主）+ 词面段落覆盖率（辅）”，避免“总覆盖高但段落0%”的解释歧义
 
 ### v0.5.2 (2026-02-14)
 **🧩 Creative 模式可控与会话重置增强**
