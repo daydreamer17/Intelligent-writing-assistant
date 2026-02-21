@@ -105,6 +105,8 @@ class CoverageDetail(BaseModel):
     total_tokens: int = 0
     covered_paragraphs: int = 0
     total_paragraphs: int = 0
+    semantic_covered_paragraphs: int = 0
+    semantic_total_paragraphs: int = 0
 
 
 class PipelineResponse(BaseModel):

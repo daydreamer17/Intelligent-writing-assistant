@@ -30,7 +30,7 @@ from ...services.generation_mode import (
 from ...services.github_context import maybe_fetch_github_context
 from ...services.inference_marker import mark_inference_paragraphs
 from ...services.pipeline_service import PipelineResult
-from ...services.research_service import ResearchNote, SourceDocument
+from ...services.research_service import RelevanceReport, ResearchNote, SourceDocument
 from ...services.tool_policy import ToolDecision, build_stage_tool_registry, decide_tools
 from ..deps import AppServices, get_services
 
@@ -73,6 +73,8 @@ def _coverage_detail(report: CoverageReport | None) -> CoverageDetail | None:
         covered_paragraphs=report.covered_paragraphs,
         total_paragraphs=report.total_paragraphs,
         semantic_coverage=report.semantic_coverage or 0.0,
+        semantic_covered_paragraphs=report.semantic_covered_paragraphs,
+        semantic_total_paragraphs=report.semantic_total_paragraphs,
     )
 
 
@@ -111,6 +113,13 @@ def _parse_optional_int(name: str) -> int | None:
     return value if value > 0 else None
 
 
+def _parse_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes")
+
+
 def _pipeline_max_tokens(stage: str) -> int | None:
     stage = stage.upper()
     return _parse_optional_int(f"PIPELINE_{stage}_MAX_TOKENS") or _parse_optional_int(
@@ -123,6 +132,49 @@ def _pipeline_max_input_chars(stage: str) -> int | None:
     return _parse_optional_int(f"PIPELINE_{stage}_MAX_INPUT_CHARS") or _parse_optional_int(
         f"STAGE_{stage}_MAX_INPUT_CHARS"
     )
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
+
+
+def _build_refusal_query(
+    *,
+    topic: str,
+    key_points: str = "",
+    constraints: str = "",
+    audience: str = "",
+    style: str = "",
+    outline: str = "",
+) -> str:
+    # Keep refusal query concise to avoid denominator explosion in recall metrics.
+    # Only include topical fields (topic + key_points).  Constraints, audience and
+    # style are generation *instructions*, not topic descriptors — including them
+    # inflates the query term set with non-topical Chinese tokens that will never
+    # overlap with English-language documents, causing spurious refusals.
+    max_chars = max(120, _parse_int("RAG_REFUSAL_QUERY_MAX_CHARS", 480))
+    include_outline = _parse_bool("RAG_REFUSAL_INCLUDE_OUTLINE", False)
+    parts = [topic.strip(), key_points.strip()]
+    if include_outline and outline:
+        parts.append(outline.strip())
+    compact_parts: list[str] = []
+    seen = set()
+    for part in parts:
+        if not part:
+            continue
+        norm = " ".join(part.split())
+        if not norm:
+            continue
+        key = norm.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        compact_parts.append(norm)
+    if not compact_parts:
+        return _truncate_text(topic.strip(), max_chars)
+    return _truncate_text(" | ".join(compact_parts), max_chars)
 
 
 def _refusal_enabled() -> bool:
@@ -216,25 +268,74 @@ def _refusal_check_with_fallback(
     sources: list[SourceDocument],
     services: AppServices,
 ) -> tuple[bool, list[SourceDocument]]:
-    report = services.pipeline.researcher.relevance_report(query, sources)
+    report, report_query = _best_refusal_report(query=query, sources=sources, services=services)
     refused = _base_should_refuse(report)
-    _log_refusal(report, refused=refused, context="base")
+    _log_refusal(report, refused=refused, context=f"base:{report_query}")
     if not refused or _refusal_mode() == "strict":
         return refused, sources
 
     fallback_top_k = max(5, _parse_int("RAG_REFUSAL_FALLBACK_TOP_K", 12))
     fallback_docs = services.rag.search(query, top_k=fallback_top_k)
     merged = _merge_sources(sources, fallback_docs)
-    fallback_report = services.pipeline.researcher.relevance_report(query, merged)
+    fallback_report, fallback_query = _best_refusal_report(query=query, sources=merged, services=services)
     fallback_refused = _fallback_should_refuse(fallback_report)
     _log_refusal(
         fallback_report,
         refused=fallback_refused,
-        context=f"fallback@{fallback_top_k}",
+        context=f"fallback@{fallback_top_k}:{fallback_query}",
     )
     if not fallback_refused:
         return False, merged
     return True, sources
+
+
+def _best_refusal_report(
+    *,
+    query: str,
+    sources: list[SourceDocument],
+    services: AppServices,
+) -> tuple[RelevanceReport, str]:
+    candidates: list[tuple[str, str]] = [("original", query)]
+    try:
+        for variant in services.rag.query_variants(query):
+            label = getattr(variant, "source", "variant")
+            text = (getattr(variant, "text", "") or "").strip()
+            if text:
+                candidates.append((str(label), text))
+    except Exception as _exc:
+        # Refusal check should stay resilient even if expansion fails.
+        logger.warning("RAG refusal query expansion failed (using original query only): %s", _exc)
+
+    deduped: list[tuple[str, str]] = []
+    seen = set()
+    for label, text in candidates:
+        key = " ".join(text.lower().split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append((label, text))
+
+    best_report = services.pipeline.researcher.relevance_report(query, sources)
+    best_label = "original"
+    best_key = (
+        best_report.best_recall,
+        best_report.avg_recall,
+        best_report.lexical_best,
+        best_report.tfidf_best,
+    )
+    for label, text in deduped:
+        report = services.pipeline.researcher.relevance_report(text, sources)
+        key = (
+            report.best_recall,
+            report.avg_recall,
+            report.lexical_best,
+            report.tfidf_best,
+        )
+        if key > best_key:
+            best_report = report
+            best_key = key
+            best_label = label
+    return best_report, best_label
 
 
 def _github_note(context: str) -> ResearchNote:
@@ -541,7 +642,14 @@ def run_pipeline(
             rewrite_tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
             rewrite_tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
         )
-        refusal_query = f"{payload.topic}\n{result.outline.outline}"
+        refusal_query = _build_refusal_query(
+            topic=payload.topic,
+            key_points=payload.key_points,
+            constraints=payload.constraints,
+            audience=payload.audience,
+            style=payload.style,
+            outline=result.outline.outline,
+        )
         effective_sources = list(sources)
         if _refusal_enabled():
             refused, effective_sources = _refusal_check_with_fallback(
@@ -824,7 +932,14 @@ def run_pipeline_stream(
                 }
             )
 
-            refusal_query = f"{payload.topic}\n{outline.outline}"
+            refusal_query = _build_refusal_query(
+                topic=payload.topic,
+                key_points=payload.key_points,
+                constraints=payload.constraints,
+                audience=payload.audience,
+                style=payload.style,
+                outline=outline.outline,
+            )
             effective_sources = list(sources)
             if _refusal_enabled() and effective_sources:
                 refused, effective_sources = _refusal_check_with_fallback(

@@ -114,6 +114,10 @@ class RAGService:
         ranked = self._rank_documents_multi(query_variants, self._documents, top_k=candidate_k)
         return self._rerank_if_needed(query, ranked, top_k=final_top_k)
 
+    def query_variants(self, query: str) -> List[QueryVariant]:
+        """Return the active retrieval query variants for diagnostics/policy checks."""
+        return self._expand_queries(query)
+
     def get_embedder(self):
         if self._vector_store and hasattr(self._vector_store, "embedder"):
             return getattr(self._vector_store, "embedder")

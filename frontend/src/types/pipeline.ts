@@ -15,6 +15,8 @@ export interface CoverageDetail {
   total_tokens: number;
   covered_paragraphs: number;
   total_paragraphs: number;
+  semantic_covered_paragraphs?: number;
+  semantic_total_paragraphs?: number;
 }
 
 export interface CitationItemResponse {

@@ -109,6 +109,13 @@ def _parse_optional_int(name: str) -> int | None:
     return value if value > 0 else None
 
 
+def _parse_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes")
+
+
 def _step_max_tokens(stage: str) -> int | None:
     stage = stage.upper()
     return _parse_optional_int(f"STEP_{stage}_MAX_TOKENS") or _parse_optional_int(
@@ -121,6 +128,49 @@ def _step_max_input_chars(stage: str) -> int | None:
     return _parse_optional_int(f"STEP_{stage}_MAX_INPUT_CHARS") or _parse_optional_int(
         f"STAGE_{stage}_MAX_INPUT_CHARS"
     )
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
+
+
+def _build_refusal_query(
+    *,
+    topic: str,
+    outline: str = "",
+    constraints: str = "",
+    key_points: str = "",
+    audience: str = "",
+    style: str = "",
+    draft: str = "",
+) -> str:
+    max_chars = max(120, _parse_int("RAG_REFUSAL_QUERY_MAX_CHARS", 480))
+    include_outline = _parse_bool("RAG_REFUSAL_INCLUDE_OUTLINE", False)
+    include_draft = _parse_bool("RAG_REFUSAL_INCLUDE_DRAFT", False)
+    parts = [topic.strip(), key_points.strip(), constraints.strip(), audience.strip(), style.strip()]
+    if include_outline and outline:
+        parts.append(outline.strip())
+    if include_draft and draft:
+        parts.append(draft.strip())
+    compact_parts: list[str] = []
+    seen = set()
+    for part in parts:
+        if not part:
+            continue
+        norm = " ".join(part.split())
+        if not norm:
+            continue
+        key = norm.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        compact_parts.append(norm)
+    if not compact_parts:
+        fallback = topic or outline or draft
+        return _truncate_text((fallback or "").strip(), max_chars)
+    return _truncate_text(" | ".join(compact_parts), max_chars)
 
 
 def _should_refuse(report: RelevanceReport) -> bool:
@@ -172,6 +222,8 @@ def _coverage_detail(report: CoverageReport | None) -> CoverageDetail | None:
         covered_paragraphs=report.covered_paragraphs,
         total_paragraphs=report.total_paragraphs,
         semantic_coverage=report.semantic_coverage or 0.0,
+        semantic_covered_paragraphs=report.semantic_covered_paragraphs,
+        semantic_total_paragraphs=report.semantic_total_paragraphs,
     )
 
 
@@ -230,24 +282,74 @@ def _rag_refusal_check(
 ) -> tuple[bool, list[SourceDocument]]:
     base_top_k = _citation_top_k()
     docs = services.rag.search(query, top_k=base_top_k)
-    report = _researcher.relevance_report(query, docs)
+    report, report_query = _best_refusal_report(query=query, docs=docs, services=services)
     refused = _should_refuse(report)
-    _log_refusal(report, refused=refused, context=f"writing:base@{base_top_k}")
+    _log_refusal(report, refused=refused, context=f"writing:base@{base_top_k}:{report_query}")
     if not refused or _refusal_mode() == "strict":
         return refused, docs
 
     fallback_top_k = max(base_top_k, _parse_int("RAG_REFUSAL_FALLBACK_TOP_K", base_top_k * 2))
     fallback_docs = services.rag.search(query, top_k=fallback_top_k)
-    fallback_report = _researcher.relevance_report(query, fallback_docs)
+    fallback_report, fallback_query = _best_refusal_report(
+        query=query, docs=fallback_docs, services=services
+    )
     fallback_refused = _should_refuse_fallback(fallback_report)
     _log_refusal(
         fallback_report,
         refused=fallback_refused,
-        context=f"writing:fallback@{fallback_top_k}",
+        context=f"writing:fallback@{fallback_top_k}:{fallback_query}",
     )
     if not fallback_refused:
         return False, fallback_docs
     return True, docs
+
+
+def _best_refusal_report(
+    *,
+    query: str,
+    docs: list[SourceDocument],
+    services: AppServices,
+) -> tuple[RelevanceReport, str]:
+    candidates: list[tuple[str, str]] = [("original", query)]
+    try:
+        for variant in services.rag.query_variants(query):
+            label = getattr(variant, "source", "variant")
+            text = (getattr(variant, "text", "") or "").strip()
+            if text:
+                candidates.append((str(label), text))
+    except Exception:
+        pass
+
+    deduped: list[tuple[str, str]] = []
+    seen = set()
+    for label, text in candidates:
+        key = " ".join(text.lower().split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append((label, text))
+
+    best_report = _researcher.relevance_report(query, docs)
+    best_label = "original"
+    best_key = (
+        best_report.best_recall,
+        best_report.avg_recall,
+        best_report.lexical_best,
+        best_report.tfidf_best,
+    )
+    for label, text in deduped:
+        report = _researcher.relevance_report(text, docs)
+        key = (
+            report.best_recall,
+            report.avg_recall,
+            report.lexical_best,
+            report.tfidf_best,
+        )
+        if key > best_key:
+            best_report = report
+            best_key = key
+            best_label = label
+    return best_report, best_label
 
 
 def _should_refuse_fallback(report: RelevanceReport) -> bool:
@@ -482,7 +584,12 @@ def create_draft(
             rag_enforced=_citations_enabled(),
             source_count=1 if research_notes.strip() else 0,
         )
-        refusal_query = f"{payload.topic}\n{payload.outline}"
+        refusal_query = _build_refusal_query(
+            topic=payload.topic,
+            outline=payload.outline,
+            constraints=payload.constraints,
+            style=payload.style,
+        )
         refused, docs = _rag_refusal_check(query=refusal_query, services=services)
         if refused:
             return DraftResponse(draft=_refusal_message())
@@ -557,7 +664,12 @@ def create_draft_stream(
                 len(payload.topic or ""),
                 len(payload.outline or ""),
             )
-            refusal_query = f"{payload.topic}\n{payload.outline}"
+            refusal_query = _build_refusal_query(
+                topic=payload.topic,
+                outline=payload.outline,
+                constraints=payload.constraints,
+                style=payload.style,
+            )
             refused, docs = _rag_refusal_check(query=refusal_query, services=services)
             if refused:
                 q.put({"type": "result", "payload": {"draft": _refusal_message()}})
@@ -819,7 +931,12 @@ def rewrite_draft(
             rag_enforced=_citations_enabled(),
             source_count=1 if guidance.strip() else 0,
         )
-        refusal_query = payload.draft
+        refusal_query = _build_refusal_query(
+            topic="",
+            key_points=payload.guidance,
+            style=payload.style,
+            draft=payload.draft,
+        )
         refused, docs = _rag_refusal_check(query=refusal_query, services=services)
         if refused:
             return RewriteResponse(
@@ -830,7 +947,7 @@ def rewrite_draft(
                 coverage_detail=CoverageDetail(),
                 citation_enforced=False,
             )
-        evidence_text = _build_evidence_from_rag(query=payload.draft, services=services)
+        evidence_text = _build_evidence_from_rag(query=refusal_query, services=services)
         if evidence_text:
             guidance = (guidance + "\n\nOnly use the evidence below:\n" + evidence_text).strip()
         revised = services.rewriter.rewrite(
@@ -914,7 +1031,12 @@ def rewrite_draft_stream(
                 len(payload.draft or ""),
                 len(payload.guidance or ""),
             )
-            refusal_query = payload.draft
+            refusal_query = _build_refusal_query(
+                topic="",
+                key_points=payload.guidance,
+                style=payload.style,
+                draft=payload.draft,
+            )
             refused, docs = _rag_refusal_check(query=refusal_query, services=services)
             if refused:
                 q.put(
@@ -931,7 +1053,7 @@ def rewrite_draft_stream(
                     }
                 )
                 return
-            evidence_text = _build_evidence_from_rag(query=payload.draft, services=services)
+            evidence_text = _build_evidence_from_rag(query=refusal_query, services=services)
             if evidence_text:
                 guidance_with_evidence = (guidance + "\n\nOnly use the evidence below:\n" + evidence_text).strip()
             else:

@@ -23,6 +23,8 @@ class CoverageReport:
     total_paragraphs: int
     covered_paragraphs: int
     semantic_coverage: float | None
+    semantic_covered_paragraphs: int
+    semantic_total_paragraphs: int
 
 
 class CitationEnforcer:
@@ -48,6 +50,8 @@ class CitationEnforcer:
                 total_paragraphs=0,
                 covered_paragraphs=0,
                 semantic_coverage=None,
+                semantic_covered_paragraphs=0,
+                semantic_total_paragraphs=0,
             )
         if not notes_list:
             return text, CoverageReport(
@@ -58,6 +62,8 @@ class CitationEnforcer:
                 total_paragraphs=0,
                 covered_paragraphs=0,
                 semantic_coverage=None,
+                semantic_covered_paragraphs=0,
+                semantic_total_paragraphs=0,
             )
 
         labels = [f"[{idx}]" for idx in range(1, len(notes_list) + 1)]
@@ -105,7 +111,7 @@ class CitationEnforcer:
 
         total_paragraphs = len(enforced_paragraphs)
         token_coverage = covered_tokens / total_tokens if total_tokens > 0 else 0.0
-        semantic_coverage = self._semantic_coverage(
+        semantic_coverage, semantic_covered_paragraphs, semantic_total_paragraphs = self._semantic_coverage(
             paragraphs=enforced_paragraphs,
             notes=notes_list,
             embedder=embedder,
@@ -119,9 +125,11 @@ class CitationEnforcer:
             total_paragraphs=total_paragraphs,
             covered_paragraphs=covered_paragraphs,
             semantic_coverage=semantic_coverage,
+            semantic_covered_paragraphs=semantic_covered_paragraphs,
+            semantic_total_paragraphs=semantic_total_paragraphs,
         )
         logger.info(
-            "Citation coverage: %.2f (token=%.2f semantic=%s covered_tokens=%s total_tokens=%s covered_paragraphs=%s total_paragraphs=%s)",
+            "Citation coverage: %.2f (token=%.2f semantic=%s covered_tokens=%s total_tokens=%s covered_paragraphs=%s total_paragraphs=%s semantic_covered=%s semantic_total=%s)",
             coverage,
             token_coverage,
             f"{semantic_coverage:.2f}" if semantic_coverage is not None else "n/a",
@@ -129,6 +137,8 @@ class CitationEnforcer:
             total_tokens,
             covered_paragraphs,
             total_paragraphs,
+            semantic_covered_paragraphs,
+            semantic_total_paragraphs,
         )
         output_text = "\n\n".join(enforced_paragraphs) if apply_labels else text
         return output_text, report
@@ -255,11 +265,11 @@ class CitationEnforcer:
         paragraphs: List[str],
         notes: List[ResearchNote],
         embedder: Embedder | None,
-    ) -> float | None:
+    ) -> tuple[float | None, int, int]:
         if not embedder or not _parse_bool_env("RAG_COVERAGE_SEMANTIC_ENABLED", default=False):
-            return None
+            return None, 0, 0
         if not paragraphs or not notes:
-            return 0.0
+            return 0.0, 0, len(paragraphs)
         max_paragraphs = max(1, _parse_int_env("RAG_COVERAGE_SEMANTIC_MAX_PARAGRAPHS", 20))
         max_notes = max(1, _parse_int_env("RAG_COVERAGE_SEMANTIC_MAX_NOTES", 12))
         threshold = _parse_float_env("RAG_COVERAGE_SEMANTIC_THRESHOLD", 0.25)
@@ -273,17 +283,18 @@ class CitationEnforcer:
         texts = para_slice + note_texts
         embeddings = self._embed_texts_robust(embedder=embedder, texts=texts, batch_size=batch_size)
         if embeddings is None:
-            return None
+            return None, 0, len(para_slice)
         para_vecs = embeddings[: len(para_slice)]
         note_vecs = embeddings[len(para_slice) :]
         if not note_vecs:
-            return 0.0
+            return 0.0, 0, len(para_slice)
         covered = 0
         for para_vec in para_vecs:
             best = max((_cosine(para_vec, note_vec) for note_vec in note_vecs), default=0.0)
             if best >= threshold:
                 covered += 1
-        return covered / len(para_slice) if para_slice else 0.0
+        ratio = covered / len(para_slice) if para_slice else 0.0
+        return ratio, covered, len(para_slice)
 
     def _embed_texts_robust(
         self,

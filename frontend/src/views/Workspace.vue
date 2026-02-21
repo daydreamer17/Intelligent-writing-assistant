@@ -104,11 +104,12 @@
           引用覆盖率：{{ Math.round(((output.coverage_detail?.semantic_coverage ?? output.coverage) || 0) * 100) }}%
         </div>
         <div v-if="output.coverage_detail">
-          段落覆盖率：{{ Math.round((output.coverage_detail.paragraph_coverage || 0) * 100) }}%
-          （{{ output.coverage_detail.covered_paragraphs }}/{{ output.coverage_detail.total_paragraphs }}）
+          语义段落覆盖率：{{ Math.round((output.coverage_detail.semantic_coverage || 0) * 100) }}%
+          （{{ output.coverage_detail.semantic_covered_paragraphs ?? 0 }}/{{ output.coverage_detail.semantic_total_paragraphs ?? output.coverage_detail.total_paragraphs }}）
         </div>
         <div v-if="output.coverage_detail">
-          语义覆盖率：{{ Math.round((output.coverage_detail.semantic_coverage || 0) * 100) }}%
+          词面段落覆盖率：{{ Math.round((output.coverage_detail.paragraph_coverage || 0) * 100) }}%
+          （{{ output.coverage_detail.covered_paragraphs }}/{{ output.coverage_detail.total_paragraphs }}）
         </div>
       </div>
       <div v-if="error" class="muted">错误：{{ error }}</div>

@@ -61,6 +61,8 @@ export interface RewriteResponse {
     total_tokens: number;
     covered_paragraphs: number;
     total_paragraphs: number;
+    semantic_covered_paragraphs?: number;
+    semantic_total_paragraphs?: number;
   };
   citation_enforced?: boolean;
 }
