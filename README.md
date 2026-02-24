@@ -16,7 +16,7 @@
 - 拒答保护：检索质量不足时拒答，避免低可信幻觉输出
 - 拒答判定增强：拒答查询默认精简（不再直接拼接超长大纲/草稿），并对 original/bilingual/HyDE 变体取最优评分后再判定
 - 记忆机制：会话隔离（`session_id`）、历史压缩、冷存写入与冷存召回回注；支持任务前自动重置会话记忆（含冷存）
-- 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化
+- 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化，支持 baseline 对比脚本、`@1/@3/@5` 指标表、逐 Query 明细报告
 - 外部知识接入：GitHub MCP（可选）及显式工具 API
 
 ## 2. 技术栈
@@ -154,6 +154,15 @@ LLM_TOOL_POLICY_DISABLE_WHEN_RAG_STRONG=true
 - `http://localhost:8000/redoc`
 
 ## 7. 更新日志
+
+### v0.5.4 (2026-02-24)
+**📈 离线检索 Baseline 对比增强**
+
+- ✨ `POST /api/rag/evaluate` 新增请求级 `rag_config_override`（`rerank/hyde/bilingual_rewrite`），仅对本次评测生效，无需重启后端
+- ✨ 新增 baseline 脚本增强：默认 A/B/C 基线，支持 `--include-bilingual-baselines` 追加 bilingual 对比
+- ✨ baseline 报告升级：`evals/baseline_report.md` 同时输出 `@1/@3/@5` 指标表，并新增按 query `tags` 分组统计
+- ✨ 新增逐 Query 对比报告：`evals/baseline_report_details.md`（失败样本、首命中位置、Top5 doc_id）
+- ✨ 新增更难评测集样例：`backend/evals/retrieval_eval_small_hard.json`（含中英混合、多概念、多标签 query）
 
 ### v0.5.3 (2026-02-21)
 **🛡️ 拒答判定与覆盖率展示修正**

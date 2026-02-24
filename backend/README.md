@@ -15,7 +15,7 @@
 - 拒答判定增强：拒答查询默认精简（不直接拼接超长大纲/草稿），并按 original/bilingual/HyDE 变体最优分数判定
 - 覆盖率明细增强：区分语义段落覆盖率与词面段落覆盖率
 - 记忆机制：会话隔离（`session_id`）、上下文压缩、冷存写入与冷存召回；支持任务前自动重置
-- 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化
+- 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化，支持 baseline 对比脚本、逐 Query 明细报告、按标签分组统计
 - MCP：可选 GitHub MCP 显式工具调用
 
 ## 2. 目录结构（简版）
@@ -147,6 +147,60 @@ LLM_TOOL_POLICY_DISABLE_WHEN_RAG_STRONG=true
 - `GET /api/rag/evaluations`
 - `GET /api/rag/evaluations/{run_id}`
 - `DELETE /api/rag/evaluations/{run_id}`
+
+### 离线检索 baseline 对比（脚本）
+
+1. 启动后端（保持 `POST /api/rag/evaluate` 可访问）：
+
+```bash
+cd backend
+python main.py
+```
+
+2. 运行默认 3 个 baseline（A/B/C），生成：
+   - `evals/baseline_report.md`（`@1/@3/@5` 指标表 + 可选标签分组统计）
+   - `evals/baseline_report_details.md`（逐 Query 对比、失败样本、首命中位置、Top5 doc_id）
+
+```bash
+python scripts/run_retrieval_baselines.py
+```
+
+3. 加入 bilingual rewrite 对比（D/E）：
+
+```bash
+python scripts/run_retrieval_baselines.py --include-bilingual-baselines
+```
+
+4. 使用更难评测集（含中英混合 / 多概念 / 多标签 query）：
+
+```bash
+python scripts/run_retrieval_baselines.py --eval evals/retrieval_eval_small_hard.json --timeout 600
+```
+
+5. 自定义输入/输出路径、超时与后端地址：
+
+```bash
+python scripts/run_retrieval_baselines.py ^
+  --eval evals/retrieval_eval_small.json ^
+  --out evals/baseline_report.md ^
+  --base-url http://127.0.0.1:8000 ^
+  --timeout 300
+```
+
+6. 用 `/api/rag/search` 获取真实 `doc_id` 替换 `evals/retrieval_eval_small.json` / `evals/retrieval_eval_small_hard.json` 中的占位值（评测集与 `RetrievalEvalRequest` 同结构；脚本支持额外 `tags` 字段用于分组统计）：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/rag/search ^
+  -H "Content-Type: application/json" ^
+  -d "{\"query\":\"你的查询\",\"top_k\":5}"
+```
+
+7. `POST /api/rag/evaluate` 支持可选 `rag_config_override`（仅本次请求生效，不改默认配置、不需要重启后端）：
+   - `rerank_enabled`
+   - `hyde_enabled`
+   - `bilingual_rewrite_enabled`
+
+8. 脚本默认直连本机后端（忽略系统代理环境变量），可避免本地 `127.0.0.1` 请求被代理导致的 `502 Bad Gateway`。
 
 ### 引用与设置
 - `POST /api/citations`
