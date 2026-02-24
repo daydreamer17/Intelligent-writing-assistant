@@ -63,11 +63,23 @@ class QueryExpander:
         self._llm = llm
         self._config = config
 
-    def expand(self, query: str) -> List[QueryVariant]:
+    def expand(
+        self,
+        query: str,
+        *,
+        hyde_enabled: bool | None = None,
+        bilingual_rewrite_enabled: bool | None = None,
+    ) -> List[QueryVariant]:
         base = _truncate(query, self._config.max_query_chars)
         variants = [QueryVariant(text=base, weight=1.0, source="original")]
+        hyde_on = self._config.hyde_enabled if hyde_enabled is None else bool(hyde_enabled)
+        bilingual_on = (
+            self._config.bilingual_rewrite_enabled
+            if bilingual_rewrite_enabled is None
+            else bool(bilingual_rewrite_enabled)
+        )
 
-        if self._config.bilingual_rewrite_enabled:
+        if bilingual_on:
             has_zh = _has_chinese(base)
             has_en = _has_latin(base)
             # Cross-lingual retrieval boost:
@@ -82,7 +94,7 @@ class QueryExpander:
                 if rewritten:
                     variants.append(QueryVariant(text=rewritten, weight=0.92, source="rewrite_zh"))
 
-        if self._config.hyde_enabled:
+        if hyde_on:
             hyde = self._generate_hyde(base)
             if hyde:
                 variants.append(QueryVariant(text=hyde, weight=0.8, source="hyde"))
@@ -92,8 +104,8 @@ class QueryExpander:
             logger.info(
                 "RAG expansion enabled: %s variants (hyde=%s bilingual=%s).",
                 len(deduped),
-                self._config.hyde_enabled,
-                self._config.bilingual_rewrite_enabled,
+                hyde_on,
+                bilingual_on,
             )
         return deduped
 

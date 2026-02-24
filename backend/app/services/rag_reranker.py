@@ -63,8 +63,16 @@ class Reranker:
     def oversample_factor(self) -> int:
         return max(2, int(self._config.max_candidates / max(self._config.top_k, 1)))
 
-    def rerank(self, query: str, docs: Iterable[SourceDocument], *, top_k: int) -> List[SourceDocument]:
-        if not self._config.enabled:
+    def rerank(
+        self,
+        query: str,
+        docs: Iterable[SourceDocument],
+        *,
+        top_k: int,
+        enabled_override: bool | None = None,
+    ) -> List[SourceDocument]:
+        enabled = self._config.enabled if enabled_override is None else bool(enabled_override)
+        if not enabled:
             return list(docs)[:top_k]
 
         candidates = list(docs)[: self._config.max_candidates]

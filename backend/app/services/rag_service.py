@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import logging
 import os
 from math import sqrt
-from typing import Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional
 
 from ..utils.tokenizer import tokenize, tokenize_list
 from .rag_query_expander import QueryExpander, QueryVariant
@@ -12,6 +12,9 @@ from .rag_reranker import Reranker
 from .research_service import SourceDocument
 from .storage_service import StorageService
 from .vector_store import VectorMatch, VectorStore
+
+if TYPE_CHECKING:
+    from ..models.schemas import RagEvalConfigOverride
 
 
 @dataclass(frozen=True)
@@ -84,16 +87,41 @@ class RAGService:
             ]
         return list(self._documents)
 
-    def search(self, query: str, top_k: int = 5) -> List[SourceDocument]:
-        query_variants = self._expand_queries(query)
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        rag_eval_override: "RagEvalConfigOverride | None" = None,
+    ) -> List[SourceDocument]:
+        rerank_enabled_override = _get_override_bool(rag_eval_override, "rerank_enabled")
+        hyde_enabled_override = _get_override_bool(rag_eval_override, "hyde_enabled")
+        bilingual_rewrite_enabled_override = _get_override_bool(
+            rag_eval_override, "bilingual_rewrite_enabled"
+        )
+
+        query_variants = self._expand_queries(
+            query,
+            hyde_enabled_override=hyde_enabled_override,
+            bilingual_rewrite_enabled_override=bilingual_rewrite_enabled_override,
+        )
         corpus_size = self._corpus_size()
-        final_top_k, candidate_k = self._dynamic_search_plan(top_k=top_k, corpus_size=corpus_size)
+        final_top_k, candidate_k = self._dynamic_search_plan(
+            top_k=top_k,
+            corpus_size=corpus_size,
+            rerank_enabled_override=rerank_enabled_override,
+        )
         if self._vector_store and self._storage and query:
             try:
                 matches = self._vector_search_multi(query_variants, top_k=candidate_k)
                 resolved = self._resolve_matches(matches)
                 if resolved:
-                    return self._rerank_if_needed(query, resolved, top_k=final_top_k)
+                    return self._rerank_if_needed(
+                        query,
+                        resolved,
+                        top_k=final_top_k,
+                        enabled_override=rerank_enabled_override,
+                    )
             except Exception as exc:
                 self._logger.warning("Vector search failed, falling back to keyword search: %s", exc)
         if self._storage:
@@ -108,11 +136,21 @@ class RAGService:
                 for doc in stored
             ]
             ranked = self._rank_documents_multi(query_variants, candidates, top_k=candidate_k)
-            return self._rerank_if_needed(query, ranked, top_k=final_top_k)
+            return self._rerank_if_needed(
+                query,
+                ranked,
+                top_k=final_top_k,
+                enabled_override=rerank_enabled_override,
+            )
         if not query:
             return self._documents[:final_top_k]
         ranked = self._rank_documents_multi(query_variants, self._documents, top_k=candidate_k)
-        return self._rerank_if_needed(query, ranked, top_k=final_top_k)
+        return self._rerank_if_needed(
+            query,
+            ranked,
+            top_k=final_top_k,
+            enabled_override=rerank_enabled_override,
+        )
 
     def query_variants(self, query: str) -> List[QueryVariant]:
         """Return the active retrieval query variants for diagnostics/policy checks."""
@@ -123,8 +161,13 @@ class RAGService:
             return getattr(self._vector_store, "embedder")
         return None
 
-    def _candidate_k(self, top_k: int) -> int:
-        if self._reranker and self._reranker.enabled:
+    def _candidate_k(self, top_k: int, *, rerank_enabled_override: bool | None = None) -> int:
+        rerank_enabled = (
+            bool(rerank_enabled_override)
+            if rerank_enabled_override is not None
+            else bool(self._reranker and self._reranker.enabled)
+        )
+        if self._reranker and rerank_enabled:
             factor = self._reranker.oversample_factor
             return max(top_k, top_k * factor)
         return top_k
@@ -137,13 +180,27 @@ class RAGService:
                 return len(self._documents)
         return len(self._documents)
 
-    def _dynamic_search_plan(self, *, top_k: int, corpus_size: int) -> tuple[int, int]:
+    def _dynamic_search_plan(
+        self,
+        *,
+        top_k: int,
+        corpus_size: int,
+        rerank_enabled_override: bool | None = None,
+    ) -> tuple[int, int]:
         requested_top_k = max(1, top_k)
         if corpus_size <= 0:
             return requested_top_k, requested_top_k
 
         if not _parse_bool_env("RAG_DYNAMIC_TOPK_ENABLED", True):
-            candidate_k = min(corpus_size, max(requested_top_k, self._candidate_k(requested_top_k)))
+            candidate_k = min(
+                corpus_size,
+                max(
+                    requested_top_k,
+                    self._candidate_k(
+                        requested_top_k, rerank_enabled_override=rerank_enabled_override
+                    ),
+                ),
+            )
             final_top_k = min(corpus_size, requested_top_k)
             return final_top_k, candidate_k
 
@@ -190,18 +247,29 @@ class RAGService:
         docs: List[SourceDocument],
         *,
         top_k: int,
+        enabled_override: bool | None = None,
     ) -> List[SourceDocument]:
-        if not self._reranker or not self._reranker.enabled:
+        if not self._reranker:
             return docs[:top_k]
-        return self._reranker.rerank(query, docs, top_k=top_k)
+        return self._reranker.rerank(query, docs, top_k=top_k, enabled_override=enabled_override)
 
-    def _expand_queries(self, query: str) -> List[QueryVariant]:
+    def _expand_queries(
+        self,
+        query: str,
+        *,
+        hyde_enabled_override: bool | None = None,
+        bilingual_rewrite_enabled_override: bool | None = None,
+    ) -> List[QueryVariant]:
         base = (query or "").strip()
         if not base:
             return []
         if self._query_expander is None:
             return [QueryVariant(text=base, weight=1.0, source="original")]
-        return self._query_expander.expand(base)
+        return self._query_expander.expand(
+            base,
+            hyde_enabled=hyde_enabled_override,
+            bilingual_rewrite_enabled=bilingual_rewrite_enabled_override,
+        )
 
     def _vector_search_multi(
         self,
@@ -316,3 +384,15 @@ def _parse_int_env(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _get_override_bool(override: object | None, attr: str) -> bool | None:
+    if override is None:
+        return None
+    try:
+        value = getattr(override, attr, None)
+    except Exception:
+        return None
+    if value is None:
+        return None
+    return bool(value)

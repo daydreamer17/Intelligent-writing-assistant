@@ -117,11 +117,16 @@ def evaluate_retrieval(
         ]
         if not cases:
             raise HTTPException(status_code=422, detail="All evaluation queries are empty")
+        rag_override = payload.rag_config_override
 
         report = _eval_service.evaluate(
             cases=cases,
             k_values=k_values,
-            search_fn=lambda query, top_k: services.rag.search(query, top_k=min(top_k, max_k)),
+            search_fn=lambda query, top_k: services.rag.search(
+                query,
+                top_k=min(top_k, max_k),
+                rag_eval_override=rag_override,
+            ),
         )
 
         macro_metrics_data = [_metric_to_dict(item) for item in report.macro_metrics]

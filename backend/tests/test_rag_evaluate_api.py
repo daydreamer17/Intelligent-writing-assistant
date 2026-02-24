@@ -18,6 +18,7 @@ from app.services.research_service import SourceDocument  # noqa: E402
 
 class _FakeRag:
     def __init__(self):
+        self.last_override = None
         self._docs = {
             "agent": [
                 SourceDocument(doc_id="d1", title="A", content="..."),
@@ -30,7 +31,8 @@ class _FakeRag:
             ],
         }
 
-    def search(self, query: str, top_k: int = 5):
+    def search(self, query: str, top_k: int = 5, *, rag_eval_override=None):
+        self.last_override = rag_eval_override
         return self._docs.get(query, [])[:top_k]
 
 
@@ -43,8 +45,9 @@ class _FakeStorage:
 
 
 def test_rag_evaluate_endpoint_returns_metrics():
+    fake_rag = _FakeRag()
     app = create_app()
-    app.dependency_overrides[get_services] = lambda: SimpleNamespace(rag=_FakeRag(), storage=_FakeStorage())
+    app.dependency_overrides[get_services] = lambda: SimpleNamespace(rag=fake_rag, storage=_FakeStorage())
     client = TestClient(app)
 
     payload = {
@@ -64,5 +67,34 @@ def test_rag_evaluate_endpoint_returns_metrics():
     assert body["eval_run_id"] == 1
     assert len(body["macro_metrics"]) == 2
     assert len(body["per_query"]) == 2
+    assert fake_rag.last_override is None
+
+    app.dependency_overrides.clear()
+
+
+def test_rag_evaluate_endpoint_accepts_rag_config_override():
+    fake_rag = _FakeRag()
+    app = create_app()
+    app.dependency_overrides[get_services] = lambda: SimpleNamespace(rag=fake_rag, storage=_FakeStorage())
+    client = TestClient(app)
+
+    payload = {
+        "cases": [
+            {"query": "agent", "relevant_doc_ids": ["d1"], "query_id": "q1"},
+        ],
+        "k_values": [1, 3, 5],
+        "rag_config_override": {
+            "rerank_enabled": False,
+            "hyde_enabled": False,
+            "bilingual_rewrite_enabled": False,
+        },
+    }
+    resp = client.post("/api/rag/evaluate", json=payload)
+    assert resp.status_code == 200
+
+    assert fake_rag.last_override is not None
+    assert fake_rag.last_override.rerank_enabled is False
+    assert fake_rag.last_override.hyde_enabled is False
+    assert fake_rag.last_override.bilingual_rewrite_enabled is False
 
     app.dependency_overrides.clear()

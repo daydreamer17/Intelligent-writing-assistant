@@ -340,18 +340,16 @@ def _build_services() -> AppServices:
             vector_store = None
             qdrant_error = str(exc)
     expander_config = QueryExpansionConfig.from_env()
-    query_expander = None
+    query_expander = QueryExpander(writing_agent.llm, expander_config)
     if expander_config.hyde_enabled:
-        query_expander = QueryExpander(writing_agent.llm, expander_config)
         logger.info(
             "RAG query expansion enabled (HyDE=%s).",
             expander_config.hyde_enabled,
         )
 
     rerank_config = RerankConfig.from_env()
-    reranker = None
+    reranker = Reranker(writing_agent.llm, rerank_config)
     if rerank_config.enabled:
-        reranker = Reranker(writing_agent.llm, rerank_config)
         logger.info(
             "RAG rerank enabled (top_k=%s, max_candidates=%s).",
             rerank_config.top_k,

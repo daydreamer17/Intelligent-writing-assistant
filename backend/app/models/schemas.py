@@ -148,6 +148,15 @@ class RetrievalEvalCaseInput(BaseModel):
     query_id: str = Field("", description="Optional query sample ID")
 
 
+class RagEvalConfigOverride(BaseModel):
+    rerank_enabled: bool | None = Field(None, description="Temporarily enable/disable rerank for this eval run")
+    hyde_enabled: bool | None = Field(None, description="Temporarily enable/disable HyDE query expansion for this eval run")
+    bilingual_rewrite_enabled: bool | None = Field(
+        None,
+        description="Temporarily enable/disable bilingual query rewrite for this eval run",
+    )
+
+
 class RetrievalMetricAtK(BaseModel):
     k: int
     recall: float
@@ -168,6 +177,10 @@ class RetrievalEvalCaseResult(BaseModel):
 class RetrievalEvalRequest(BaseModel):
     cases: list[RetrievalEvalCaseInput] = Field(default_factory=list)
     k_values: list[int] = Field(default_factory=lambda: [1, 3, 5], description="K values to evaluate")
+    rag_config_override: RagEvalConfigOverride | None = Field(
+        default=None,
+        description="Per-request retrieval config override (eval only)",
+    )
 
 
 class RetrievalEvalResponse(BaseModel):
