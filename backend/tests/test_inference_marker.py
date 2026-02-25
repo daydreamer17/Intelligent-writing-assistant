@@ -22,3 +22,8 @@ def test_mark_inference_paragraphs_skips_short_headings():
     assert "## 小标题 [推断]" not in out
     assert "这是正文段落。 [推断]" in out
 
+
+def test_mark_inference_paragraphs_marks_short_plain_phrase_in_hybrid_case():
+    text = "量子烹饪龙语契约与海底火星税法"
+    out = mark_inference_paragraphs(text, tag="[推断]", min_paragraph_chars=12)
+    assert out.endswith("[推断]")

@@ -49,6 +49,10 @@ def _should_skip_mark(paragraph: str, min_paragraph_chars: int) -> bool:
     # Avoid labeling short headings/list titles as inference.
     if paragraph.startswith(("#", "- ", "* ")):
         return True
-    if re.fullmatch(r"(第[一二三四五六七八九十0-9]+[章节部分]|[A-Za-z0-9\u4e00-\u9fff\s:：\-—]{1,40})", paragraph):
+    if re.fullmatch(r"第[一二三四五六七八九十0-9]+[章节部分]", paragraph):
+        return True
+    # Keep obvious label-like single-line headings unmarked, but do not skip generic
+    # short phrases (Hybrid mode regression expects they still get an inference tag).
+    if len(paragraph) <= 10 and re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff\s:：\-—]{1,20}", paragraph):
         return True
     return False

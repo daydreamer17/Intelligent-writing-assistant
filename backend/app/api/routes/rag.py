@@ -118,6 +118,13 @@ def evaluate_retrieval(
         if not cases:
             raise HTTPException(status_code=422, detail="All evaluation queries are empty")
         rag_override = payload.rag_config_override
+        if rag_override is not None:
+            logger.info(
+                "RAG evaluate override received: rerank=%s hyde=%s bilingual=%s",
+                rag_override.rerank_enabled,
+                rag_override.hyde_enabled,
+                rag_override.bilingual_rewrite_enabled,
+            )
 
         report = _eval_service.evaluate(
             cases=cases,

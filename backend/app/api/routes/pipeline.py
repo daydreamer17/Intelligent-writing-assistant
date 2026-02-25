@@ -78,6 +78,74 @@ def _coverage_detail(report: CoverageReport | None) -> CoverageDetail | None:
     )
 
 
+def _zero_coverage_report() -> CoverageReport:
+    return CoverageReport(
+        coverage=0.0,
+        token_coverage=0.0,
+        total_tokens=0,
+        covered_tokens=0,
+        total_paragraphs=0,
+        covered_paragraphs=0,
+        semantic_coverage=None,
+        semantic_covered_paragraphs=0,
+        semantic_total_paragraphs=0,
+    )
+
+
+def _strict_citation_postcheck_failed(report: CoverageReport) -> bool:
+    if not _strict_citation_labels():
+        return False
+    if not _parse_bool("RAG_CITATION_STRICT_POSTCHECK_ENABLED", True):
+        return False
+    if report.covered_tokens <= 0 and report.covered_paragraphs <= 0:
+        logger.warning(
+            "Strict citation postcheck failed (pipeline): no lexical overlap (token_coverage=%.3f semantic_coverage=%s)",
+            report.token_coverage,
+            f"{report.semantic_coverage:.3f}" if report.semantic_coverage is not None else "n/a",
+        )
+        return True
+    min_token_coverage = _parse_float("RAG_CITATION_STRICT_MIN_TOKEN_COVERAGE", 0.0)
+    min_covered_paragraphs = max(0, _parse_int("RAG_CITATION_STRICT_MIN_COVERED_PARAGRAPHS", 0))
+    if min_token_coverage > 0.0 and report.token_coverage < min_token_coverage:
+        if report.covered_paragraphs < max(1, min_covered_paragraphs):
+            logger.warning(
+                "Strict citation postcheck failed (pipeline): token_coverage %.3f < %.3f and covered_paragraphs=%s",
+                report.token_coverage,
+                min_token_coverage,
+                report.covered_paragraphs,
+            )
+            return True
+    if min_covered_paragraphs > 0 and report.covered_paragraphs < min_covered_paragraphs:
+        logger.warning(
+            "Strict citation postcheck failed (pipeline): covered_paragraphs=%s < %s",
+            report.covered_paragraphs,
+            min_covered_paragraphs,
+        )
+        return True
+    return False
+
+
+def _rag_only_hyde_refusal_guard(best_variant: str, original_report: RelevanceReport) -> bool:
+    if get_generation_mode() != "rag_only":
+        return False
+    if not (best_variant or "").lower().startswith("hyde"):
+        return False
+    min_terms = max(1, _parse_int("RAG_REFUSAL_MIN_QUERY_TERMS", 2))
+    if original_report.query_terms < min_terms:
+        return False
+    max_lex = _parse_float("RAG_REFUSAL_RAGONLY_ORIGINAL_LEXICAL_MAX_FOR_HYDE", 0.02)
+    max_tfidf = _parse_float("RAG_REFUSAL_RAGONLY_ORIGINAL_TFIDF_MAX_FOR_HYDE", 0.03)
+    trigger = original_report.lexical_best <= max_lex and original_report.tfidf_best <= max_tfidf
+    if trigger:
+        logger.info(
+            "RAG-only HyDE refusal guard triggered (pipeline): best_variant=%s original_lex=%.3f original_tfidf=%.3f",
+            best_variant,
+            original_report.lexical_best,
+            original_report.tfidf_best,
+        )
+    return trigger
+
+
 def _refusal_message() -> str:
     return "在提供的文档中，无法找到该问题的答案。"
 
@@ -268,8 +336,12 @@ def _refusal_check_with_fallback(
     sources: list[SourceDocument],
     services: AppServices,
 ) -> tuple[bool, list[SourceDocument]]:
-    report, report_query = _best_refusal_report(query=query, sources=sources, services=services)
+    report, report_query, original_report = _best_refusal_report(
+        query=query, sources=sources, services=services
+    )
     refused = _base_should_refuse(report)
+    if not refused and _rag_only_hyde_refusal_guard(report_query, original_report):
+        refused = True
     _log_refusal(report, refused=refused, context=f"base:{report_query}")
     if not refused or _refusal_mode() == "strict":
         return refused, sources
@@ -277,8 +349,12 @@ def _refusal_check_with_fallback(
     fallback_top_k = max(5, _parse_int("RAG_REFUSAL_FALLBACK_TOP_K", 12))
     fallback_docs = services.rag.search(query, top_k=fallback_top_k)
     merged = _merge_sources(sources, fallback_docs)
-    fallback_report, fallback_query = _best_refusal_report(query=query, sources=merged, services=services)
+    fallback_report, fallback_query, fallback_original_report = _best_refusal_report(
+        query=query, sources=merged, services=services
+    )
     fallback_refused = _fallback_should_refuse(fallback_report)
+    if not fallback_refused and _rag_only_hyde_refusal_guard(fallback_query, fallback_original_report):
+        fallback_refused = True
     _log_refusal(
         fallback_report,
         refused=fallback_refused,
@@ -294,7 +370,7 @@ def _best_refusal_report(
     query: str,
     sources: list[SourceDocument],
     services: AppServices,
-) -> tuple[RelevanceReport, str]:
+) -> tuple[RelevanceReport, str, RelevanceReport]:
     candidates: list[tuple[str, str]] = [("original", query)]
     try:
         for variant in services.rag.query_variants(query):
@@ -315,7 +391,8 @@ def _best_refusal_report(
         seen.add(key)
         deduped.append((label, text))
 
-    best_report = services.pipeline.researcher.relevance_report(query, sources)
+    original_report = services.pipeline.researcher.relevance_report(query, sources)
+    best_report = original_report
     best_label = "original"
     best_key = (
         best_report.best_recall,
@@ -335,7 +412,7 @@ def _best_refusal_report(
             best_report = report
             best_key = key
             best_label = label
-    return best_report, best_label
+    return best_report, best_label, original_report
 
 
 def _github_note(context: str) -> ResearchNote:
@@ -474,8 +551,9 @@ def _serialize_pipeline_result(
         )
         for note in result.research_notes
     ]
-    citations = services.citations.build_citations(result.research_notes)
-    bibliography = services.citations.format_bibliography(citations)
+    is_refusal = (result.draft_result.revised or "").strip() == _refusal_message()
+    citations = [] if is_refusal else services.citations.build_citations(result.research_notes)
+    bibliography = "" if is_refusal else services.citations.format_bibliography(citations)
     version_id = services.storage.save_draft_version(
         topic=payload.topic,
         outline=result.outline.outline,
@@ -740,6 +818,9 @@ def run_pipeline(
             strict_labels=_strict_citation_labels(),
             embedder=services.rag.get_embedder(),
         )
+        if apply_labels and _strict_citation_postcheck_failed(report):
+            enforced_text = _refusal_message()
+            report = _zero_coverage_report()
         enforced_text = _postprocess_final_text(enforced_text)
         citation_enforced = apply_labels and enforced_text != result.draft_result.revised
         draft_result = DraftResult(
@@ -1191,6 +1272,9 @@ def run_pipeline_stream(
                 strict_labels=_strict_citation_labels(),
                 embedder=services.rag.get_embedder(),
             )
+            if apply_labels and _strict_citation_postcheck_failed(report):
+                enforced_text = _refusal_message()
+                report = _zero_coverage_report()
             enforced_text = _postprocess_final_text(enforced_text)
             citation_enforced = apply_labels and enforced_text != revised
             revised = enforced_text

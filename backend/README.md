@@ -15,7 +15,8 @@
 - 拒答判定增强：拒答查询默认精简（不直接拼接超长大纲/草稿），并按 original/bilingual/HyDE 变体最优分数判定
 - 覆盖率明细增强：区分语义段落覆盖率与词面段落覆盖率
 - 记忆机制：会话隔离（`session_id`）、上下文压缩、冷存写入与冷存召回；支持任务前自动重置
-- 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化，支持 baseline 对比脚本、逐 Query 明细报告、按标签分组统计
+- 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化，支持 baseline 对比脚本、重复运行均值/方差、逐 Query 明细报告、按标签分组统计、Agent 行为回归小套件
+- 线上动态检索策略路由（可选）：按 query 类型自动切换 `dense_only / rerank / hyde / bilingual`
 - MCP：可选 GitHub MCP 显式工具调用
 
 ## 2. 目录结构（简版）
@@ -86,6 +87,7 @@ QDRANT_DISTANCE=cosine
 RAG_DYNAMIC_TOPK_ENABLED=true
 RAG_RERANK_ENABLED=true
 RAG_HYDE_ENABLED=false
+RAG_QUERY_STRATEGY_ROUTING_ENABLED=false # 线上动态检索策略路由（按 query 类型）
 RAG_GENERATION_MODE=rag_only        # rag_only / hybrid / creative
 RAG_CREATIVE_MCP_ENABLED=true       # creative 模式下是否启用 MCP
 RAG_CREATIVE_MEMORY_ENABLED=false   # creative 模式是否启用会话记忆
@@ -157,8 +159,8 @@ cd backend
 python main.py
 ```
 
-2. 运行默认 3 个 baseline（A/B/C），生成：
-   - `evals/baseline_report.md`（`@1/@3/@5` 指标表 + 可选标签分组统计）
+2. 运行默认 3 个 baseline（A/B/C），生成并保存结果文档：
+   - `evals/baseline_report.md`（`@1/@3/@5` 指标表、可选标签分组统计、Agent 行为回归小套件）
    - `evals/baseline_report_details.md`（逐 Query 对比、失败样本、首命中位置、Top5 doc_id）
 
 ```bash
@@ -177,7 +179,13 @@ python scripts/run_retrieval_baselines.py --include-bilingual-baselines
 python scripts/run_retrieval_baselines.py --eval evals/retrieval_eval_small_hard.json --timeout 600
 ```
 
-5. 自定义输入/输出路径、超时与后端地址：
+5. 重复运行并输出均值/标准差（推荐用于做策略决策，降低单次波动影响）：
+
+```bash
+python scripts/run_retrieval_baselines.py --eval evals/retrieval_eval_small_hard.json --include-bilingual-baselines --repeats 5 --timeout 600
+```
+
+6. 自定义输入/输出路径、超时与后端地址：
 
 ```bash
 python scripts/run_retrieval_baselines.py ^
@@ -187,7 +195,12 @@ python scripts/run_retrieval_baselines.py ^
   --timeout 300
 ```
 
-6. 用 `/api/rag/search` 获取真实 `doc_id` 替换 `evals/retrieval_eval_small.json` / `evals/retrieval_eval_small_hard.json` 中的占位值（评测集与 `RetrievalEvalRequest` 同结构；脚本支持额外 `tags` 字段用于分组统计）：
+7. 结果文档保存流程说明：
+   - 默认输出：`--out` 未指定时写入 `evals/baseline_report.md`
+   - 详情报告会自动保存为同目录同名后缀：`evals/baseline_report_details.md`
+   - 若使用 `--out xxx.md`，则详情报告自动保存为 `xxx_details.md`
+
+8. 用 `/api/rag/search` 获取真实 `doc_id` 替换 `evals/retrieval_eval_small.json` / `evals/retrieval_eval_small_hard.json` 中的占位值（评测集与 `RetrievalEvalRequest` 同结构；脚本支持额外 `tags` 字段用于分组统计）：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/rag/search ^
@@ -195,12 +208,14 @@ curl -X POST http://127.0.0.1:8000/api/rag/search ^
   -d "{\"query\":\"你的查询\",\"top_k\":5}"
 ```
 
-7. `POST /api/rag/evaluate` 支持可选 `rag_config_override`（仅本次请求生效，不改默认配置、不需要重启后端）：
+9. `POST /api/rag/evaluate` 支持可选 `rag_config_override`（仅本次请求生效，不改默认配置、不需要重启后端）：
    - `rerank_enabled`
    - `hyde_enabled`
    - `bilingual_rewrite_enabled`
 
-8. 脚本默认直连本机后端（忽略系统代理环境变量），可避免本地 `127.0.0.1` 请求被代理导致的 `502 Bad Gateway`。
+10. 脚本默认直连本机后端（忽略系统代理环境变量），可避免本地 `127.0.0.1` 请求被代理导致的 `502 Bad Gateway`。
+
+11. 注意：线上动态检索策略路由（`RAG_QUERY_STRATEGY_ROUTING_ENABLED`）主要影响 `/api/rag/search`、Pipeline、写作接口；baseline 脚本默认通过 `rag_config_override` 固定策略组合，不直接使用该自动路由。
 
 ### 引用与设置
 - `POST /api/citations`
@@ -237,5 +252,6 @@ curl -X POST http://127.0.0.1:8000/api/rag/search ^
 - `hybrid` 模式会优先注入可匹配的 `[n]`，仅对无证据段落补 `[推断]`。
 - 覆盖率展示建议优先看语义段落覆盖率；词面段落覆盖率在中英混合语料下可能偏低。
 - 拒答日志会显示 `base:<variant>` / `fallback@k:<variant>`，用于定位本轮命中的查询变体。
+- 若开启 `RAG_QUERY_STRATEGY_ROUTING_ENABLED=true`，日志会出现 `RAG query strategy route: ...`，用于确认本轮 query 命中的线上策略组合。
 - 流式链路依赖 SSE，代理层需允许 `text/event-stream`。
 - 离线评测结果持久化在 SQLite 表 `retrieval_eval_runs`。

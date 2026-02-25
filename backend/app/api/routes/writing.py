@@ -227,6 +227,78 @@ def _coverage_detail(report: CoverageReport | None) -> CoverageDetail | None:
     )
 
 
+def _zero_coverage_report() -> CoverageReport:
+    return CoverageReport(
+        coverage=0.0,
+        token_coverage=0.0,
+        total_tokens=0,
+        covered_tokens=0,
+        total_paragraphs=0,
+        covered_paragraphs=0,
+        semantic_coverage=None,
+        semantic_covered_paragraphs=0,
+        semantic_total_paragraphs=0,
+    )
+
+
+def _strict_citation_postcheck_failed(report: CoverageReport) -> bool:
+    if not _strict_citation_labels():
+        return False
+    if not _parse_bool("RAG_CITATION_STRICT_POSTCHECK_ENABLED", True):
+        return False
+
+    # Default guard is conservative: reject "fake citation" cases with no lexical overlap at all,
+    # even if semantic coverage looks high due to embedding noise.
+    if report.covered_tokens <= 0 and report.covered_paragraphs <= 0:
+        logger.warning(
+            "Strict citation postcheck failed: no lexical overlap (token_coverage=%.3f semantic_coverage=%s)",
+            report.token_coverage,
+            f"{report.semantic_coverage:.3f}" if report.semantic_coverage is not None else "n/a",
+        )
+        return True
+
+    min_token_coverage = _parse_float("RAG_CITATION_STRICT_MIN_TOKEN_COVERAGE", 0.0)
+    min_covered_paragraphs = max(0, _parse_int("RAG_CITATION_STRICT_MIN_COVERED_PARAGRAPHS", 0))
+    if min_token_coverage > 0.0 and report.token_coverage < min_token_coverage:
+        if report.covered_paragraphs < max(1, min_covered_paragraphs):
+            logger.warning(
+                "Strict citation postcheck failed: token_coverage %.3f < %.3f and covered_paragraphs=%s",
+                report.token_coverage,
+                min_token_coverage,
+                report.covered_paragraphs,
+            )
+            return True
+    if min_covered_paragraphs > 0 and report.covered_paragraphs < min_covered_paragraphs:
+        logger.warning(
+            "Strict citation postcheck failed: covered_paragraphs=%s < %s",
+            report.covered_paragraphs,
+            min_covered_paragraphs,
+        )
+        return True
+    return False
+
+
+def _rag_only_hyde_refusal_guard(best_variant: str, original_report: RelevanceReport) -> bool:
+    if get_generation_mode() != "rag_only":
+        return False
+    if not (best_variant or "").lower().startswith("hyde"):
+        return False
+    min_terms = max(1, _parse_int("RAG_REFUSAL_MIN_QUERY_TERMS", 2))
+    if original_report.query_terms < min_terms:
+        return False
+    max_lex = _parse_float("RAG_REFUSAL_RAGONLY_ORIGINAL_LEXICAL_MAX_FOR_HYDE", 0.02)
+    max_tfidf = _parse_float("RAG_REFUSAL_RAGONLY_ORIGINAL_TFIDF_MAX_FOR_HYDE", 0.03)
+    trigger = original_report.lexical_best <= max_lex and original_report.tfidf_best <= max_tfidf
+    if trigger:
+        logger.info(
+            "RAG-only HyDE refusal guard triggered: best_variant=%s original_lex=%.3f original_tfidf=%.3f",
+            best_variant,
+            original_report.lexical_best,
+            original_report.tfidf_best,
+        )
+    return trigger
+
+
 def _citation_payload(
     *,
     text: str,
@@ -241,6 +313,8 @@ def _citation_payload(
         strict_labels=_strict_citation_labels(),
         embedder=services.rag.get_embedder(),
     )
+    if apply_labels and _strict_citation_postcheck_failed(report):
+        return (_refusal_message(), _zero_coverage_report(), [], "", False)
     enforced_text = _postprocess_final_text(enforced_text)
     citations = services.citations.build_citations(notes)
     bibliography = services.citations.format_bibliography(citations)
@@ -282,18 +356,22 @@ def _rag_refusal_check(
 ) -> tuple[bool, list[SourceDocument]]:
     base_top_k = _citation_top_k()
     docs = services.rag.search(query, top_k=base_top_k)
-    report, report_query = _best_refusal_report(query=query, docs=docs, services=services)
+    report, report_query, original_report = _best_refusal_report(query=query, docs=docs, services=services)
     refused = _should_refuse(report)
+    if not refused and _rag_only_hyde_refusal_guard(report_query, original_report):
+        refused = True
     _log_refusal(report, refused=refused, context=f"writing:base@{base_top_k}:{report_query}")
     if not refused or _refusal_mode() == "strict":
         return refused, docs
 
     fallback_top_k = max(base_top_k, _parse_int("RAG_REFUSAL_FALLBACK_TOP_K", base_top_k * 2))
     fallback_docs = services.rag.search(query, top_k=fallback_top_k)
-    fallback_report, fallback_query = _best_refusal_report(
+    fallback_report, fallback_query, fallback_original_report = _best_refusal_report(
         query=query, docs=fallback_docs, services=services
     )
     fallback_refused = _should_refuse_fallback(fallback_report)
+    if not fallback_refused and _rag_only_hyde_refusal_guard(fallback_query, fallback_original_report):
+        fallback_refused = True
     _log_refusal(
         fallback_report,
         refused=fallback_refused,
@@ -309,7 +387,7 @@ def _best_refusal_report(
     query: str,
     docs: list[SourceDocument],
     services: AppServices,
-) -> tuple[RelevanceReport, str]:
+) -> tuple[RelevanceReport, str, RelevanceReport]:
     candidates: list[tuple[str, str]] = [("original", query)]
     try:
         for variant in services.rag.query_variants(query):
@@ -329,7 +407,8 @@ def _best_refusal_report(
         seen.add(key)
         deduped.append((label, text))
 
-    best_report = _researcher.relevance_report(query, docs)
+    original_report = _researcher.relevance_report(query, docs)
+    best_report = original_report
     best_label = "original"
     best_key = (
         best_report.best_recall,
@@ -349,7 +428,7 @@ def _best_refusal_report(
             best_report = report
             best_key = key
             best_label = label
-    return best_report, best_label
+    return best_report, best_label, original_report
 
 
 def _should_refuse_fallback(report: RelevanceReport) -> bool:

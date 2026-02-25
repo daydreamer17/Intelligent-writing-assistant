@@ -16,7 +16,8 @@
 - 拒答保护：检索质量不足时拒答，避免低可信幻觉输出
 - 拒答判定增强：拒答查询默认精简（不再直接拼接超长大纲/草稿），并对 original/bilingual/HyDE 变体取最优评分后再判定
 - 记忆机制：会话隔离（`session_id`）、历史压缩、冷存写入与冷存召回回注；支持任务前自动重置会话记忆（含冷存）
-- 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化，支持 baseline 对比脚本、`@1/@3/@5` 指标表、逐 Query 明细报告
+- 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化，支持 baseline 对比脚本、`@1/@3/@5` 指标表、重复运行均值/方差、逐 Query 明细报告、Agent 行为回归小套件
+- 线上检索策略路由（可选）：按 query 类型自动切换 `dense_only / rerank / hyde / bilingual` 组合（与离线 baseline 评测隔离）
 - 外部知识接入：GitHub MCP（可选）及显式工具 API
 
 ## 2. 技术栈
@@ -110,6 +111,7 @@ QDRANT_DISTANCE=cosine
 RAG_DYNAMIC_TOPK_ENABLED=true
 RAG_RERANK_ENABLED=true
 RAG_HYDE_ENABLED=false
+RAG_QUERY_STRATEGY_ROUTING_ENABLED=false # 线上动态检索策略路由（按 query 类型）
 RAG_GENERATION_MODE=rag_only        # rag_only / hybrid / creative
 RAG_CREATIVE_MCP_ENABLED=true       # creative 模式下是否启用 MCP
 RAG_CREATIVE_MEMORY_ENABLED=false   # creative 模式是否启用会话记忆
@@ -153,7 +155,57 @@ LLM_TOOL_POLICY_DISABLE_WHEN_RAG_STRONG=true
 - `http://localhost:8000/docs`
 - `http://localhost:8000/redoc`
 
-## 7. 更新日志
+## 7. 离线评测脚本（启动与结果保存流程）
+
+1. 启动后端（保持 `POST /api/rag/evaluate` 可访问）
+
+```bash
+cd backend
+python main.py
+```
+
+2. 运行 baseline 脚本（默认 A/B/C）
+
+```bash
+cd backend
+python scripts/run_retrieval_baselines.py
+```
+
+3. 常用增强参数
+
+```bash
+# 加入 bilingual baseline（D/E）
+python scripts/run_retrieval_baselines.py --include-bilingual-baselines
+
+# 重复运行并输出均值/方差（更适合做策略决策）
+python scripts/run_retrieval_baselines.py --eval evals/retrieval_eval_small_hard.json --include-bilingual-baselines --repeats 5 --timeout 600
+```
+
+4. 结果文档保存位置（默认）
+
+- `backend/evals/baseline_report.md`
+  - `@1/@3/@5` 指标表
+  - `Repeated Runs Statistics (Mean ± Std)`（当 `--repeats > 1`）
+  - `Tag-Grouped Baseline Metrics`
+  - `Agent 行为回归小套件（规则判定）`
+- `backend/evals/baseline_report_details.md`
+  - 失败样本
+  - 逐 Query 对比（`Hit@1/3/5`、`FirstHitRank@5`、Top5 `doc_id`）
+
+5. 自定义输出路径（`--out xxx.md`）时：
+
+- 主报告写入你指定的 `xxx.md`
+- 详情报告自动写入同目录同名后缀：`xxx_details.md`
+
+## 8. 更新日志
+
+### v0.5.5 (2026-02-25)
+**🧪 评测稳定性与线上检索策略路由增强**
+
+- ✨ baseline 脚本新增 `--repeats N`，支持重复运行并在报告中输出均值/标准差（Mean ± Std）
+- ✨ baseline 报告新增 Agent 行为回归小套件（引用/拒答/模式切换/推断标注）规则判定区块
+- ✨ 新增线上动态检索策略路由开关 `RAG_QUERY_STRATEGY_ROUTING_ENABLED`（按 query 类型切换 `dense_only / rerank / hyde / bilingual`）
+- 🔧 修复 Hybrid 模式短句无证据输出未追加 `[推断]` 的边界问题（回归小套件 17/17 通过）
 
 ### v0.5.4 (2026-02-24)
 **📈 离线检索 Baseline 对比增强**
@@ -278,7 +330,7 @@ LLM_TOOL_POLICY_DISABLE_WHEN_RAG_STRONG=true
 - ✅ 统一错误处理和表单验证
 - ✅ 添加自动保存和状态持久化
 
-## 8. 说明
+## 9. 说明
 
 - 项目处于持续迭代阶段，建议在生产环境前进行回归测试。
 - 更详细的后端实现与配置说明见 `backend/README.md`。

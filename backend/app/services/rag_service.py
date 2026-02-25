@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import os
+import re
 from math import sqrt
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional
 
 from ..utils.tokenizer import tokenize, tokenize_list
 from .rag_query_expander import QueryExpander, QueryVariant
@@ -99,6 +100,38 @@ class RAGService:
         bilingual_rewrite_enabled_override = _get_override_bool(
             rag_eval_override, "bilingual_rewrite_enabled"
         )
+        routed = self._route_query_strategy(query) if rag_eval_override is None else None
+        if routed:
+            rerank_enabled_override = (
+                routed.get("rerank_enabled")
+                if rerank_enabled_override is None
+                else rerank_enabled_override
+            )
+            hyde_enabled_override = (
+                routed.get("hyde_enabled")
+                if hyde_enabled_override is None
+                else hyde_enabled_override
+            )
+            bilingual_rewrite_enabled_override = (
+                routed.get("bilingual_rewrite_enabled")
+                if bilingual_rewrite_enabled_override is None
+                else bilingual_rewrite_enabled_override
+            )
+
+        if rag_eval_override is not None:
+            self._logger.info(
+                "RAG eval override applied: rerank=%s hyde=%s bilingual=%s",
+                rerank_enabled_override,
+                hyde_enabled_override,
+                bilingual_rewrite_enabled_override,
+            )
+        elif routed:
+            self._logger.info(
+                "RAG query strategy route: profile=%s strategy=%s query=%r",
+                routed.get("profile"),
+                routed.get("strategy"),
+                _truncate_for_log(query, 160),
+            )
 
         query_variants = self._expand_queries(
             query,
@@ -271,6 +304,61 @@ class RAGService:
             bilingual_rewrite_enabled=bilingual_rewrite_enabled_override,
         )
 
+    def _route_query_strategy(self, query: str) -> dict[str, object] | None:
+        if not _parse_bool_env("RAG_QUERY_STRATEGY_ROUTING_ENABLED", False):
+            return None
+        text = (query or "").strip()
+        if not text:
+            return None
+
+        profile = _profile_query(text)
+        has_zh = bool(profile["has_zh"])
+        has_en = bool(profile["has_en"])
+        title_like = bool(profile["title_like"])
+        cross_lingual = bool(profile["cross_lingual"])
+        multi_concept = bool(profile["multi_concept"])
+        multi_relevant = bool(profile["multi_relevant_hint"])
+
+        strategy = "passthrough"
+        rerank = None
+        hyde = None
+        bilingual = None
+
+        # Low-cost path for title-like queries (exact/near-exact filenames/titles).
+        if title_like and not cross_lingual and not multi_concept and not multi_relevant:
+            strategy = "dense_only_title_like"
+            rerank = False
+            hyde = False
+            bilingual = False
+        # Hard mixed-language / multi-target queries: enable all three.
+        elif cross_lingual and (multi_concept or multi_relevant):
+            strategy = "dense_hyde_rerank_bilingual"
+            rerank = True
+            hyde = True
+            bilingual = True
+        # Cross-lingual without explicit multi-target: prefer bilingual + rerank.
+        elif cross_lingual:
+            strategy = "dense_rerank_bilingual"
+            rerank = True
+            hyde = False
+            bilingual = True
+        # Semantic/multi-concept monolingual queries: rerank usually gives best cost/quality tradeoff.
+        elif multi_concept or multi_relevant or (has_zh or has_en):
+            strategy = "dense_rerank_semantic"
+            rerank = True
+            hyde = False
+            bilingual = False
+
+        if strategy == "passthrough":
+            return None
+        return {
+            "strategy": strategy,
+            "profile": profile,
+            "rerank_enabled": rerank,
+            "hyde_enabled": hyde,
+            "bilingual_rewrite_enabled": bilingual,
+        }
+
     def _vector_search_multi(
         self,
         variants: List[QueryVariant],
@@ -389,10 +477,53 @@ def _parse_int_env(name: str, default: int) -> int:
 def _get_override_bool(override: object | None, attr: str) -> bool | None:
     if override is None:
         return None
-    try:
-        value = getattr(override, attr, None)
-    except Exception:
-        return None
+    value: Any
+    if isinstance(override, Mapping):
+        value = override.get(attr)
+    else:
+        try:
+            value = getattr(override, attr, None)
+        except Exception:
+            return None
     if value is None:
         return None
     return bool(value)
+
+
+_ZH_RE = re.compile(r"[\u4e00-\u9fff]")
+_EN_RE = re.compile(r"[A-Za-z]")
+_TITLE_HINT_RE = re.compile(
+    r"(?i)(^week\s*\d+|ebu6502|lecture|tutorial|introduction|advanced|hadoop|mapreduce|cuda|\.pdf\b)"
+)
+_MULTI_CONCEPT_RE = re.compile(
+    r"(?i)(\+|/| and | both | together | rather than |\bvs\b|与|以及|同时|并且|而不是|两份|都算相关)"
+)
+
+
+def _profile_query(query: str) -> dict[str, bool]:
+    text = (query or "").strip()
+    has_zh = bool(_ZH_RE.search(text))
+    has_en = bool(_EN_RE.search(text))
+    normalized = f" {text.lower()} "
+    title_like = bool(_TITLE_HINT_RE.search(text)) and len(text) <= 180
+    multi_concept = bool(_MULTI_CONCEPT_RE.search(normalized))
+    multi_relevant_hint = any(token in text for token in ("两份都算相关", "都算相关", "multiple", "both"))
+    cross_lingual = (has_zh and has_en) or (
+        has_zh
+        and any(term in normalized for term in (" cuda", " hadoop", " mapreduce", " nosql", " graph", " sla", " gpu"))
+    )
+    return {
+        "has_zh": has_zh,
+        "has_en": has_en,
+        "title_like": title_like,
+        "cross_lingual": cross_lingual,
+        "multi_concept": multi_concept,
+        "multi_relevant_hint": multi_relevant_hint,
+    }
+
+
+def _truncate_for_log(text: str, max_chars: int) -> str:
+    value = (text or "").replace("\n", " ").strip()
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars].rstrip() + "..."
