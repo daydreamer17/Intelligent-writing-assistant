@@ -217,6 +217,18 @@ curl -X POST http://127.0.0.1:8000/api/rag/search ^
 
 11. 注意：线上动态检索策略路由（`RAG_QUERY_STRATEGY_ROUTING_ENABLED`）主要影响 `/api/rag/search`、Pipeline、写作接口；baseline 脚本默认通过 `rag_config_override` 固定策略组合，不直接使用该自动路由。
 
+当前评测结果快照（`evals/retrieval_eval_small_hard.json`，`--include-bilingual-baselines --repeats 5`）：
+
+| Baseline | Recall@5 | Precision@5 | HitRate@5 | MRR@5 | nDCG@5 |
+|---|---:|---:|---:|---:|---:|
+| dense_only | 95.8% ± 0.0% | 21.7% ± 0.0% | 100.0% ± 0.0% | 0.806 ± 0.000 | 0.845 ± 0.000 |
+| dense_rerank | 98.3% ± 2.0% | 22.7% ± 0.8% | 100.0% ± 0.0% | 0.861 ± 0.035 | 0.888 ± 0.027 |
+| dense_hyde_rerank | 97.5% ± 2.0% | 22.3% ± 0.8% | 100.0% ± 0.0% | 0.875 ± 0.052 | 0.894 ± 0.038 |
+| dense_rerank_bilingual | 96.7% ± 1.7% | 22.0% ± 0.7% | 100.0% ± 0.0% | 0.839 ± 0.027 | 0.867 ± 0.021 |
+| dense_hyde_rerank_bilingual | 96.7% ± 1.7% | 22.0% ± 0.7% | 100.0% ± 0.0% | 0.856 ± 0.044 | 0.879 ± 0.034 |
+
+> Agent 行为回归小套件：17/17 通过。
+
 ### 引用与设置
 - `POST /api/citations`
 - `GET /api/settings/generation-mode`

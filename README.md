@@ -197,6 +197,18 @@ python scripts/run_retrieval_baselines.py --eval evals/retrieval_eval_small_hard
 - 主报告写入你指定的 `xxx.md`
 - 详情报告自动写入同目录同名后缀：`xxx_details.md`
 
+6. 当前评测结果快照（`evals/retrieval_eval_small_hard.json`，`--include-bilingual-baselines --repeats 5`）
+
+| Baseline | Recall@5 | Precision@5 | HitRate@5 | MRR@5 | nDCG@5 |
+|---|---:|---:|---:|---:|---:|
+| dense_only | 95.8% ± 0.0% | 21.7% ± 0.0% | 100.0% ± 0.0% | 0.806 ± 0.000 | 0.845 ± 0.000 |
+| dense_rerank | 98.3% ± 2.0% | 22.7% ± 0.8% | 100.0% ± 0.0% | 0.861 ± 0.035 | 0.888 ± 0.027 |
+| dense_hyde_rerank | 97.5% ± 2.0% | 22.3% ± 0.8% | 100.0% ± 0.0% | 0.875 ± 0.052 | 0.894 ± 0.038 |
+| dense_rerank_bilingual | 96.7% ± 1.7% | 22.0% ± 0.7% | 100.0% ± 0.0% | 0.839 ± 0.027 | 0.867 ± 0.021 |
+| dense_hyde_rerank_bilingual | 96.7% ± 1.7% | 22.0% ± 0.7% | 100.0% ± 0.0% | 0.856 ± 0.044 | 0.879 ± 0.034 |
+
+> Agent 行为回归小套件：17/17 通过（引用存在性、证据不足拒答/标注、模式切换生效）。
+
 ## 8. 更新日志
 
 ### v0.5.5 (2026-02-25)
