@@ -118,7 +118,7 @@ def _format_result(raw: str, *, max_repos: int, max_chars: int) -> str:
     try:
         data = json.loads(raw)
     except Exception:
-        return raw[:max_chars]
+        return "" if _looks_like_empty_or_diagnostic_text(raw) else raw[:max_chars]
 
     items = None
     if isinstance(data, dict):
@@ -126,7 +126,9 @@ def _format_result(raw: str, *, max_repos: int, max_chars: int) -> str:
         if items is None:
             items = data.get("data")
     if not isinstance(items, list):
-        return raw[:max_chars]
+        return "" if _looks_like_empty_or_diagnostic_text(raw) else raw[:max_chars]
+    if not items:
+        return ""
 
     lines = []
     for item in items[:max_repos]:
@@ -143,4 +145,22 @@ def _format_result(raw: str, *, max_repos: int, max_chars: int) -> str:
         lines.append(line.strip())
 
     text = "\n".join(lines).strip()
-    return text[:max_chars] if text else raw[:max_chars]
+    return text[:max_chars] if text else ""
+
+
+def _looks_like_empty_or_diagnostic_text(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return True
+    diagnostic_markers = (
+        "no results",
+        "no repositories found",
+        "not found",
+        "没有返回",
+        "未找到",
+        "没有找到",
+        "建议进一步明确搜索关键词",
+        "当前工具未能正确检索",
+        "根据目前的工具执行结果",
+    )
+    return any(marker in lowered for marker in diagnostic_markers)

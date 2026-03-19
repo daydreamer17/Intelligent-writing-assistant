@@ -1,6 +1,7 @@
 from .citations import router as citations_router
 from .mcp_github import router as mcp_github_router
 from .pipeline import router as pipeline_router
+from .pipeline_v2 import router as pipeline_v2_router
 from .rag import router as rag_router
 from .settings import router as settings_router
 from .versions import router as versions_router
@@ -10,6 +11,7 @@ __all__ = [
     "citations_router",
     "mcp_github_router",
     "pipeline_router",
+    "pipeline_v2_router",
     "rag_router",
     "settings_router",
     "versions_router",

@@ -1,6 +1,9 @@
 <template>
-  <div v-if="visible" class="progress-overlay">
-    <div class="progress-card">
+  <div
+    v-if="visible"
+    :class="inline ? 'progress-inline' : 'progress-overlay'"
+  >
+    <div class="progress-card" :class="{ 'progress-card--inline': inline }">
       <h3>{{ title }}</h3>
       <div class="progress-steps">
         <div
@@ -35,12 +38,14 @@ interface Props {
   title?: string;
   steps: string[];
   currentStep: number;
+  inline?: boolean;
 }
 
 const props = withDefaults(defineProps<Props>(), {
   title: '处理中',
   visible: false,
   currentStep: 0,
+  inline: false,
 });
 
 const progressPercent = computed(() => {
@@ -77,6 +82,18 @@ const progressText = computed(() => {
   min-width: 400px;
   max-width: 600px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.progress-inline {
+  width: 100%;
+}
+
+.progress-card--inline {
+  min-width: 0;
+  max-width: none;
+  box-shadow: none;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  background: #f8fafc;
 }
 
 .progress-card h3 {

@@ -52,3 +52,32 @@ export interface PipelineResponse {
   coverage_detail?: CoverageDetail;
   citation_enforced?: boolean;
 }
+
+export interface PipelineV2Request extends PipelineRequest {
+  thread_id?: string;
+}
+
+export interface PipelineV2ResumeRequest {
+  thread_id: string;
+  outline_override?: string;
+}
+
+export interface PipelineV2InterruptPayload {
+  thread_id?: string;
+  outline?: string;
+  assumptions?: string;
+  open_questions?: string;
+  [key: string]: unknown;
+}
+
+export interface PipelineV2Interrupt {
+  kind: string;
+  payload: PipelineV2InterruptPayload;
+}
+
+export interface PipelineV2Response {
+  status: "interrupted" | "completed";
+  thread_id: string;
+  interrupt?: PipelineV2Interrupt | null;
+  result?: PipelineResponse | null;
+}

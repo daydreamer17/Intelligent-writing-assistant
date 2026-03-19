@@ -75,26 +75,55 @@ class CitationEnforcer:
         covered_paragraphs = 0
         enforced_paragraphs: List[str] = []
         paragraph_tokens: List[List[str]] = []
+        paragraph_texts: List[str] = []
+        paragraph_best_matches: List[Tuple[int | None, float]] = []
 
         for para in paragraphs:
             stripped = para.strip()
             if not stripped:
                 continue
+            paragraph_texts.append(stripped)
             tokens = self._tokenize(stripped)
             paragraph_tokens.append(tokens)
             total_tokens += len(tokens)
             best_idx, best_ratio = self._best_match(tokens, note_tokens)
+            paragraph_best_matches.append((best_idx, best_ratio))
             if best_ratio >= self._threshold:
                 covered_tokens += len(tokens)
                 covered_paragraphs += 1
+
+        semantic_matches = self._semantic_best_matches(
+            paragraphs=paragraph_texts,
+            notes=notes_list,
+            embedder=embedder,
+        )
+
+        for idx, stripped in enumerate(paragraph_texts):
+            best_idx, best_ratio = paragraph_best_matches[idx]
+            semantic_idx, semantic_score = semantic_matches[idx]
+
             if apply_labels and not _has_citation(stripped, labels) and labels:
-                # strict: preserve legacy behavior (always backfill a label)
-                # non-strict: only label paragraphs with enough evidence overlap
+                chosen_idx: int | None = None
                 if strict_labels:
-                    label = labels[best_idx] if best_idx is not None else labels[0]
-                    stripped = f"{stripped} {label}"
+                    chosen_idx = best_idx if best_idx is not None else semantic_idx
+                    if chosen_idx is None:
+                        chosen_idx = 0
                 elif best_idx is not None and best_ratio >= self._threshold:
-                    stripped = f"{stripped} {labels[best_idx]}"
+                    chosen_idx = best_idx
+                elif semantic_idx is not None:
+                    chosen_idx = semantic_idx
+
+                if chosen_idx is not None:
+                    stripped = f"{stripped} {labels[chosen_idx]}"
+
+            if semantic_idx is not None and best_ratio < self._threshold:
+                logger.info(
+                    "Citation semantic backfill matched paragraph=%s note=%s score=%.3f",
+                    idx,
+                    semantic_idx,
+                    semantic_score,
+                )
+
             enforced_paragraphs.append(stripped)
 
         if apply_labels and strict_labels and _parse_bool_env("RAG_CITATION_REQUIRE_ALL_LABELS", True):
@@ -295,6 +324,52 @@ class CitationEnforcer:
                 covered += 1
         ratio = covered / len(para_slice) if para_slice else 0.0
         return ratio, covered, len(para_slice)
+
+    def _semantic_best_matches(
+        self,
+        *,
+        paragraphs: List[str],
+        notes: List[ResearchNote],
+        embedder: Embedder | None,
+    ) -> List[Tuple[int | None, float]]:
+        matches: List[Tuple[int | None, float]] = [(None, 0.0) for _ in paragraphs]
+        if not embedder or not _parse_bool_env("RAG_COVERAGE_SEMANTIC_ENABLED", default=False):
+            return matches
+        if not paragraphs or not notes:
+            return matches
+
+        max_paragraphs = max(1, _parse_int_env("RAG_COVERAGE_SEMANTIC_MAX_PARAGRAPHS", 20))
+        max_notes = max(1, _parse_int_env("RAG_COVERAGE_SEMANTIC_MAX_NOTES", 12))
+        threshold = _parse_float_env("RAG_COVERAGE_SEMANTIC_THRESHOLD", 0.25)
+        batch_size = max(1, _parse_int_env("RAG_COVERAGE_SEMANTIC_BATCH_SIZE", 8))
+        max_text_chars = max(200, _parse_int_env("RAG_COVERAGE_SEMANTIC_MAX_TEXT_CHARS", 2000))
+
+        para_slice = [_trim_text(item, max_text_chars) for item in paragraphs[:max_paragraphs]]
+        note_texts = [
+            _trim_text((note.title + " " + note.summary).strip(), max_text_chars)
+            for note in notes[:max_notes]
+        ]
+        texts = para_slice + note_texts
+        embeddings = self._embed_texts_robust(embedder=embedder, texts=texts, batch_size=batch_size)
+        if embeddings is None:
+            return matches
+
+        para_vecs = embeddings[: len(para_slice)]
+        note_vecs = embeddings[len(para_slice) :]
+        if not note_vecs:
+            return matches
+
+        for idx, para_vec in enumerate(para_vecs):
+            best_idx: int | None = None
+            best_score = 0.0
+            for note_idx, note_vec in enumerate(note_vecs):
+                score = _cosine(para_vec, note_vec)
+                if score > best_score:
+                    best_idx = note_idx
+                    best_score = score
+            if best_idx is not None and best_score >= threshold:
+                matches[idx] = (best_idx, best_score)
+        return matches
 
     def _embed_texts_robust(
         self,

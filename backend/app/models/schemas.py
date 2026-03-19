@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -123,6 +123,27 @@ class PipelineResponse(BaseModel):
     coverage: float | None = None
     coverage_detail: CoverageDetail | None = None
     citation_enforced: bool = False
+
+
+class PipelineV2Request(PipelineRequest):
+    thread_id: str = Field("", description="LangGraph 运行线程ID；为空时自动生成")
+
+
+class PipelineV2ResumeRequest(BaseModel):
+    thread_id: str = Field(..., description="LangGraph 运行线程ID")
+    outline_override: str = Field("", description="人工修订后的大纲；为空时沿用原大纲")
+
+
+class PipelineV2Interrupt(BaseModel):
+    kind: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class PipelineV2Response(BaseModel):
+    status: Literal["interrupted", "completed"]
+    thread_id: str
+    interrupt: PipelineV2Interrupt | None = None
+    result: PipelineResponse | None = None
 
 
 class UploadDocumentsRequest(BaseModel):

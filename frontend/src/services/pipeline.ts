@@ -1,5 +1,11 @@
 import { getApi } from "./api";
-import type { PipelineRequest, PipelineResponse } from "../types";
+import type {
+  PipelineRequest,
+  PipelineResponse,
+  PipelineV2Request,
+  PipelineV2Response,
+  PipelineV2ResumeRequest,
+} from "../types";
 import { useAppStore } from "../store";
 
 export const runPipeline = async (payload: PipelineRequest) => {
@@ -9,18 +15,34 @@ export const runPipeline = async (payload: PipelineRequest) => {
   return data;
 };
 
-export const runPipelineStream = async (
-  payload: PipelineRequest,
-  onEvent: (event: any) => void
+export const runPipelineV2 = async (payload: PipelineV2Request) => {
+  const { data } = await getApi().post<PipelineV2Response>("/api/pipeline/v2", payload, {
+    timeout: 1800000,
+  });
+  return data;
+};
+
+export const resumePipelineV2 = async (payload: PipelineV2ResumeRequest) => {
+  const { data } = await getApi().post<PipelineV2Response>("/api/pipeline/v2/resume", payload, {
+    timeout: 1800000,
+  });
+  return data;
+};
+
+const runEventStream = async (
+  path: string,
+  payload: unknown,
+  onEvent: (event: any) => void,
+  options?: { allowInterrupt?: boolean }
 ) => {
   const store = useAppStore();
+  const allowInterrupt = Boolean(options?.allowInterrupt);
 
-  // 创建 AbortController 用于超时控制
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 1800000); // 30分钟超时
+  const timeoutId = setTimeout(() => controller.abort(), 1800000);
 
   try {
-    const response = await fetch(`${store.apiBase}/api/pipeline/stream`, {
+    const response = await fetch(`${store.apiBase}${path}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -37,16 +59,16 @@ export const runPipelineStream = async (
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
     let lastActivityTime = Date.now();
-    const activityTimeout = 600000; // 10分钟无数据才认为连接断开
+    const activityTimeout = 600000;
     let receivedResult = false;
     let receivedAny = false;
     let receivedError = false;
+    let receivedInterrupt = false;
     let errorDetail = "";
     let shouldStop = false;
 
     try {
       while (!shouldStop) {
-        // 检查是否长时间无数据
         if (Date.now() - lastActivityTime > activityTimeout) {
           throw new Error("Stream timeout: no data received for 10 minutes");
         }
@@ -78,11 +100,13 @@ export const runPipelineStream = async (
             if (evt?.type === "result") {
               receivedResult = true;
             }
+            if (evt?.type === "interrupt") {
+              receivedInterrupt = true;
+            }
             if (evt?.type === "error") {
               receivedError = true;
               errorDetail = String(evt?.detail || "Pipeline stream failed");
             }
-            // 先标记终止态，再派发回调；避免回调异常导致前端无法退出 loading
             if (isTerminal) {
               shouldStop = true;
             }
@@ -110,10 +134,8 @@ export const runPipelineStream = async (
         try {
           await reader.cancel();
         } catch {
-          // ignore
         }
       }
-      // 处理残留 buffer（避免末尾没有换行导致丢失最后一条事件）
       if (!shouldStop && buffer.trim()) {
         const dataLines = buffer
           .split("\n")
@@ -131,6 +153,9 @@ export const runPipelineStream = async (
               if (evt?.type === "result") {
                 receivedResult = true;
               }
+              if (evt?.type === "interrupt") {
+                receivedInterrupt = true;
+              }
               if (evt?.type === "error") {
                 receivedError = true;
                 errorDetail = String(evt?.detail || "Pipeline stream failed");
@@ -144,7 +169,6 @@ export const runPipelineStream = async (
                 // ignore callback errors
               }
             } catch {
-              // ignore parse errors
             }
           }
         }
@@ -154,6 +178,9 @@ export const runPipelineStream = async (
     if (receivedError) {
       throw new Error(errorDetail || "Pipeline stream failed");
     }
+    if (allowInterrupt && receivedInterrupt) {
+      return;
+    }
     if (!receivedResult) {
       if (receivedAny) {
         throw new Error("Pipeline stream ended before final result");
@@ -161,6 +188,27 @@ export const runPipelineStream = async (
       throw new Error("Stream ended before receiving any pipeline event");
     }
   } finally {
-    clearTimeout(timeoutId); // 清除超时定时器
+    clearTimeout(timeoutId);
   }
+};
+
+export const runPipelineStream = async (
+  payload: PipelineRequest,
+  onEvent: (event: any) => void
+) => {
+  return runEventStream("/api/pipeline/stream", payload, onEvent);
+};
+
+export const runPipelineV2Stream = async (
+  payload: PipelineV2Request,
+  onEvent: (event: any) => void
+) => {
+  return runEventStream("/api/pipeline/v2/stream", payload, onEvent, { allowInterrupt: true });
+};
+
+export const resumePipelineV2Stream = async (
+  payload: PipelineV2ResumeRequest,
+  onEvent: (event: any) => void
+) => {
+  return runEventStream("/api/pipeline/v2/resume/stream", payload, onEvent);
 };

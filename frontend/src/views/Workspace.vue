@@ -55,19 +55,22 @@
         <textarea v-model="form.outline" rows="4"></textarea>
       </div>
       <div style="display:flex; gap:12px; flex-wrap:wrap;">
-        <button class="btn" @click="handlePipeline" :disabled="loading.pipeline">一键 Pipeline</button>
-        <button class="btn secondary" @click="handlePlan" :disabled="loading.plan">仅生成大纲</button>
-        <button class="btn ghost" @click="handleDraft" :disabled="loading.draft">生成草稿</button>
-        <button class="btn ghost" @click="handleReview" :disabled="loading.review">审校</button>
-        <button class="btn ghost" @click="handleRewrite" :disabled="loading.rewrite">改写</button>
+        <button class="btn" @click="handlePipeline" :disabled="loading.pipeline || loading.pipelineV2">一键 Pipeline</button>
+        <button class="btn secondary" @click="handlePlan" :disabled="loading.plan || loading.pipelineV2">仅生成大纲</button>
+        <button class="btn ghost" @click="handleDraft" :disabled="loading.draft || loading.pipelineV2">生成草稿</button>
+        <button class="btn ghost" @click="handleReview" :disabled="loading.review || loading.pipelineV2">审校</button>
+        <button class="btn ghost" @click="handleRewrite" :disabled="loading.rewrite || loading.pipelineV2">改写</button>
+        <button class="btn secondary" @click="handlePipelineV2" :disabled="isPrimaryActionDisabled">
+          {{ loading.pipelineV2 ? "LangGraph v2 中..." : "LangGraph v2 Demo" }}
+        </button>
         <button
           class="btn ghost"
           @click="handleResetSessionMemory"
-          :disabled="loading.pipeline || sessionMemoryResetting"
+          :disabled="loading.pipeline || loading.pipelineV2 || sessionMemoryResetting"
         >
           {{ sessionMemoryResetting ? "重置中..." : "重置会话记忆" }}
         </button>
-        <button class="btn ghost" @click="clearGenerated" :disabled="loading.pipeline || loading.draft || loading.review || loading.rewrite">清空生成内容</button>
+        <button class="btn ghost" @click="clearGenerated" :disabled="loading.pipeline || loading.pipelineV2 || loading.draft || loading.review || loading.rewrite">清空生成内容</button>
         <button class="btn ghost" @click="exportText">导出 TXT</button>
         <button class="btn ghost" @click="exportMarkdown">导出 MD</button>
         <button class="btn ghost" @click="exportHtml">导出 HTML</button>
@@ -115,6 +118,66 @@
       <div v-if="error" class="muted">错误：{{ error }}</div>
     </div>
 
+    <section v-if="pipelineV2.status !== 'idle'" class="card v2-panel">
+      <div class="v2-panel__header">
+        <div>
+          <h3>LangGraph v2 Demo</h3>
+          <p class="muted">当前状态：{{ pipelineV2StatusText }}</p>
+        </div>
+        <div class="v2-panel__actions">
+          <button
+            v-if="pipelineV2.status === 'interrupted'"
+            class="btn"
+            @click="handlePipelineV2Resume"
+            :disabled="loading.pipelineV2 || !pipelineV2.threadId"
+          >
+            {{ loading.pipelineV2 ? "恢复中..." : "继续执行 / Resume" }}
+          </button>
+          <button class="btn ghost" @click="resetPipelineV2State" :disabled="loading.pipelineV2">
+            清空/退出演示状态
+          </button>
+        </div>
+      </div>
+
+      <ProgressIndicator
+        :visible="showPipelineV2Progress"
+        title="LangGraph v2 子阶段"
+        :steps="pipelineV2Steps"
+        :current-step="currentPipelineV2Step"
+        :inline="true"
+      />
+
+      <div class="v2-panel__meta">
+        <div><span class="v2-panel__label">thread_id：</span>{{ pipelineV2.threadId || "-" }}</div>
+        <div v-if="pipelineV2.status === 'completed'" class="muted">已基于该 thread_id 恢复执行并完成。</div>
+      </div>
+
+      <div v-if="pipelineV2.assumptions" class="field">
+        <label>Assumptions</label>
+        <div class="v2-panel__text">{{ pipelineV2.assumptions }}</div>
+      </div>
+
+      <div v-if="pipelineV2.openQuestions" class="field">
+        <label>Open Questions</label>
+        <div class="v2-panel__text">{{ pipelineV2.openQuestions }}</div>
+      </div>
+
+      <div class="field">
+        <label>{{ pipelineV2.status === 'completed' ? '最终采用的大纲' : 'Outline Review' }}</label>
+        <textarea
+          v-model="pipelineV2.outlineDraft"
+          rows="8"
+          :readonly="pipelineV2.status !== 'interrupted'"
+          :placeholder="pipelineV2.status === 'interrupted' ? '你可以在这里编辑大纲，然后点击 Resume。' : ''"
+        />
+        <div v-if="pipelineV2.status === 'interrupted'" class="muted">
+          如果保留为空，Resume 时会沿用后端保存的原 outline，不会删除大纲。
+        </div>
+      </div>
+
+      <div v-if="pipelineV2.error" class="muted">V2 错误：{{ pipelineV2.error }}</div>
+    </section>
+
     <div class="grid-2">
       <OutlinePanel
         :outline="output.outline"
@@ -150,7 +213,11 @@ import { computed, reactive, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { useAppStore } from "../store";
 import { draftStream, plan, reviewStream, rewriteStream } from "../services/writing";
-import { runPipelineStream } from "../services/pipeline";
+import {
+  runPipelineStream,
+  runPipelineV2Stream,
+  resumePipelineV2Stream,
+} from "../services/pipeline";
 import { getHealthDetail } from "../services/health";
 import {
   clearSessionMemory,
@@ -161,7 +228,13 @@ import {
 import { handleApiError } from "../utils/errorHandler";
 import { validatePipelineRequest, validateDraftRequest, validateReviewRequest, validateRewriteRequest } from "../utils/validation";
 import { debounce } from "../utils/debounce";
-import type { PipelineRequest, HealthDetailResponse, CoverageDetail } from "../types";
+import type {
+  PipelineRequest,
+  PipelineResponse,
+  PipelineV2Request,
+  HealthDetailResponse,
+  CoverageDetail,
+} from "../types";
 import OutlinePanel from "../components/OutlinePanel.vue";
 import DraftEditor from "../components/DraftEditor.vue";
 import ReviewPanel from "../components/ReviewPanel.vue";
@@ -229,6 +302,18 @@ const loading = reactive({
   review: false,
   rewrite: false,
   pipeline: false,
+  pipelineV2: false,
+});
+
+type PipelineV2UiStatus = "idle" | "planning" | "interrupted" | "resuming" | "completed" | "error";
+
+const pipelineV2 = reactive({
+  status: "idle" as PipelineV2UiStatus,
+  threadId: "",
+  outlineDraft: "",
+  assumptions: "",
+  openQuestions: "",
+  error: "",
 });
 
 const error = ref("");
@@ -254,6 +339,18 @@ const pipelineStageIndex: Record<string, number> = {
   citations: 5,
 };
 
+const pipelineV2Steps = ['生成大纲', '等待人工修订', '收集研究笔记', '创作初稿', '审阅反馈', '修改润色', '生成引用'];
+const currentPipelineV2Step = ref(0);
+const pipelineV2StageIndex: Record<string, number> = {
+  plan: 0,
+  interrupted: 1,
+  research: 2,
+  draft: 3,
+  review: 4,
+  rewrite: 5,
+  citations: 6,
+};
+
 const generationModeDescriptionMap: Record<GenerationMode, string> = {
   rag_only: "RAG-only：仅证据输出、禁外部资料、缺证据会停",
   hybrid: "Hybrid：允许补全，非证据段落自动标注 [推断]",
@@ -270,6 +367,30 @@ const showCoverageMetrics = computed(() => {
   return Boolean(output.coverage_detail || output.coverage !== undefined);
 });
 
+const isPrimaryActionDisabled = computed(
+  () =>
+    loading.pipeline ||
+    loading.pipelineV2 ||
+    loading.plan ||
+    loading.draft ||
+    loading.review ||
+    loading.rewrite ||
+    sessionMemoryResetting.value
+);
+
+const pipelineV2StatusTextMap: Record<PipelineV2UiStatus, string> = {
+  idle: "Idle",
+  planning: "Planning",
+  interrupted: "Interrupted - waiting for outline review",
+  resuming: "Resuming",
+  completed: "Completed",
+  error: "Error",
+};
+
+const pipelineV2StatusText = computed(() => pipelineV2StatusTextMap[pipelineV2.status]);
+
+const showPipelineV2Progress = computed(() => pipelineV2.status !== "idle" && pipelineV2.status !== "error");
+
 const hasText = (value: string | null | undefined) => Boolean((value || "").trim());
 
 const buildRewriteGuidance = () => {
@@ -282,6 +403,74 @@ const buildRewriteGuidance = () => {
 const resetError = () => {
   error.value = "";
 };
+
+const resetPipelineProgress = () => {
+  loading.pipeline = false;
+  currentPipelineStep.value = 0;
+};
+
+const resetPipelineV2State = () => {
+  pipelineV2.status = "idle";
+  pipelineV2.threadId = "";
+  pipelineV2.outlineDraft = "";
+  pipelineV2.assumptions = "";
+  pipelineV2.openQuestions = "";
+  pipelineV2.error = "";
+  currentPipelineV2Step.value = 0;
+  loading.pipelineV2 = false;
+};
+
+const applyPipelineResponse = (res: PipelineResponse) => {
+  output.outline = res.outline;
+  output.assumptions = res.assumptions;
+  output.open_questions = res.open_questions;
+  output.research_notes = res.research_notes || [];
+  output.draft = res.draft || output.draft;
+  output.review = res.review || output.review;
+  output.revised = res.revised || output.revised;
+  output.bibliography = res.bibliography;
+  output.version_id = res.version_id;
+  output.citations = res.citations || [];
+  if (res.citation_enforced) {
+    output.revised = res.revised;
+  }
+  if (typeof res.coverage === "number") {
+    output.coverage = res.coverage;
+  }
+  if (res.coverage_detail) {
+    output.coverage_detail = res.coverage_detail;
+  }
+};
+
+const applyPipelineV2InterruptPayload = (payload: Record<string, unknown> | undefined) => {
+  pipelineV2.outlineDraft = payload?.outline ? String(payload.outline) : "";
+  pipelineV2.assumptions = payload?.assumptions ? String(payload.assumptions) : "";
+  pipelineV2.openQuestions = payload?.open_questions ? String(payload.open_questions) : "";
+  output.outline = pipelineV2.outlineDraft;
+  output.assumptions = pipelineV2.assumptions;
+  output.open_questions = pipelineV2.openQuestions;
+  form.outline = pipelineV2.outlineDraft;
+};
+
+const buildSourceDocuments = () =>
+  ragSnippets.value.map((content, idx) => ({
+    doc_id: `snippet-${Date.now()}-${idx}`,
+    title: `RAG片段 ${idx + 1}`,
+    content,
+    url: "",
+  }));
+
+const buildPipelineRequestPayload = (): PipelineRequest => ({
+  topic: form.topic,
+  audience: form.audience,
+  style: form.style,
+  target_length: form.target_length,
+  constraints: form.constraints,
+  key_points: form.key_points,
+  review_criteria: form.review_criteria,
+  sources: buildSourceDocuments(),
+  session_id: sessionId.value,
+});
 
 const resetSessionMemoryForNewTask = async () => {
   await clearSessionMemory({
@@ -307,9 +496,189 @@ const clearGenerated = () => {
   showToast("已清空生成内容");
 };
 
+const handlePipelineV2 = async () => {
+  try {
+    resetError();
+    pipelineV2.error = "";
+    resetPipelineProgress();
+
+    const validation = validatePipelineRequest({
+      topic: form.topic,
+      audience: form.audience,
+      style: form.style,
+      target_length: form.target_length,
+    });
+    if (!validation.valid) {
+      const message = validation.errors.join("; ");
+      error.value = message;
+      pipelineV2.status = "error";
+      pipelineV2.error = message;
+      return;
+    }
+
+    await resetSessionMemoryForNewTask();
+    loading.pipelineV2 = true;
+    pipelineV2.status = "planning";
+    currentPipelineV2Step.value = pipelineV2StageIndex.plan;
+    pipelineV2.threadId = "";
+    pipelineV2.outlineDraft = "";
+    pipelineV2.assumptions = "";
+    pipelineV2.openQuestions = "";
+    output.outline = "";
+    output.assumptions = "";
+    output.open_questions = "";
+
+    const payload: PipelineV2Request = {
+      ...buildPipelineRequestPayload(),
+    };
+    await runPipelineV2Stream(payload, (evt) => {
+      if (evt.type === "status" && evt.step === "plan") {
+        currentPipelineV2Step.value = pipelineV2StageIndex.plan;
+      }
+      if (evt.type === "delta" && evt.stage === "plan") {
+        pipelineV2.outlineDraft += evt.content || "";
+        output.outline = pipelineV2.outlineDraft;
+      }
+      if (evt.type === "outline") {
+        applyPipelineV2InterruptPayload(evt.payload || {});
+      }
+      if (evt.type === "interrupt") {
+        pipelineV2.status = "interrupted";
+        currentPipelineV2Step.value = pipelineV2StageIndex.interrupted;
+        pipelineV2.threadId = String(evt.payload?.thread_id || "");
+        applyPipelineV2InterruptPayload(evt.payload || {});
+        showToast("LangGraph v2 已中断，等待人工修订大纲");
+      }
+      if (evt.type === "error") {
+        const message = evt.detail || "LangGraph v2 执行失败";
+        error.value = message;
+        pipelineV2.status = "error";
+        pipelineV2.error = message;
+      }
+    });
+
+    if (pipelineV2.status === "planning") {
+      throw new Error("LangGraph v2 流式执行结束，但未收到 interrupt 事件");
+    }
+  } catch (err) {
+    const message = handleApiError(err);
+    error.value = message;
+    pipelineV2.status = "error";
+    pipelineV2.error = message;
+  } finally {
+    loading.pipelineV2 = false;
+  }
+};
+
+const handlePipelineV2Resume = async () => {
+  if (!pipelineV2.threadId) {
+    const message = "缺少 thread_id，无法继续执行";
+    error.value = message;
+    pipelineV2.status = "error";
+    pipelineV2.error = message;
+    return;
+  }
+
+  try {
+    resetError();
+    pipelineV2.error = "";
+    resetPipelineProgress();
+    loading.pipelineV2 = true;
+    pipelineV2.status = "resuming";
+    currentPipelineV2Step.value = pipelineV2StageIndex.research;
+    output.research_notes = [];
+    output.draft = "";
+    output.review = "";
+    output.revised = "";
+    output.coverage = undefined;
+    output.coverage_detail = undefined;
+
+    await resumePipelineV2Stream(
+      {
+        thread_id: pipelineV2.threadId,
+        outline_override: pipelineV2.outlineDraft,
+      },
+      (evt) => {
+        if (evt.type === "status" && evt.step && evt.step in pipelineV2StageIndex) {
+          currentPipelineV2Step.value =
+            pipelineV2StageIndex[evt.step as keyof typeof pipelineV2StageIndex];
+        }
+        if (evt.type === "outline") {
+          applyPipelineV2InterruptPayload(evt.payload || {});
+        }
+        if (evt.type === "research") {
+          output.research_notes = evt.payload?.notes || [];
+        }
+        if (evt.type === "delta") {
+          if (evt.stage === "draft") {
+            output.draft += evt.content || "";
+          }
+          if (evt.stage === "review") {
+            output.review += evt.content || "";
+          }
+          if (evt.stage === "rewrite") {
+            output.revised += evt.content || "";
+          }
+        }
+        if (evt.type === "draft") {
+          output.draft = evt.payload?.draft || output.draft;
+        }
+        if (evt.type === "review") {
+          output.review = evt.payload?.review || output.review;
+        }
+        if (evt.type === "rewrite") {
+          output.revised = evt.payload?.revised || output.revised;
+          if (typeof evt.payload?.coverage === "number") {
+            output.coverage = evt.payload.coverage;
+          }
+          if (evt.payload?.coverage_detail) {
+            output.coverage_detail = evt.payload.coverage_detail;
+          }
+        }
+        if (evt.type === "interrupt") {
+          pipelineV2.status = "interrupted";
+          currentPipelineV2Step.value = pipelineV2StageIndex.interrupted;
+          pipelineV2.threadId = String(evt.payload?.thread_id || pipelineV2.threadId);
+          applyPipelineV2InterruptPayload(evt.payload || {});
+          showToast("LangGraph v2 仍处于等待修订状态");
+        }
+        if (evt.type === "result" && evt.payload) {
+          applyPipelineResponse(evt.payload);
+          pipelineV2.status = "completed";
+          currentPipelineV2Step.value = pipelineV2Steps.length;
+          pipelineV2.threadId = pipelineV2.threadId || String(evt.payload?.thread_id || "");
+          pipelineV2.outlineDraft = evt.payload.outline || pipelineV2.outlineDraft;
+          pipelineV2.assumptions = evt.payload.assumptions || pipelineV2.assumptions;
+          pipelineV2.openQuestions = evt.payload.open_questions || pipelineV2.openQuestions;
+          form.outline = evt.payload.outline || form.outline;
+          showToast("LangGraph v2 已恢复执行并完成");
+        }
+        if (evt.type === "error") {
+          const message = evt.detail || "LangGraph v2 Resume 执行失败";
+          error.value = message;
+          pipelineV2.status = "error";
+          pipelineV2.error = message;
+        }
+      }
+    );
+
+    if (pipelineV2.status === "resuming") {
+      throw new Error("LangGraph v2 Resume 流式执行结束，但未收到完成结果");
+    }
+  } catch (err) {
+    const message = handleApiError(err);
+    error.value = message;
+    pipelineV2.status = "error";
+    pipelineV2.error = message;
+  } finally {
+    loading.pipelineV2 = false;
+  }
+};
+
 const handlePlan = async () => {
   try {
     resetError();
+    resetPipelineV2State();
 
     // 表单验证
     if (!form.topic || form.topic.trim() === '') {
@@ -343,6 +712,7 @@ const handlePlan = async () => {
 const handleDraft = async () => {
   try {
     resetError();
+    resetPipelineV2State();
 
     // 表单验证
     const validation = validateDraftRequest({ topic: form.topic, outline: form.outline });
@@ -390,6 +760,7 @@ const handleDraft = async () => {
 const handleReview = async () => {
   try {
     resetError();
+    resetPipelineV2State();
 
     // 表单验证
     const validation = validateReviewRequest({ draft: output.draft || form.research_notes });
@@ -435,6 +806,7 @@ const handleReview = async () => {
 const handleRewrite = async () => {
   try {
     resetError();
+    resetPipelineV2State();
     const rewriteGuidance = buildRewriteGuidance();
 
     // 表单验证
@@ -495,6 +867,7 @@ const handleRewrite = async () => {
 const handlePipeline = async () => {
   try {
     resetError();
+    resetPipelineV2State();
 
     // 表单验证
     const validation = validatePipelineRequest({
@@ -524,25 +897,7 @@ const handlePipeline = async () => {
     output.coverage = undefined;
     output.coverage_detail = undefined;
 
-    // 将RAG snippets转换为sources格式
-    const sources = ragSnippets.value.map((content, idx) => ({
-      doc_id: `snippet-${Date.now()}-${idx}`,
-      title: `RAG片段 ${idx + 1}`,
-      content: content,
-      url: ""
-    }));
-
-    const payload: PipelineRequest = {
-      topic: form.topic,
-      audience: form.audience,
-      style: form.style,
-      target_length: form.target_length,
-      constraints: form.constraints,
-      key_points: form.key_points,
-      review_criteria: form.review_criteria,
-      sources: sources,
-      session_id: sessionId.value,
-    };
+    const payload: PipelineRequest = buildPipelineRequestPayload();
 
     await runPipelineStream(payload, (evt) => {
       if (evt.type === "status") {
@@ -613,30 +968,7 @@ const handlePipeline = async () => {
       if (evt.type === "result") {
         const res = evt.payload;
         currentPipelineStep.value = pipelineSteps.length;
-
-        // 只更新非流式字段，保留已经通过 delta 累积的内容
-        output.outline = res.outline;
-        output.assumptions = res.assumptions;
-        output.open_questions = res.open_questions;
-        output.research_notes = res.research_notes || [];
-
-        // 最终结果事件是服务端权威结果，统一覆盖，避免前端状态停留在中间态
-        output.draft = res.draft || output.draft;
-        output.review = res.review || output.review;
-        output.revised = res.revised || output.revised;
-
-        output.bibliography = res.bibliography;
-        output.version_id = res.version_id;
-        output.citations = res.citations || [];
-        if (res.citation_enforced) {
-          output.revised = res.revised;
-        }
-        if (typeof res.coverage === "number") {
-          output.coverage = res.coverage;
-        }
-        if (res.coverage_detail) {
-          output.coverage_detail = res.coverage_detail;
-        }
+        applyPipelineResponse(res);
         showToast("Pipeline 完成");
       }
       if (evt.type === "done") {
@@ -865,3 +1197,42 @@ const restoreAutoSave = () => {
 
 restoreAutoSave();
 </script>
+
+<style scoped>
+.v2-panel {
+  border: 1px solid rgba(41, 121, 255, 0.18);
+}
+
+.v2-panel__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.v2-panel__actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.v2-panel__meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 12px 0;
+}
+
+.v2-panel__label {
+  font-weight: 600;
+}
+
+.v2-panel__text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  line-height: 1.7;
+  font-size: 14px;
+}
+</style>

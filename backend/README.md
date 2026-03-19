@@ -136,6 +136,132 @@ LLM_TOOL_POLICY_DISABLE_WHEN_RAG_STRONG=true
 ### 一键流程
 - `POST /api/pipeline`
 - `POST /api/pipeline/stream`
+- `POST /api/pipeline/v2`
+- `POST /api/pipeline/v2/resume`
+- `POST /api/pipeline/v2/stream`
+- `POST /api/pipeline/v2/resume/stream`
+
+### LangGraph v2（最小接入）
+
+`/api/pipeline/v2` 不是对旧 Pipeline 的重写，而是在现有后端外层增加一条最小控制流入口，用来验证 LangGraph 的 interrupt / resume 能力，并且不影响旧 `/api/pipeline` 与 `/api/pipeline/stream`。目前同时提供同步版与 SSE 版，前端 Workspace 已接入最小演示闭环。
+
+#### v1 / v2 区别
+
+| 路径 | 控制流 | 中断能力 | 恢复能力 | 当前用途 |
+|---|---|---|---|---|
+| `/api/pipeline` | 旧同步全链路 | 无 | 无 | 生产主链路 |
+| `/api/pipeline/stream` | 旧 SSE 全链路 | 无 | 无 | 生产流式主链路 |
+| `/api/pipeline/v2` | LangGraph 最小工作流（同步） | 大纲后 interrupt | 通过 `/api/pipeline/v2/resume` | LangGraph 接入验证与后续扩展入口 |
+| `/api/pipeline/v2/stream` | LangGraph 最小工作流（SSE） | 大纲后 interrupt | 通过 `/api/pipeline/v2/resume/stream` | LangGraph 流式演示路径 |
+
+#### 当前 v2 只做什么
+
+- `plan`
+- `outline` 生成后 interrupt
+- `resume`
+- resume 之后继续复用现有 `collect_research_notes(...)`、`drafter.run_full(...)` 和现有 route helper 收尾
+- 同一条控制流同时支持：
+  - 同步：`/api/pipeline/v2`、`/api/pipeline/v2/resume`
+  - 流式：`/api/pipeline/v2/stream`、`/api/pipeline/v2/resume/stream`
+
+#### 当前限制
+
+- 只有一个 interrupt 点：大纲生成后
+- checkpointer 当前使用 SQLite 持久化存储
+- 只要 checkpoint 文件仍存在，服务重启后仍可使用同一个 `thread_id` 继续 resume
+- v2 前端演示重点是 interrupt / outline review / resume 闭环；不是完整的 LangGraph 可视化控制台
+
+#### v2 checkpoint 存储位置
+
+- 环境变量：`LANGGRAPH_V2_CHECKPOINT_DB`
+- 默认值：`data/langgraph_v2_checkpoints.sqlite`
+- 若未设置，则会在后端目录下的 `data/` 目录自动创建该 SQLite 文件
+
+#### 最小调用示例
+
+1. 启动并拿到 interrupt：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/pipeline/v2 ^
+  -H "Content-Type: application/json" ^
+  -d "{\"topic\":\"测试主题\",\"audience\":\"初学者\",\"style\":\"说明文\",\"target_length\":\"800\",\"constraints\":\"不要跑题\",\"key_points\":\"要点A\",\"review_criteria\":\"准确\",\"sources\":[]}"
+```
+
+典型返回：
+
+```json
+{
+  "status": "interrupted",
+  "thread_id": "9d2c...",
+  "interrupt": {
+    "kind": "outline_review",
+    "payload": {
+      "thread_id": "9d2c...",
+      "outline": "1) Outline ...",
+      "assumptions": "...",
+      "open_questions": "..."
+    }
+  },
+  "result": null
+}
+```
+
+2. 使用同一个 `thread_id` 继续：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/pipeline/v2/resume ^
+  -H "Content-Type: application/json" ^
+  -d "{\"thread_id\":\"9d2c...\",\"outline_override\":\"1) Outline\\n- 人工修订版大纲\"}"
+```
+
+如果你希望像旧 `/api/pipeline/stream` 一样看到 LLM 实时输出，可改用：
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/api/pipeline/v2/stream ^
+  -H "Content-Type: application/json" ^
+  -d "{\"topic\":\"测试主题\",\"audience\":\"初学者\",\"style\":\"说明文\",\"target_length\":\"800\",\"constraints\":\"不要跑题\",\"key_points\":\"要点A\",\"review_criteria\":\"准确\",\"sources\":[]}"
+```
+
+以及：
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/api/pipeline/v2/resume/stream ^
+  -H "Content-Type: application/json" ^
+  -d "{\"thread_id\":\"9d2c...\",\"outline_override\":\"1) Outline\\n- 人工修订版大纲\"}"
+```
+
+#### 前端演示状态
+
+Workspace 中的 LangGraph v2 Demo 已接入上述流式路径，页面上可以完整演示：
+
+- `Planning`
+- `Interrupted - waiting for outline review`
+- `Resuming`
+- `Completed`
+
+并带有与旧 pipeline 同风格的子阶段进度条：
+
+- `生成大纲`
+- `等待人工修订`
+- `收集研究笔记`
+- `创作初稿`
+- `审阅反馈`
+- `修改润色`
+- `生成引用`
+
+#### 旧链路 vs 新链路
+
+```mermaid
+flowchart LR
+    A["/api/pipeline"] --> B["旧 full pipeline"]
+    C["/api/pipeline/stream"] --> D["旧 SSE full pipeline"]
+
+    E["/api/pipeline/v2 or /api/pipeline/v2/stream"] --> F["plan"]
+    F --> G["interrupt(outline_review)"]
+    H["/api/pipeline/v2/resume or /api/pipeline/v2/resume/stream"] --> I["resume"]
+    I --> J["existing services + route helper"]
+    J --> K["completed"]
+```
 
 ### RAG
 - `POST /api/rag/upload`

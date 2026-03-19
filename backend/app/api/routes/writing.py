@@ -246,10 +246,26 @@ def _strict_citation_postcheck_failed(report: CoverageReport) -> bool:
         return False
     if not _parse_bool("RAG_CITATION_STRICT_POSTCHECK_ENABLED", True):
         return False
+    semantic_threshold = max(
+        _parse_float("RAG_CITATION_STRICT_MIN_SEMANTIC_COVERAGE", 0.6),
+        _parse_float("RAG_COVERAGE_SEMANTIC_THRESHOLD", 0.25),
+    )
+    semantic_accepts = (
+        (report.semantic_coverage or 0.0) >= semantic_threshold
+        and report.semantic_covered_paragraphs > 0
+    )
 
     # Default guard is conservative: reject "fake citation" cases with no lexical overlap at all,
     # even if semantic coverage looks high due to embedding noise.
     if report.covered_tokens <= 0 and report.covered_paragraphs <= 0:
+        if semantic_accepts:
+            logger.info(
+                "Strict citation postcheck accepted by semantic evidence: semantic_coverage=%.3f semantic_covered=%s threshold=%.3f",
+                report.semantic_coverage or 0.0,
+                report.semantic_covered_paragraphs,
+                semantic_threshold,
+            )
+            return False
         logger.warning(
             "Strict citation postcheck failed: no lexical overlap (token_coverage=%.3f semantic_coverage=%s)",
             report.token_coverage,
@@ -260,7 +276,7 @@ def _strict_citation_postcheck_failed(report: CoverageReport) -> bool:
     min_token_coverage = _parse_float("RAG_CITATION_STRICT_MIN_TOKEN_COVERAGE", 0.0)
     min_covered_paragraphs = max(0, _parse_int("RAG_CITATION_STRICT_MIN_COVERED_PARAGRAPHS", 0))
     if min_token_coverage > 0.0 and report.token_coverage < min_token_coverage:
-        if report.covered_paragraphs < max(1, min_covered_paragraphs):
+        if report.covered_paragraphs < max(1, min_covered_paragraphs) and not semantic_accepts:
             logger.warning(
                 "Strict citation postcheck failed: token_coverage %.3f < %.3f and covered_paragraphs=%s",
                 report.token_coverage,
@@ -268,7 +284,7 @@ def _strict_citation_postcheck_failed(report: CoverageReport) -> bool:
                 report.covered_paragraphs,
             )
             return True
-    if min_covered_paragraphs > 0 and report.covered_paragraphs < min_covered_paragraphs:
+    if min_covered_paragraphs > 0 and report.covered_paragraphs < min_covered_paragraphs and not semantic_accepts:
         logger.warning(
             "Strict citation postcheck failed: covered_paragraphs=%s < %s",
             report.covered_paragraphs,

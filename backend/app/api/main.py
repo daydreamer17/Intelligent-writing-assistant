@@ -16,6 +16,7 @@ try:
         citations_router,
         mcp_github_router,
         pipeline_router,
+        pipeline_v2_router,
         rag_router,
         settings_router,
         versions_router,
@@ -36,6 +37,7 @@ except ImportError:  # Allows running `python main.py` directly.
         citations_router,
         mcp_github_router,
         pipeline_router,
+        pipeline_v2_router,
         rag_router,
         settings_router,
         versions_router,
@@ -61,6 +63,7 @@ def create_app() -> FastAPI:
 
     app.include_router(writing_router, prefix="/api")
     app.include_router(pipeline_router, prefix="/api")
+    app.include_router(pipeline_v2_router, prefix="/api")
     app.include_router(rag_router, prefix="/api")
     app.include_router(citations_router, prefix="/api")
     app.include_router(versions_router, prefix="/api")
