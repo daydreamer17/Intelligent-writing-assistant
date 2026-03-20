@@ -8,13 +8,14 @@
 - 流式生成：支持分步与一键 Pipeline 的 SSE 实时状态与结果推送
 - RAG 检索增强：支持 `.txt / .pdf / .docx / .md / .markdown` 上传与检索
 - 调用模式三态：`RAG-only / Hybrid / Creative`
+- 覆盖率解释增强：前端优先展示语义覆盖率；词面复用覆盖率作为严格辅指标，默认词面阈值下调到 `0.12`
 - 记忆机制：会话隔离（`session_id`）、历史压缩、冷存写入与冷存召回回注
 - 外部知识接入：GitHub MCP（可选）及显式工具 API
-- LangGraph v2 最小接入：
+- LangGraph v2：
   - `plan`
   - `outline` 后 interrupt
   - 基于 `thread_id` 的 checkpoint / resume
-  - resume 后继续复用现有后半段 service
+  - `resume` 后走 full-stage graph：`research -> draft -> review -> rewrite? -> post_process`
 - 前端 Workspace 已支持 LangGraph v2 演示闭环：
   - interrupt / outline review / resume
   - 同步与流式两种 v2 路径
@@ -102,12 +103,22 @@ npm run dev
 | `/api/pipeline/v2` | LangGraph 最小工作流（同步） | 大纲后 interrupt | 通过 `/api/pipeline/v2/resume` | LangGraph 接入验证 |
 | `/api/pipeline/v2/stream` | LangGraph 最小工作流（SSE） | 大纲后 interrupt | 通过 `/api/pipeline/v2/resume/stream` | LangGraph 流式演示 |
 
-### 当前 v2 只做什么
+### 当前 v2 做什么
 
 - `plan`
 - `outline` 生成后 interrupt
 - `resume`
-- resume 后继续复用现有 `collect_research_notes(...)`、`drafter.run_full(...)` 和现有 route helper
+- `resume` 后进入完整阶段图：
+  - `research`
+  - `draft`
+  - `review`
+  - `rewrite`（可跳过）
+  - `post_process`
+- 文本生成阶段在流式路径下支持真实流式输出：
+  - `plan`
+  - `draft`
+  - `review`
+  - `rewrite`
 
 ### 逻辑链条
 
@@ -119,8 +130,12 @@ flowchart LR
     E["/api/pipeline/v2 or /api/pipeline/v2/stream"] --> F["plan"]
     F --> G["interrupt(outline_review)"]
     H["/api/pipeline/v2/resume or /api/pipeline/v2/resume/stream"] --> I["resume"]
-    I --> J["existing services + route helper"]
-    J --> K["completed"]
+    I --> J["research"]
+    J --> K["draft"]
+    K --> L["review"]
+    L --> M["rewrite?"]
+    M --> N["post_process"]
+    N --> O["completed"]
 ```
 
 ### 当前限制
@@ -130,6 +145,17 @@ flowchart LR
 - 详细接口、checkpoint 存储与流式调用示例见 `backend/README.md`
 
 ## 7. 更新日志
+
+<details>
+<summary><strong>v0.5.7 (2026-03-20)</strong> — LangGraph v2 全阶段接管与覆盖率解释修正</summary>
+
+- ✨ LangGraph v2 从 tail-graph 扩展为 full-stage graph：`research -> draft -> review -> rewrite? -> post_process`
+- ✨ v2 `review_decision` 升级为稳定结构化输出，减少 rewrite 判定漂移
+- ✨ v2 流式路径补齐真实流式文本阶段：`plan / draft / review / rewrite`
+- 🔧 RAG 覆盖率展示文案改为“优先看语义 + 严格词面复用”，避免将词面 0% 误解为未基于文档生成
+- 🔧 词面覆盖默认阈值由 `0.3` 调整为 `0.12`，降低摘要型/改写型输出长期显示 0% 的问题
+
+</details>
 
 <details>
 <summary><strong>v0.5.6 (2026-03-19)</strong> — LangGraph v2 可恢复演示闭环增强</summary>

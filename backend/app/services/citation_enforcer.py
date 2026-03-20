@@ -29,7 +29,9 @@ class CoverageReport:
 
 class CitationEnforcer:
     def __init__(self) -> None:
-        self._threshold = _parse_float_env("RAG_COVERAGE_THRESHOLD", default=0.3)
+        # Lexical coverage is a strict auxiliary signal. Use a lower default so
+        # paraphrased RAG outputs do not collapse to 0% too easily.
+        self._threshold = _parse_float_env("RAG_COVERAGE_THRESHOLD", default=0.12)
 
     def enforce(
         self,

@@ -63,6 +63,9 @@
         <button class="btn secondary" @click="handlePipelineV2" :disabled="isPrimaryActionDisabled">
           {{ loading.pipelineV2 ? "LangGraph v2 中..." : "LangGraph v2 Demo" }}
         </button>
+        <button class="btn ghost" @click="openPipelineV2Panel" :disabled="loading.pipeline || loading.pipelineV2">
+          Open V2 Panel
+        </button>
         <button
           class="btn ghost"
           @click="handleResetSessionMemory"
@@ -104,25 +107,24 @@
       </div>
       <div v-if="showCoverageMetrics" class="muted">
         <div>
-          引用覆盖率：{{ Math.round(((output.coverage_detail?.semantic_coverage ?? output.coverage) || 0) * 100) }}%
+          引用覆盖率（优先看语义）：{{ Math.round(((output.coverage_detail?.semantic_coverage ?? output.coverage) || 0) * 100) }}%
         </div>
         <div v-if="output.coverage_detail">
           语义段落覆盖率：{{ Math.round((output.coverage_detail.semantic_coverage || 0) * 100) }}%
           （{{ output.coverage_detail.semantic_covered_paragraphs ?? 0 }}/{{ output.coverage_detail.semantic_total_paragraphs ?? output.coverage_detail.total_paragraphs }}）
         </div>
         <div v-if="output.coverage_detail">
-          词面段落覆盖率：{{ Math.round((output.coverage_detail.paragraph_coverage || 0) * 100) }}%
+          词面复用覆盖率（严格）：{{ Math.round((output.coverage_detail.paragraph_coverage || 0) * 100) }}%
           （{{ output.coverage_detail.covered_paragraphs }}/{{ output.coverage_detail.total_paragraphs }}）
         </div>
       </div>
       <div v-if="error" class="muted">错误：{{ error }}</div>
     </div>
-
-    <section v-if="pipelineV2.status !== 'idle'" class="card v2-panel">
+    <section v-if="pipelineV2.panelOpen" class="card v2-panel">
       <div class="v2-panel__header">
         <div>
           <h3>LangGraph v2 Demo</h3>
-          <p class="muted">当前状态：{{ pipelineV2StatusText }}</p>
+          <p class="muted">Status: {{ pipelineV2StatusText }}</p>
         </div>
         <div class="v2-panel__actions">
           <button
@@ -131,26 +133,51 @@
             @click="handlePipelineV2Resume"
             :disabled="loading.pipelineV2 || !pipelineV2.threadId"
           >
-            {{ loading.pipelineV2 ? "恢复中..." : "继续执行 / Resume" }}
+            {{ loading.pipelineV2 ? "Resuming..." : "Resume" }}
+          </button>
+          <button
+            v-if="pipelineV2.threadId"
+            class="btn ghost"
+            @click="copyPipelineV2ThreadId"
+            :disabled="loading.pipelineV2"
+          >
+            Copy thread_id
           </button>
           <button class="btn ghost" @click="resetPipelineV2State" :disabled="loading.pipelineV2">
-            清空/退出演示状态
+            Exit Demo
           </button>
         </div>
       </div>
 
       <ProgressIndicator
         :visible="showPipelineV2Progress"
-        title="LangGraph v2 子阶段"
+        title="LangGraph v2 Progress"
         :steps="pipelineV2Steps"
         :current-step="currentPipelineV2Step"
         :inline="true"
       />
 
       <div class="v2-panel__meta">
-        <div><span class="v2-panel__label">thread_id：</span>{{ pipelineV2.threadId || "-" }}</div>
-        <div v-if="pipelineV2.status === 'completed'" class="muted">已基于该 thread_id 恢复执行并完成。</div>
+        <div><span class="v2-panel__label">thread_id: </span>{{ pipelineV2.threadId || "-" }}</div>
+        <div v-if="pipelineV2.status === 'completed'" class="muted">This result was completed from a resumed thread.</div>
       </div>
+
+      <div class="field">
+        <label>Load existing thread_id</label>
+        <div class="v2-panel__lookup">
+          <input v-model="pipelineV2.lookupThreadId" placeholder="Paste an existing thread_id" />
+          <button
+            class="btn ghost"
+            @click="handlePipelineV2LoadCheckpoint"
+            :disabled="loading.pipelineV2 || !hasText(pipelineV2.lookupThreadId)"
+          >
+            Load checkpoint
+          </button>
+        </div>
+        <div class="muted">Use this to inspect or resume an existing LangGraph v2 checkpoint.</div>
+      </div>
+
+      <div v-if="pipelineV2.note" class="muted">{{ pipelineV2.note }}</div>
 
       <div v-if="pipelineV2.assumptions" class="field">
         <label>Assumptions</label>
@@ -163,19 +190,19 @@
       </div>
 
       <div class="field">
-        <label>{{ pipelineV2.status === 'completed' ? '最终采用的大纲' : 'Outline Review' }}</label>
+        <label>{{ pipelineV2.status === 'completed' ? 'Resolved Outline' : 'Outline Review' }}</label>
         <textarea
           v-model="pipelineV2.outlineDraft"
           rows="8"
           :readonly="pipelineV2.status !== 'interrupted'"
-          :placeholder="pipelineV2.status === 'interrupted' ? '你可以在这里编辑大纲，然后点击 Resume。' : ''"
+          :placeholder="pipelineV2.status === 'interrupted' ? 'Edit the outline here, then click Resume.' : ''"
         />
         <div v-if="pipelineV2.status === 'interrupted'" class="muted">
-          如果保留为空，Resume 时会沿用后端保存的原 outline，不会删除大纲。
+          If left empty, Resume will reuse the saved outline instead of deleting it.
         </div>
       </div>
 
-      <div v-if="pipelineV2.error" class="muted">V2 错误：{{ pipelineV2.error }}</div>
+      <div v-if="pipelineV2.error" class="muted">V2 error: {{ pipelineV2.error }}</div>
     </section>
 
     <div class="grid-2">
@@ -214,6 +241,7 @@ import { storeToRefs } from "pinia";
 import { useAppStore } from "../store";
 import { draftStream, plan, reviewStream, rewriteStream } from "../services/writing";
 import {
+  getPipelineV2Checkpoint,
   runPipelineStream,
   runPipelineV2Stream,
   resumePipelineV2Stream,
@@ -229,11 +257,12 @@ import { handleApiError } from "../utils/errorHandler";
 import { validatePipelineRequest, validateDraftRequest, validateReviewRequest, validateRewriteRequest } from "../utils/validation";
 import { debounce } from "../utils/debounce";
 import type {
+  CoverageDetail,
+  HealthDetailResponse,
   PipelineRequest,
   PipelineResponse,
+  PipelineV2CheckpointDetailResponse,
   PipelineV2Request,
-  HealthDetailResponse,
-  CoverageDetail,
 } from "../types";
 import OutlinePanel from "../components/OutlinePanel.vue";
 import DraftEditor from "../components/DraftEditor.vue";
@@ -308,11 +337,14 @@ const loading = reactive({
 type PipelineV2UiStatus = "idle" | "planning" | "interrupted" | "resuming" | "completed" | "error";
 
 const pipelineV2 = reactive({
+  panelOpen: false,
   status: "idle" as PipelineV2UiStatus,
   threadId: "",
+  lookupThreadId: "",
   outlineDraft: "",
   assumptions: "",
   openQuestions: "",
+  note: "",
   error: "",
 });
 
@@ -410,14 +442,95 @@ const resetPipelineProgress = () => {
 };
 
 const resetPipelineV2State = () => {
+  pipelineV2.panelOpen = false;
   pipelineV2.status = "idle";
   pipelineV2.threadId = "";
+  pipelineV2.lookupThreadId = "";
   pipelineV2.outlineDraft = "";
   pipelineV2.assumptions = "";
   pipelineV2.openQuestions = "";
+  pipelineV2.note = "";
   pipelineV2.error = "";
   currentPipelineV2Step.value = 0;
   loading.pipelineV2 = false;
+};
+
+const openPipelineV2Panel = () => {
+  pipelineV2.panelOpen = true;
+  pipelineV2.note = "";
+  pipelineV2.error = "";
+};
+
+const copyPipelineV2ThreadId = async () => {
+  if (!pipelineV2.threadId) return;
+  try {
+    await navigator.clipboard.writeText(pipelineV2.threadId);
+    showToast("thread_id copied");
+  } catch {
+    error.value = "Failed to copy thread_id. Please copy it manually.";
+  }
+};
+
+const applyPipelineV2CheckpointDetail = (detail: PipelineV2CheckpointDetailResponse) => {
+  pipelineV2.panelOpen = true;
+  pipelineV2.threadId = detail.thread_id;
+  pipelineV2.lookupThreadId = detail.thread_id;
+  pipelineV2.outlineDraft = detail.outline || "";
+  pipelineV2.assumptions = detail.assumptions || "";
+  pipelineV2.openQuestions = detail.open_questions || "";
+  pipelineV2.error = "";
+  pipelineV2.note = "";
+  form.outline = detail.outline || form.outline;
+  output.outline = detail.outline || output.outline;
+  output.assumptions = detail.assumptions || output.assumptions;
+  output.open_questions = detail.open_questions || output.open_questions;
+
+  if (detail.status === "interrupted") {
+    pipelineV2.status = "interrupted";
+    currentPipelineV2Step.value = pipelineV2StageIndex.interrupted;
+    pipelineV2.note = "Loaded an interrupted checkpoint.";
+    return;
+  }
+
+  if (detail.status === "completed") {
+    pipelineV2.status = "completed";
+    currentPipelineV2Step.value = pipelineV2Steps.length;
+    pipelineV2.note = "This thread is already completed. Use Settings to inspect or clean it.";
+    return;
+  }
+
+  pipelineV2.status = "idle";
+  currentPipelineV2Step.value = 0;
+  pipelineV2.note =
+    detail.status === "failed"
+      ? `This thread is failed${detail.last_error ? `: ${detail.last_error}` : ""}`
+      : `This thread is ${detail.status}. Frontend resume is not available for this status.`;
+};
+
+const handlePipelineV2LoadCheckpoint = async () => {
+  const threadId = pipelineV2.lookupThreadId.trim();
+  if (!threadId) {
+    pipelineV2.error = "Please enter a valid thread_id.";
+    return;
+  }
+  try {
+    resetError();
+    pipelineV2.panelOpen = true;
+    pipelineV2.error = "";
+    pipelineV2.note = "";
+    loading.pipelineV2 = true;
+    const detail = await getPipelineV2Checkpoint(threadId);
+    applyPipelineV2CheckpointDetail(detail);
+    showToast(`Loaded thread_id: ${threadId}`);
+  } catch (err) {
+    const message = handleApiError(err);
+    error.value = message;
+    pipelineV2.status = "error";
+    pipelineV2.error = message;
+    pipelineV2.panelOpen = true;
+  } finally {
+    loading.pipelineV2 = false;
+  }
 };
 
 const applyPipelineResponse = (res: PipelineResponse) => {
@@ -518,12 +631,15 @@ const handlePipelineV2 = async () => {
 
     await resetSessionMemoryForNewTask();
     loading.pipelineV2 = true;
+    pipelineV2.panelOpen = true;
     pipelineV2.status = "planning";
     currentPipelineV2Step.value = pipelineV2StageIndex.plan;
     pipelineV2.threadId = "";
+    pipelineV2.lookupThreadId = "";
     pipelineV2.outlineDraft = "";
     pipelineV2.assumptions = "";
     pipelineV2.openQuestions = "";
+    pipelineV2.note = "";
     output.outline = "";
     output.assumptions = "";
     output.open_questions = "";
@@ -531,7 +647,7 @@ const handlePipelineV2 = async () => {
     const payload: PipelineV2Request = {
       ...buildPipelineRequestPayload(),
     };
-    await runPipelineV2Stream(payload, (evt) => {
+    const streamSummary = await runPipelineV2Stream(payload, (evt) => {
       if (evt.type === "status" && evt.step === "plan") {
         currentPipelineV2Step.value = pipelineV2StageIndex.plan;
       }
@@ -558,11 +674,20 @@ const handlePipelineV2 = async () => {
     });
 
     if (pipelineV2.status === "planning") {
+      if (streamSummary?.interruptPayload) {
+        pipelineV2.status = "interrupted";
+        currentPipelineV2Step.value = pipelineV2StageIndex.interrupted;
+        pipelineV2.threadId = String(streamSummary.interruptPayload?.thread_id || "");
+        applyPipelineV2InterruptPayload(streamSummary.interruptPayload || {});
+        showToast("LangGraph v2 已中断，等待人工修订大纲");
+        return;
+      }
       throw new Error("LangGraph v2 流式执行结束，但未收到 interrupt 事件");
     }
   } catch (err) {
     const message = handleApiError(err);
     error.value = message;
+    pipelineV2.panelOpen = true;
     pipelineV2.status = "error";
     pipelineV2.error = message;
   } finally {
@@ -582,6 +707,7 @@ const handlePipelineV2Resume = async () => {
   try {
     resetError();
     pipelineV2.error = "";
+    pipelineV2.note = "";
     resetPipelineProgress();
     loading.pipelineV2 = true;
     pipelineV2.status = "resuming";
@@ -593,7 +719,7 @@ const handlePipelineV2Resume = async () => {
     output.coverage = undefined;
     output.coverage_detail = undefined;
 
-    await resumePipelineV2Stream(
+    const streamSummary = await resumePipelineV2Stream(
       {
         thread_id: pipelineV2.threadId,
         outline_override: pipelineV2.outlineDraft,
@@ -663,11 +789,24 @@ const handlePipelineV2Resume = async () => {
     );
 
     if (pipelineV2.status === "resuming") {
+      if (streamSummary?.resultPayload) {
+        applyPipelineResponse(streamSummary.resultPayload);
+        pipelineV2.status = "completed";
+        currentPipelineV2Step.value = pipelineV2Steps.length;
+        pipelineV2.threadId = pipelineV2.threadId || String(streamSummary.resultPayload?.thread_id || "");
+        pipelineV2.outlineDraft = streamSummary.resultPayload.outline || pipelineV2.outlineDraft;
+        pipelineV2.assumptions = streamSummary.resultPayload.assumptions || pipelineV2.assumptions;
+        pipelineV2.openQuestions = streamSummary.resultPayload.open_questions || pipelineV2.openQuestions;
+        form.outline = streamSummary.resultPayload.outline || form.outline;
+        showToast("LangGraph v2 已恢复执行并完成");
+        return;
+      }
       throw new Error("LangGraph v2 Resume 流式执行结束，但未收到完成结果");
     }
   } catch (err) {
     const message = handleApiError(err);
     error.value = message;
+    pipelineV2.panelOpen = true;
     pipelineV2.status = "error";
     pipelineV2.error = message;
   } finally {
@@ -1226,6 +1365,17 @@ restoreAutoSave();
 
 .v2-panel__label {
   font-weight: 600;
+}
+
+.v2-panel__lookup {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.v2-panel__lookup input {
+  flex: 1 1 280px;
 }
 
 .v2-panel__text {

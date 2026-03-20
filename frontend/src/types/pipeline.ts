@@ -81,3 +81,49 @@ export interface PipelineV2Response {
   interrupt?: PipelineV2Interrupt | null;
   result?: PipelineResponse | null;
 }
+
+export interface PipelineV2CheckpointSummary {
+  thread_id: string;
+  status: string;
+  current_stage: string;
+  updated_at: string;
+}
+
+export interface PipelineV2CheckpointListResponse {
+  checkpoints: PipelineV2CheckpointSummary[];
+}
+
+export interface PipelineV2CheckpointDetailResponse {
+  thread_id: string;
+  session_id: string;
+  mode: string;
+  status: string;
+  current_stage: string;
+  created_at: string;
+  updated_at: string;
+  can_resume: boolean;
+  outline: string;
+  assumptions: string;
+  open_questions: string;
+  last_error: string;
+}
+
+export interface PipelineV2CheckpointCleanupRequest {
+  older_than_hours?: number;
+  status?: string;
+  dry_run?: boolean;
+  limit?: number;
+}
+
+export interface PipelineV2CheckpointCleanupResponse {
+  dry_run: boolean;
+  matched: number;
+  deleted: number;
+  thread_ids: string[];
+  older_than_hours: number;
+  status: string;
+}
+
+export interface DeletePipelineV2CheckpointResponse {
+  deleted: boolean;
+}

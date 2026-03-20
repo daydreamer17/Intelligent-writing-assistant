@@ -130,6 +130,61 @@ class WritingPipeline:
         )
         return self.researcher.collect_notes(query=query, sources=source_list, top_k=top_k)
 
+    def continue_from_outline(
+        self,
+        *,
+        topic: str,
+        outline: OutlinePlan,
+        sources: Iterable[SourceDocument] | None = None,
+        constraints: str = "",
+        style: str = "",
+        target_length: str = "",
+        review_criteria: str = "",
+        audience: str = "",
+        draft_max_tokens: int | None = None,
+        review_max_tokens: int | None = None,
+        rewrite_max_tokens: int | None = None,
+        draft_max_input_chars: int | None = None,
+        review_max_input_chars: int | None = None,
+        rewrite_max_input_chars: int | None = None,
+        session_id: str = "",
+        draft_tool_profile_id: str | None = None,
+        draft_tool_registry_override: ToolRegistry | None = None,
+        review_tool_profile_id: str | None = None,
+        review_tool_registry_override: ToolRegistry | None = None,
+        rewrite_tool_profile_id: str | None = None,
+        rewrite_tool_registry_override: ToolRegistry | None = None,
+    ) -> PipelineResult:
+        notes = self.collect_research_notes(topic, outline, sources)
+        notes_text = self.researcher.format_notes(notes)
+
+        _pipeline_throttle()
+
+        draft_result = self.drafter.run_full(
+            topic=topic,
+            outline=outline.outline,
+            research_notes=notes_text,
+            constraints=constraints,
+            style=style,
+            target_length=target_length,
+            review_criteria=review_criteria,
+            audience=audience,
+            draft_max_tokens=draft_max_tokens,
+            review_max_tokens=review_max_tokens,
+            rewrite_max_tokens=rewrite_max_tokens,
+            draft_max_input_chars=draft_max_input_chars,
+            review_max_input_chars=review_max_input_chars,
+            rewrite_max_input_chars=rewrite_max_input_chars,
+            session_id=session_id,
+            draft_tool_profile_id=draft_tool_profile_id,
+            draft_tool_registry_override=draft_tool_registry_override,
+            review_tool_profile_id=review_tool_profile_id,
+            review_tool_registry_override=review_tool_registry_override,
+            rewrite_tool_profile_id=rewrite_tool_profile_id,
+            rewrite_tool_registry_override=rewrite_tool_registry_override,
+        )
+        return PipelineResult(outline=outline, research_notes=notes, draft_result=draft_result)
+
 
 def _resolve_notes_top_k(source_count: int) -> int:
     source_count = max(0, source_count)

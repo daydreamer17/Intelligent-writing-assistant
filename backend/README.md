@@ -13,7 +13,7 @@
   - `hybrid`：有证据段落加 `[n]`，无证据段落加 `[推断]`
   - `creative`：不强制引用，支持运行时开关 MCP
 - 拒答判定增强：拒答查询默认精简（不直接拼接超长大纲/草稿），并按 original/bilingual/HyDE 变体最优分数判定
-- 覆盖率明细增强：区分语义段落覆盖率与词面段落覆盖率
+- 覆盖率明细增强：区分语义段落覆盖率与词面复用覆盖率（严格辅指标）
 - 记忆机制：会话隔离（`session_id`）、上下文压缩、冷存写入与冷存召回；支持任务前自动重置
 - 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化，支持 baseline 对比脚本、重复运行均值/方差、逐 Query 明细报告、按标签分组统计、Agent 行为回归小套件
 - 线上动态检索策略路由（可选）：按 query 类型自动切换 `dense_only / rerank / hyde / bilingual`
@@ -93,6 +93,7 @@ RAG_CREATIVE_MCP_ENABLED=true       # creative 模式下是否启用 MCP
 RAG_CREATIVE_MEMORY_ENABLED=false   # creative 模式是否启用会话记忆
 RAG_HYBRID_INFERENCE_TAG=[推断]
 RAG_HYBRID_MIN_PARAGRAPH_CHARS=12
+RAG_COVERAGE_THRESHOLD=0.12         # 词面复用覆盖阈值（默认下调，避免摘要型输出长期显示 0%）
 RAG_REFUSAL_ENABLED=true
 RAG_REFUSAL_QUERY_MAX_CHARS=480
 RAG_REFUSAL_INCLUDE_OUTLINE=false
@@ -154,15 +155,25 @@ LLM_TOOL_POLICY_DISABLE_WHEN_RAG_STRONG=true
 | `/api/pipeline/v2` | LangGraph 最小工作流（同步） | 大纲后 interrupt | 通过 `/api/pipeline/v2/resume` | LangGraph 接入验证与后续扩展入口 |
 | `/api/pipeline/v2/stream` | LangGraph 最小工作流（SSE） | 大纲后 interrupt | 通过 `/api/pipeline/v2/resume/stream` | LangGraph 流式演示路径 |
 
-#### 当前 v2 只做什么
+#### 当前 v2 做什么
 
 - `plan`
 - `outline` 生成后 interrupt
 - `resume`
-- resume 之后继续复用现有 `collect_research_notes(...)`、`drafter.run_full(...)` 和现有 route helper 收尾
+- `resume` 后进入 full-stage graph：
+  - `research`
+  - `draft`
+  - `review`
+  - `rewrite`（可跳过）
+  - `post_process`
 - 同一条控制流同时支持：
   - 同步：`/api/pipeline/v2`、`/api/pipeline/v2/resume`
   - 流式：`/api/pipeline/v2/stream`、`/api/pipeline/v2/resume/stream`
+- 文本生成阶段在流式路径下支持真实流式输出：
+  - `plan`
+  - `draft`
+  - `review`
+  - `rewrite`
 
 #### 当前限制
 
@@ -259,8 +270,12 @@ flowchart LR
     E["/api/pipeline/v2 or /api/pipeline/v2/stream"] --> F["plan"]
     F --> G["interrupt(outline_review)"]
     H["/api/pipeline/v2/resume or /api/pipeline/v2/resume/stream"] --> I["resume"]
-    I --> J["existing services + route helper"]
-    J --> K["completed"]
+    I --> J["research"]
+    J --> K["draft"]
+    K --> L["review"]
+    L --> M["rewrite?"]
+    M --> N["post_process"]
+    N --> O["completed"]
 ```
 
 ### RAG
@@ -388,7 +403,8 @@ curl -X POST http://127.0.0.1:8000/api/rag/search ^
 - 会话重置会同时清理内存历史与 SQLite 冷存（按会话作用域，包含 `session_id::tool_profile` 变体）。
 - `hybrid` 模式下，Qdrant 不可用会自动降级到 SQLite 检索。
 - `hybrid` 模式会优先注入可匹配的 `[n]`，仅对无证据段落补 `[推断]`。
-- 覆盖率展示建议优先看语义段落覆盖率；词面段落覆盖率在中英混合语料下可能偏低。
+- 覆盖率展示建议优先看语义段落覆盖率；“词面复用覆盖率（严格）”只是辅指标，在中英混合、强改写、摘要型输出下仍可能偏低。
+- 当前默认 `RAG_COVERAGE_THRESHOLD=0.12`，相比旧值 `0.3` 更适合摘要型 RAG 输出；如希望更严格的词面复用判定，可再调高。
 - 拒答日志会显示 `base:<variant>` / `fallback@k:<variant>`，用于定位本轮命中的查询变体。
 - 若开启 `RAG_QUERY_STRATEGY_ROUTING_ENABLED=true`，日志会出现 `RAG query strategy route: ...`，用于确认本轮 query 命中的线上策略组合。
 - 流式链路依赖 SSE，代理层需允许 `text/event-stream`。

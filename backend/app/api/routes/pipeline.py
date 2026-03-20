@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import time
 import logging
 import os
 from queue import Empty, Queue
 from threading import Thread
+from typing import Any, Callable
 
 from hello_agents.tools import ToolRegistry
 from fastapi import APIRouter, Depends, HTTPException
@@ -30,6 +32,7 @@ from ...services.generation_mode import (
 from ...services.github_context import maybe_fetch_github_context
 from ...services.inference_marker import mark_inference_paragraphs
 from ...services.pipeline_service import PipelineResult
+from ...services.planner_service import OutlinePlan
 from ...services.research_service import RelevanceReport, ResearchNote, SourceDocument
 from ...services.tool_policy import ToolDecision, build_stage_tool_registry, decide_tools
 from ..deps import AppServices, get_services
@@ -599,6 +602,964 @@ def _serialize_pipeline_result(
     )
 
 
+def _emit_text_deltas(q: Queue[dict | None], stage: str, text: str) -> None:
+    if not text:
+        return
+    chunk_size = max(128, _parse_int("PIPELINE_STREAM_FALLBACK_CHUNK_SIZE", 600))
+    for i in range(0, len(text), chunk_size):
+        q.put({"type": "delta", "stage": stage, "content": text[i : i + chunk_size]})
+
+
+def _dynamic_review_max_tokens(draft: str) -> int:
+    configured = _pipeline_max_tokens("review")
+    if configured:
+        return configured
+    return min(8000, max(2000, int(len(draft) * 0.8)))
+
+
+def _dynamic_rewrite_max_tokens(draft: str) -> int:
+    configured = _pipeline_max_tokens("rewrite")
+    if configured:
+        return configured
+    return min(8000, max(2000, int(len(draft) * 1.5)))
+
+
+def _rewrite_guidance(review: str, criteria: str) -> str:
+    parts = [part.strip() for part in [review, criteria] if part and part.strip()]
+    return "\n\n".join(dict.fromkeys(parts))
+
+
+def _serialize_resume_notes(notes: list[ResearchNote]) -> list[dict[str, str]]:
+    return [
+        {
+            "doc_id": note.doc_id,
+            "title": note.title,
+            "summary": note.summary,
+            "url": note.url,
+        }
+        for note in notes
+    ]
+
+
+def _restore_resume_notes(raw_notes: Any) -> list[ResearchNote]:
+    restored: list[ResearchNote] = []
+    for raw_note in raw_notes or []:
+        if not isinstance(raw_note, dict):
+            continue
+        restored.append(
+            ResearchNote(
+                doc_id=str(raw_note.get("doc_id") or ""),
+                title=str(raw_note.get("title") or ""),
+                summary=str(raw_note.get("summary") or ""),
+                url=str(raw_note.get("url") or ""),
+            )
+        )
+    return restored
+
+
+def _base_resume_payload(
+    *,
+    payload: PipelineRequest,
+    resolved_session_id: str,
+    effective_constraints: str,
+    github_context: str,
+    outline: OutlinePlan,
+) -> dict[str, Any]:
+    return {
+        "request": payload.model_dump(),
+        "resolved_session_id": resolved_session_id,
+        "effective_constraints": effective_constraints,
+        "github_context": github_context,
+        "outline": outline.outline,
+        "assumptions": outline.assumptions,
+        "open_questions": outline.open_questions,
+    }
+
+
+@dataclass(frozen=True)
+class _ResearchStageState:
+    effective_sources: list[SourceDocument]
+    notes: list[ResearchNote]
+    notes_text: str
+    final_response: PipelineResponse | None = None
+
+
+@dataclass(frozen=True)
+class _DraftStageState:
+    effective_sources: list[SourceDocument]
+    notes: list[ResearchNote]
+    notes_text: str
+    draft: str
+    final_response: PipelineResponse | None = None
+
+
+def _run_pipeline_research_sync(
+    *,
+    payload: PipelineRequest,
+    services: AppServices,
+    outline: OutlinePlan,
+    sources: list[SourceDocument],
+    github_context: str,
+    effective_constraints: str,
+    resolved_session_id: str,
+    task_status: dict[str, bool | None],
+) -> _ResearchStageState:
+    apply_labels = _citations_enabled()
+    effective_sources = list(sources)
+    refusal_query = _build_refusal_query(
+        topic=payload.topic,
+        key_points=payload.key_points,
+        constraints=payload.constraints,
+        audience=payload.audience,
+        style=payload.style,
+        outline=outline.outline,
+    )
+    if _refusal_enabled() and effective_sources:
+        refused, effective_sources = _refusal_check_with_fallback(
+            query=refusal_query,
+            sources=effective_sources,
+            services=services,
+        )
+    else:
+        refused = False
+    notes = (
+        services.pipeline.collect_research_notes(payload.topic, outline, effective_sources)
+        if effective_sources
+        else []
+    )
+    if github_context and not any(note.doc_id == "github:mcp" for note in notes):
+        notes.append(_github_note(github_context))
+    task_status["research"] = None if not effective_sources else bool(notes)
+    notes_text = services.pipeline.researcher.format_notes(notes)
+    if apply_labels and refused:
+        refusal_text = _refusal_message()
+        task_status["draft"] = False
+        task_status["review"] = False
+        task_status["rewrite"] = False
+        task_status["citations"] = False
+        result = PipelineResult(
+            outline=outline,
+            research_notes=notes,
+            draft_result=DraftResult(
+                outline=outline.outline,
+                research_notes=notes_text,
+                draft=refusal_text,
+                review=refusal_text,
+                revised=refusal_text,
+            ),
+        )
+        response = _serialize_pipeline_result(
+            payload,
+            result,
+            services,
+            coverage=0.0,
+            coverage_detail=CoverageDetail(),
+            citation_enforced=False,
+        )
+        return _ResearchStageState(
+            effective_sources=effective_sources,
+            notes=notes,
+            notes_text=notes_text,
+            final_response=response,
+        )
+    return _ResearchStageState(
+        effective_sources=effective_sources,
+        notes=notes,
+        notes_text=notes_text,
+    )
+
+
+def _run_pipeline_draft_sync(
+    *,
+    payload: PipelineRequest,
+    services: AppServices,
+    outline: OutlinePlan,
+    effective_constraints: str,
+    resolved_session_id: str,
+    notes_text: str,
+    source_count: int,
+) -> str:
+    apply_labels = _citations_enabled()
+    draft_tool_decision, draft_tool_registry = _resolve_stage_tools(
+        services=services,
+        stage="draft",
+        topic=payload.topic,
+        outline=outline.outline,
+        constraints=effective_constraints,
+        research_notes=notes_text,
+        rag_enforced=apply_labels,
+        source_count=source_count,
+    )
+    evidence_text = services.drafter.extract_evidence(notes_text)
+    draft_constraints = services.drafter.build_constraints(
+        research_notes=notes_text,
+        constraints=effective_constraints,
+        evidence_text=evidence_text,
+    )
+    return services.drafter.create_draft(
+        topic=payload.topic,
+        outline=outline.outline,
+        research_notes=notes_text,
+        constraints=draft_constraints,
+        style=payload.style,
+        target_length=payload.target_length,
+        evidence_text=evidence_text,
+        max_tokens=_pipeline_max_tokens("draft"),
+        max_input_chars=_pipeline_max_input_chars("draft"),
+        session_id=resolved_session_id,
+        tool_profile_id=_runtime_tool_profile_id(services, draft_tool_decision),
+        tool_registry_override=_runtime_tool_registry(services, draft_tool_registry),
+    )
+
+
+def _finalize_pipeline_response_from_tail(
+    *,
+    payload: PipelineRequest,
+    services: AppServices,
+    outline: OutlinePlan,
+    notes: list[ResearchNote],
+    notes_text: str,
+    draft: str,
+    review: str,
+    revised_candidate: str,
+) -> tuple[PipelineResponse, str, CoverageReport, bool]:
+    apply_labels = _citations_enabled()
+    enforced_text, report = _citation_enforcer.enforce(
+        revised_candidate or draft,
+        notes,
+        apply_labels=apply_labels,
+        strict_labels=_strict_citation_labels(),
+        embedder=services.rag.get_embedder(),
+    )
+    if apply_labels and _strict_citation_postcheck_failed(report):
+        enforced_text = _refusal_message()
+        report = _zero_coverage_report()
+    enforced_text = _postprocess_final_text(enforced_text)
+    citation_enforced = apply_labels and enforced_text != revised_candidate
+    final_result = PipelineResult(
+        outline=outline,
+        research_notes=notes,
+        draft_result=DraftResult(
+            outline=outline.outline,
+            research_notes=notes_text,
+            draft=draft,
+            review=review,
+            revised=enforced_text,
+        ),
+    )
+    response = _serialize_pipeline_result(
+        payload,
+        final_result,
+        services,
+        coverage=report.coverage,
+        coverage_detail=_coverage_detail(report),
+        citation_enforced=citation_enforced,
+    )
+    return response, enforced_text, report, citation_enforced
+
+
+def _run_pipeline_until_draft_sync(
+    *,
+    payload: PipelineRequest,
+    services: AppServices,
+    outline: OutlinePlan,
+    sources: list[SourceDocument],
+    github_context: str,
+    effective_constraints: str,
+    resolved_session_id: str,
+    task_status: dict[str, bool | None],
+    save_resume_state: Callable[[str, dict[str, Any]], None] | None = None,
+    resume_stage: str = "outline_accepted",
+    resume_payload: dict[str, Any] | None = None,
+) -> _DraftStageState:
+    base_payload = _base_resume_payload(
+        payload=payload,
+        resolved_session_id=resolved_session_id,
+        effective_constraints=effective_constraints,
+        github_context=github_context,
+        outline=outline,
+    )
+    resume_payload = dict(resume_payload or {})
+
+    if resume_stage == "draft_done":
+        notes = _restore_resume_notes(resume_payload.get("research_notes"))
+        if github_context and not any(note.doc_id == "github:mcp" for note in notes):
+            notes.append(_github_note(github_context))
+        notes_text = str(resume_payload.get("notes_text") or "")
+        if not notes_text:
+            notes_text = services.pipeline.researcher.format_notes(notes)
+        draft = str(resume_payload.get("draft") or "")
+        task_status["research"] = None if not sources else bool(notes)
+        task_status["draft"] = _is_effective(draft)
+        return _DraftStageState(
+            effective_sources=effective_sources,
+            notes=notes,
+            notes_text=notes_text,
+            draft=draft,
+        )
+
+    if save_resume_state:
+        save_resume_state("outline_accepted", dict(base_payload))
+    research_state = _run_pipeline_research_sync(
+        payload=payload,
+        services=services,
+        outline=outline,
+        sources=sources,
+        github_context=github_context,
+        effective_constraints=effective_constraints,
+        resolved_session_id=resolved_session_id,
+        task_status=task_status,
+    )
+    effective_sources = list(research_state.effective_sources)
+    notes = list(research_state.notes)
+    notes_text = research_state.notes_text
+    if research_state.final_response is not None:
+        if save_resume_state:
+            save_resume_state(
+                "completed",
+                {
+                    **base_payload,
+                    "research_notes": _serialize_resume_notes(notes),
+                    "notes_text": notes_text,
+                    "response": research_state.final_response.model_dump(),
+                    "coverage": 0.0,
+                    "coverage_detail": CoverageDetail().model_dump(),
+                },
+            )
+        return _DraftStageState(
+            effective_sources=effective_sources,
+            notes=notes,
+            notes_text=notes_text,
+            draft="",
+            final_response=research_state.final_response,
+        )
+
+    draft = _run_pipeline_draft_sync(
+        payload=payload,
+        services=services,
+        outline=outline,
+        effective_constraints=effective_constraints,
+        resolved_session_id=resolved_session_id,
+        notes_text=notes_text,
+        source_count=len(effective_sources),
+    )
+    task_status["draft"] = _is_effective(draft)
+    if save_resume_state:
+        save_resume_state(
+            "draft_done",
+            {
+                **base_payload,
+                "research_notes": _serialize_resume_notes(notes),
+                "notes_text": notes_text,
+                "draft": draft,
+            },
+        )
+    return _DraftStageState(
+        effective_sources=effective_sources,
+        notes=notes,
+        notes_text=notes_text,
+        draft=draft,
+    )
+
+
+def _run_pipeline_after_outline_sync(
+    *,
+    payload: PipelineRequest,
+    services: AppServices,
+    outline: OutlinePlan,
+    sources: list[SourceDocument],
+    github_context: str,
+    effective_constraints: str,
+    resolved_session_id: str,
+    task_status: dict[str, bool | None],
+    save_resume_state: Callable[[str, dict[str, Any]], None] | None = None,
+    resume_stage: str = "outline_accepted",
+    resume_payload: dict[str, Any] | None = None,
+) -> PipelineResponse:
+    apply_labels = _citations_enabled()
+    draft_state = _run_pipeline_until_draft_sync(
+        payload=payload,
+        services=services,
+        outline=outline,
+        sources=sources,
+        github_context=github_context,
+        effective_constraints=effective_constraints,
+        resolved_session_id=resolved_session_id,
+        task_status=task_status,
+        save_resume_state=save_resume_state,
+        resume_stage=resume_stage,
+        resume_payload=resume_payload,
+    )
+    if draft_state.final_response is not None:
+        return draft_state.final_response
+
+    effective_sources = list(draft_state.effective_sources)
+    notes = list(draft_state.notes)
+    notes_text = draft_state.notes_text
+    draft = draft_state.draft
+
+    review_tool_decision, review_tool_registry = _resolve_stage_tools(
+        services=services,
+        stage="review",
+        topic=payload.topic,
+        outline=outline.outline,
+        draft=draft,
+        guidance=payload.review_criteria,
+        research_notes=notes_text,
+        rag_enforced=apply_labels,
+        source_count=len(effective_sources),
+    )
+    review = services.drafter.review_draft(
+        draft=draft,
+        criteria=payload.review_criteria,
+        sources=notes_text,
+        audience=payload.audience,
+        max_tokens=_dynamic_review_max_tokens(draft),
+        max_input_chars=_pipeline_max_input_chars("review"),
+        session_id=resolved_session_id,
+        tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
+        tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
+    )
+    task_status["review"] = bool(review.strip())
+
+    rewrite_tool_decision, rewrite_tool_registry = _resolve_stage_tools(
+        services=services,
+        stage="rewrite",
+        topic=payload.topic,
+        outline=outline.outline,
+        draft=draft,
+        guidance=payload.review_criteria,
+        research_notes=notes_text,
+        rag_enforced=apply_labels,
+        source_count=len(effective_sources),
+    )
+    evidence_text = services.drafter.extract_evidence(notes_text)
+    revised = services.drafter.revise_draft(
+        draft=draft,
+        guidance=_rewrite_guidance(review, payload.review_criteria),
+        style=payload.style,
+        target_length=payload.target_length,
+        evidence_text=evidence_text,
+        max_tokens=_dynamic_rewrite_max_tokens(draft),
+        max_input_chars=_pipeline_max_input_chars("rewrite"),
+        session_id=resolved_session_id,
+        tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
+        tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
+    )
+
+    response, enforced_text, report, citation_enforced = _finalize_pipeline_response_from_tail(
+        payload=payload,
+        services=services,
+        outline=outline,
+        notes=notes,
+        notes_text=notes_text,
+        draft=draft,
+        review=review,
+        revised_candidate=revised,
+    )
+    task_status["rewrite"] = _is_effective(enforced_text)
+    task_status["citations"] = True
+    if save_resume_state:
+        base_payload = _base_resume_payload(
+            payload=payload,
+            resolved_session_id=resolved_session_id,
+            effective_constraints=effective_constraints,
+            github_context=github_context,
+            outline=outline,
+        )
+        save_resume_state(
+            "completed",
+            {
+                **base_payload,
+                "research_notes": _serialize_resume_notes(notes),
+                "notes_text": notes_text,
+                "draft": draft,
+                "review": review,
+                "revised": enforced_text,
+                "coverage": report.coverage,
+                "coverage_detail": (_coverage_detail(report) or CoverageDetail()).model_dump(),
+                "response": response.model_dump(),
+            },
+        )
+    return response
+
+
+def _run_pipeline_research_stream(
+    *,
+    q: Queue[dict | None],
+    payload: PipelineRequest,
+    services: AppServices,
+    outline: OutlinePlan,
+    sources: list[SourceDocument],
+    github_context: str,
+    effective_constraints: str,
+    resolved_session_id: str,
+    task_status: dict[str, bool | None],
+) -> _ResearchStageState:
+    _ = effective_constraints
+    apply_labels = _citations_enabled()
+    effective_sources = list(sources)
+    refusal_query = _build_refusal_query(
+        topic=payload.topic,
+        key_points=payload.key_points,
+        constraints=payload.constraints,
+        audience=payload.audience,
+        style=payload.style,
+        outline=outline.outline,
+    )
+    if _refusal_enabled() and effective_sources:
+        refused, effective_sources = _refusal_check_with_fallback(
+            query=refusal_query,
+            sources=effective_sources,
+            services=services,
+        )
+    else:
+        refused = False
+
+    q.put({"type": "status", "step": "research"})
+    notes = (
+        services.pipeline.collect_research_notes(payload.topic, outline, effective_sources)
+        if effective_sources
+        else []
+    )
+    if github_context and not any(note.doc_id == "github:mcp" for note in notes):
+        notes.append(_github_note(github_context))
+    task_status["research"] = None if not effective_sources else bool(notes)
+    notes_text = services.pipeline.researcher.format_notes(notes)
+    q.put(
+        {
+            "type": "research",
+            "payload": {
+                "notes": [
+                    ResearchNoteResponse(
+                        doc_id=note.doc_id,
+                        title=note.title,
+                        summary=note.summary,
+                        url=note.url,
+                    ).model_dump()
+                    for note in notes
+                ],
+                "notes_text": notes_text,
+            },
+        }
+    )
+    if apply_labels and refused:
+        refusal_text = _refusal_message()
+        task_status["draft"] = False
+        task_status["review"] = False
+        task_status["rewrite"] = False
+        task_status["citations"] = False
+        q.put({"type": "draft", "payload": {"draft": refusal_text}})
+        q.put({"type": "review", "payload": {"review": refusal_text}})
+        q.put(
+            {
+                "type": "rewrite",
+                "payload": {
+                    "revised": refusal_text,
+                    "final": True,
+                    "coverage": 0.0,
+                    "coverage_detail": CoverageDetail().model_dump(),
+                },
+            }
+        )
+        result = PipelineResult(
+            outline=outline,
+            research_notes=notes,
+            draft_result=DraftResult(
+                outline=outline.outline,
+                research_notes=notes_text,
+                draft=refusal_text,
+                review=refusal_text,
+                revised=refusal_text,
+            ),
+        )
+        response = _serialize_pipeline_result(
+            payload,
+            result,
+            services,
+            coverage=0.0,
+            coverage_detail=CoverageDetail(),
+            citation_enforced=False,
+        )
+        q.put({"type": "result", "payload": response.model_dump()})
+        return _ResearchStageState(
+            effective_sources=effective_sources,
+            notes=notes,
+            notes_text=notes_text,
+            final_response=response,
+        )
+    return _ResearchStageState(
+        effective_sources=effective_sources,
+        notes=notes,
+        notes_text=notes_text,
+    )
+
+
+def _run_pipeline_draft_stream(
+    *,
+    q: Queue[dict | None],
+    payload: PipelineRequest,
+    services: AppServices,
+    outline: OutlinePlan,
+    effective_constraints: str,
+    resolved_session_id: str,
+    notes_text: str,
+    source_count: int,
+) -> str:
+    apply_labels = _citations_enabled()
+    draft_tool_decision, draft_tool_registry = _resolve_stage_tools(
+        services=services,
+        stage="draft",
+        topic=payload.topic,
+        outline=outline.outline,
+        constraints=effective_constraints,
+        research_notes=notes_text,
+        rag_enforced=apply_labels,
+        source_count=source_count,
+    )
+    evidence_text = services.drafter.extract_evidence(notes_text)
+    draft_constraints = services.drafter.build_constraints(
+        research_notes=notes_text,
+        constraints=effective_constraints,
+        evidence_text=evidence_text,
+    )
+    q.put({"type": "status", "step": "draft"})
+    draft_chunks: list[str] = []
+    for chunk in services.drafter.writing_agent.draft_stream(
+        topic=payload.topic,
+        outline=outline.outline,
+        constraints=draft_constraints,
+        style=payload.style,
+        target_length=payload.target_length,
+        max_tokens=_pipeline_max_tokens("draft"),
+        max_input_chars=_pipeline_max_input_chars("draft"),
+        session_id=resolved_session_id,
+        tool_profile_id=_runtime_tool_profile_id(services, draft_tool_decision),
+        tool_registry_override=_runtime_tool_registry(services, draft_tool_registry),
+    ):
+        if not chunk:
+            continue
+        draft_chunks.append(chunk)
+        q.put({"type": "delta", "stage": "draft", "content": chunk})
+    draft = "".join(draft_chunks)
+    if not draft.strip():
+        draft = _run_pipeline_draft_sync(
+            payload=payload,
+            services=services,
+            outline=outline,
+            effective_constraints=effective_constraints,
+            resolved_session_id=resolved_session_id,
+            notes_text=notes_text,
+            source_count=source_count,
+        )
+        _emit_text_deltas(q, "draft", draft)
+    q.put({"type": "draft", "payload": {"draft": draft}})
+    return draft
+
+
+def _run_pipeline_until_draft_stream(
+    *,
+    q: Queue[dict | None],
+    payload: PipelineRequest,
+    services: AppServices,
+    outline: OutlinePlan,
+    sources: list[SourceDocument],
+    github_context: str,
+    effective_constraints: str,
+    resolved_session_id: str,
+    task_status: dict[str, bool | None],
+    save_resume_state: Callable[[str, dict[str, Any]], None] | None = None,
+    resume_stage: str = "outline_accepted",
+    resume_payload: dict[str, Any] | None = None,
+) -> _DraftStageState:
+    base_payload = _base_resume_payload(
+        payload=payload,
+        resolved_session_id=resolved_session_id,
+        effective_constraints=effective_constraints,
+        github_context=github_context,
+        outline=outline,
+    )
+    resume_payload = dict(resume_payload or {})
+
+    if resume_stage == "draft_done":
+        notes = _restore_resume_notes(resume_payload.get("research_notes"))
+        if github_context and not any(note.doc_id == "github:mcp" for note in notes):
+            notes.append(_github_note(github_context))
+        notes_text = str(resume_payload.get("notes_text") or "")
+        if not notes_text:
+            notes_text = services.pipeline.researcher.format_notes(notes)
+        draft = str(resume_payload.get("draft") or "")
+        task_status["research"] = None if not sources else bool(notes)
+        task_status["draft"] = _is_effective(draft)
+        q.put(
+            {
+                "type": "research",
+                "payload": {
+                    "notes": [
+                        ResearchNoteResponse(
+                            doc_id=note.doc_id,
+                            title=note.title,
+                            summary=note.summary,
+                            url=note.url,
+                        ).model_dump()
+                        for note in notes
+                    ],
+                    "notes_text": notes_text,
+                },
+            }
+        )
+        q.put({"type": "draft", "payload": {"draft": draft}})
+        return _DraftStageState(
+            effective_sources=effective_sources,
+            notes=notes,
+            notes_text=notes_text,
+            draft=draft,
+        )
+
+    if save_resume_state:
+        save_resume_state("outline_accepted", dict(base_payload))
+    research_state = _run_pipeline_research_stream(
+        q=q,
+        payload=payload,
+        services=services,
+        outline=outline,
+        sources=sources,
+        github_context=github_context,
+        effective_constraints=effective_constraints,
+        resolved_session_id=resolved_session_id,
+        task_status=task_status,
+    )
+    effective_sources = list(research_state.effective_sources)
+    notes = list(research_state.notes)
+    notes_text = research_state.notes_text
+    if research_state.final_response is not None:
+        if save_resume_state:
+            save_resume_state(
+                "completed",
+                {
+                    **base_payload,
+                    "research_notes": _serialize_resume_notes(notes),
+                    "notes_text": notes_text,
+                    "response": research_state.final_response.model_dump(),
+                    "coverage": 0.0,
+                    "coverage_detail": CoverageDetail().model_dump(),
+                },
+            )
+        return _DraftStageState(
+            effective_sources=effective_sources,
+            notes=notes,
+            notes_text=notes_text,
+            draft="",
+            final_response=research_state.final_response,
+        )
+
+    draft = _run_pipeline_draft_stream(
+        q=q,
+        payload=payload,
+        services=services,
+        outline=outline,
+        effective_constraints=effective_constraints,
+        resolved_session_id=resolved_session_id,
+        notes_text=notes_text,
+        source_count=len(effective_sources),
+    )
+    task_status["draft"] = _is_effective(draft)
+    if save_resume_state:
+        save_resume_state(
+            "draft_done",
+            {
+                **base_payload,
+                "research_notes": _serialize_resume_notes(notes),
+                "notes_text": notes_text,
+                "draft": draft,
+            },
+        )
+    return _DraftStageState(
+        effective_sources=effective_sources,
+        notes=notes,
+        notes_text=notes_text,
+        draft=draft,
+    )
+
+
+def _run_pipeline_after_outline_stream(
+    *,
+    q: Queue[dict | None],
+    payload: PipelineRequest,
+    services: AppServices,
+    outline: OutlinePlan,
+    sources: list[SourceDocument],
+    github_context: str,
+    effective_constraints: str,
+    resolved_session_id: str,
+    task_status: dict[str, bool | None],
+    save_resume_state: Callable[[str, dict[str, Any]], None] | None = None,
+    resume_stage: str = "outline_accepted",
+    resume_payload: dict[str, Any] | None = None,
+) -> PipelineResponse:
+    draft_state = _run_pipeline_until_draft_stream(
+        q=q,
+        payload=payload,
+        services=services,
+        outline=outline,
+        sources=sources,
+        github_context=github_context,
+        effective_constraints=effective_constraints,
+        resolved_session_id=resolved_session_id,
+        task_status=task_status,
+        save_resume_state=save_resume_state,
+        resume_stage=resume_stage,
+        resume_payload=resume_payload,
+    )
+    if draft_state.final_response is not None:
+        return draft_state.final_response
+
+    apply_labels = _citations_enabled()
+    effective_sources = list(draft_state.effective_sources)
+    notes = list(draft_state.notes)
+    notes_text = draft_state.notes_text
+    draft = draft_state.draft
+
+    review_tool_decision, review_tool_registry = _resolve_stage_tools(
+        services=services,
+        stage="review",
+        topic=payload.topic,
+        outline=outline.outline,
+        draft=draft,
+        guidance=payload.review_criteria,
+        research_notes=notes_text,
+        rag_enforced=apply_labels,
+        source_count=len(effective_sources),
+    )
+    q.put({"type": "status", "step": "review"})
+    review_chunks: list[str] = []
+    for chunk in services.reviewer.agent.review_stream(
+        draft=draft,
+        criteria=payload.review_criteria,
+        sources=notes_text,
+        audience=payload.audience,
+        max_tokens=_dynamic_review_max_tokens(draft),
+        max_input_chars=_pipeline_max_input_chars("review"),
+        session_id=resolved_session_id,
+        tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
+        tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
+    ):
+        if not chunk:
+            continue
+        review_chunks.append(chunk)
+        q.put({"type": "delta", "stage": "review", "content": chunk})
+    review = "".join(review_chunks)
+    if not review.strip():
+        review = services.reviewer.review(
+            draft=draft,
+            criteria=payload.review_criteria,
+            sources=notes_text,
+            audience=payload.audience,
+            max_tokens=_dynamic_review_max_tokens(draft),
+            max_input_chars=_pipeline_max_input_chars("review"),
+            session_id=resolved_session_id,
+            tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
+            tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
+        ).review
+        _emit_text_deltas(q, "review", review)
+    task_status["review"] = bool(review.strip())
+    q.put({"type": "review", "payload": {"review": review}})
+
+    rewrite_tool_decision, rewrite_tool_registry = _resolve_stage_tools(
+        services=services,
+        stage="rewrite",
+        topic=payload.topic,
+        outline=outline.outline,
+        draft=draft,
+        guidance=payload.review_criteria,
+        research_notes=notes_text,
+        rag_enforced=apply_labels,
+        source_count=len(effective_sources),
+    )
+    q.put({"type": "status", "step": "rewrite"})
+    rewrite_chunks: list[str] = []
+    evidence_text = services.drafter.extract_evidence(notes_text)
+    rewrite_guidance = _rewrite_guidance(review, payload.review_criteria)
+    for chunk in services.rewriter.agent.rewrite_stream(
+        draft=draft,
+        guidance=(rewrite_guidance + ("\n\nOnly use the evidence below:\n" + evidence_text if evidence_text else "")).strip(),
+        style=payload.style,
+        target_length=payload.target_length,
+        max_tokens=_dynamic_rewrite_max_tokens(draft),
+        max_input_chars=_pipeline_max_input_chars("rewrite"),
+        session_id=resolved_session_id,
+        tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
+        tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
+    ):
+        if not chunk:
+            continue
+        rewrite_chunks.append(chunk)
+        q.put({"type": "delta", "stage": "rewrite", "content": chunk})
+    revised = "".join(rewrite_chunks)
+    if not revised.strip():
+        revised = services.rewriter.rewrite(
+            draft=draft,
+            guidance=rewrite_guidance,
+            style=payload.style,
+            target_length=payload.target_length,
+            max_tokens=_dynamic_rewrite_max_tokens(draft),
+            max_input_chars=_pipeline_max_input_chars("rewrite"),
+            session_id=resolved_session_id,
+            tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
+            tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
+        ).revised
+        _emit_text_deltas(q, "rewrite", revised)
+
+    response, enforced_text, report, citation_enforced = _finalize_pipeline_response_from_tail(
+        payload=payload,
+        services=services,
+        outline=outline,
+        notes=notes,
+        notes_text=notes_text,
+        draft=draft,
+        review=review,
+        revised_candidate=revised,
+    )
+    task_status["rewrite"] = _is_effective(enforced_text)
+    task_status["citations"] = True
+    q.put(
+        {
+            "type": "rewrite",
+            "payload": {
+                "revised": enforced_text,
+                "final": True,
+                "coverage": report.coverage,
+                "coverage_detail": (_coverage_detail(report) or CoverageDetail()).model_dump(),
+            },
+        }
+    )
+    q.put({"type": "status", "step": "citations"})
+    if save_resume_state:
+        base_payload = _base_resume_payload(
+            payload=payload,
+            resolved_session_id=resolved_session_id,
+            effective_constraints=effective_constraints,
+            github_context=github_context,
+            outline=outline,
+        )
+        save_resume_state(
+            "completed",
+            {
+                **base_payload,
+                "research_notes": _serialize_resume_notes(notes),
+                "notes_text": notes_text,
+                "draft": draft,
+                "review": review,
+                "revised": enforced_text,
+                "coverage": report.coverage,
+                "coverage_detail": (_coverage_detail(report) or CoverageDetail()).model_dump(),
+                "response": response.model_dump(),
+            },
+        )
+    q.put({"type": "result", "payload": response.model_dump()})
+    return response
+
+
 @router.post("/pipeline", response_model=PipelineResponse)
 def run_pipeline(
     payload: PipelineRequest,
@@ -709,169 +1670,37 @@ def run_pipeline(
             rag_enforced=apply_labels,
             source_count=source_count_for_policy,
         )
-        result = services.pipeline.run(
+        outline = services.planner.plan_outline(
             topic=payload.topic,
             audience=payload.audience,
             style=payload.style,
             target_length=payload.target_length,
             constraints=constraints,
             key_points=payload.key_points,
-            sources=sources,
-            review_criteria=payload.review_criteria,
-            plan_max_tokens=_pipeline_max_tokens("plan"),
-            draft_max_tokens=_pipeline_max_tokens("draft"),
-            review_max_tokens=_pipeline_max_tokens("review"),
-            rewrite_max_tokens=_pipeline_max_tokens("rewrite"),
-            plan_max_input_chars=_pipeline_max_input_chars("plan"),
-            draft_max_input_chars=_pipeline_max_input_chars("draft"),
-            review_max_input_chars=_pipeline_max_input_chars("review"),
-            rewrite_max_input_chars=_pipeline_max_input_chars("rewrite"),
+            max_tokens=_pipeline_max_tokens("plan"),
+            max_input_chars=_pipeline_max_input_chars("plan"),
             session_id=payload.session_id,
-            plan_tool_profile_id=_runtime_tool_profile_id(services, plan_tool_decision),
-            plan_tool_registry_override=_runtime_tool_registry(services, plan_tool_registry),
-            draft_tool_profile_id=_runtime_tool_profile_id(services, draft_tool_decision),
-            draft_tool_registry_override=_runtime_tool_registry(services, draft_tool_registry),
-            review_tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
-            review_tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
-            rewrite_tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
-            rewrite_tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
+            tool_profile_id=_runtime_tool_profile_id(services, plan_tool_decision),
+            tool_registry_override=_runtime_tool_registry(services, plan_tool_registry),
         )
-        refusal_query = _build_refusal_query(
-            topic=payload.topic,
-            key_points=payload.key_points,
-            constraints=payload.constraints,
-            audience=payload.audience,
-            style=payload.style,
-            outline=result.outline.outline,
+        task_status["plan"] = bool(outline.outline.strip())
+        response = _run_pipeline_after_outline_sync(
+            payload=payload,
+            services=services,
+            outline=outline,
+            sources=sources,
+            github_context=github_context,
+            effective_constraints=constraints,
+            resolved_session_id=payload.session_id,
+            task_status=task_status,
         )
-        effective_sources = list(sources)
-        if _refusal_enabled():
-            refused, effective_sources = _refusal_check_with_fallback(
-                query=refusal_query,
-                sources=effective_sources,
-                services=services,
-            )
-        else:
-            refused = False
-        if refused:
-            refusal_text = _refusal_message()
-            draft_result = DraftResult(
-                outline=result.draft_result.outline,
-                research_notes=result.draft_result.research_notes,
-                draft=refusal_text,
-                review=refusal_text,
-                revised=refusal_text,
-            )
-            result = PipelineResult(
-                outline=result.outline,
-                research_notes=result.research_notes,
-                draft_result=draft_result,
-            )
-            task_status["plan"] = bool(result.outline.outline.strip())
-            task_status["research"] = None if not sources else bool(result.research_notes)
-            task_status["draft"] = False
-            task_status["review"] = False
-            task_status["rewrite"] = False
-            task_status["citations"] = False
-            succeeded = True
-            response = _serialize_pipeline_result(
-                payload,
-                result,
-                services,
-                coverage=0.0,
-                coverage_detail=CoverageDetail(),
-                citation_enforced=False,
-            )
-            logger.info(
-                "pipeline refused: session_id=%s elapsed_ms=%.2f",
-                payload.session_id or "__default__",
-                (time.perf_counter() - t0) * 1000,
-            )
-            return response
-        if apply_labels and not _same_source_ids(sources, effective_sources):
-            refreshed_notes = services.pipeline.collect_research_notes(
-                payload.topic,
-                result.outline,
-                effective_sources,
-            )
-            if github_context and not any(note.doc_id == "github:mcp" for note in refreshed_notes):
-                refreshed_notes.append(_github_note(github_context))
-            refreshed_notes_text = services.pipeline.researcher.format_notes(refreshed_notes)
-            refreshed_draft = services.drafter.run_full(
-                topic=payload.topic,
-                outline=result.outline.outline,
-                research_notes=refreshed_notes_text,
-                constraints=constraints,
-                style=payload.style,
-                target_length=payload.target_length,
-                review_criteria=payload.review_criteria,
-                audience=payload.audience,
-                draft_max_tokens=_pipeline_max_tokens("draft"),
-                review_max_tokens=_pipeline_max_tokens("review"),
-                rewrite_max_tokens=_pipeline_max_tokens("rewrite"),
-                draft_max_input_chars=_pipeline_max_input_chars("draft"),
-                review_max_input_chars=_pipeline_max_input_chars("review"),
-                rewrite_max_input_chars=_pipeline_max_input_chars("rewrite"),
-                session_id=payload.session_id,
-                draft_tool_profile_id=_runtime_tool_profile_id(services, draft_tool_decision),
-                draft_tool_registry_override=_runtime_tool_registry(services, draft_tool_registry),
-                review_tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
-                review_tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
-                rewrite_tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
-                rewrite_tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
-            )
-            result = PipelineResult(
-                outline=result.outline,
-                research_notes=refreshed_notes,
-                draft_result=refreshed_draft,
-            )
-        elif github_context and not any(note.doc_id == "github:mcp" for note in result.research_notes):
-            result.research_notes.append(_github_note(github_context))
-        enforced_text, report = _citation_enforcer.enforce(
-            result.draft_result.revised or result.draft_result.draft,
-            result.research_notes,
-            apply_labels=apply_labels,
-            strict_labels=_strict_citation_labels(),
-            embedder=services.rag.get_embedder(),
-        )
-        if apply_labels and _strict_citation_postcheck_failed(report):
-            enforced_text = _refusal_message()
-            report = _zero_coverage_report()
-        enforced_text = _postprocess_final_text(enforced_text)
-        citation_enforced = apply_labels and enforced_text != result.draft_result.revised
-        draft_result = DraftResult(
-            outline=result.draft_result.outline,
-            research_notes=result.draft_result.research_notes,
-            draft=result.draft_result.draft,
-            review=result.draft_result.review,
-            revised=enforced_text,
-        )
-        result = PipelineResult(
-            outline=result.outline,
-            research_notes=result.research_notes,
-            draft_result=draft_result,
-        )
-        task_status["plan"] = bool(result.outline.outline.strip())
-        task_status["research"] = None if not sources else bool(result.research_notes)
-        task_status["draft"] = _is_effective(result.draft_result.draft)
-        task_status["review"] = bool(result.draft_result.review.strip())
-        task_status["rewrite"] = _is_effective(result.draft_result.revised)
-        task_status["citations"] = True
         succeeded = True
-        response = _serialize_pipeline_result(
-            payload,
-            result,
-            services,
-            coverage=report.coverage,
-            coverage_detail=_coverage_detail(report),
-            citation_enforced=citation_enforced,
-        )
         logger.info(
             "pipeline done: session_id=%s draft_len=%s revised_len=%s notes=%s elapsed_ms=%.2f",
             payload.session_id or "__default__",
-            len(result.draft_result.draft or ""),
-            len(result.draft_result.revised or ""),
-            len(result.research_notes or []),
+            len(response.draft or ""),
+            len(response.revised or ""),
+            len(response.research_notes or []),
             (time.perf_counter() - t0) * 1000,
         )
         return response
@@ -902,13 +1731,6 @@ def run_pipeline_stream(
     q: Queue[dict | None] = Queue()
 
     def worker() -> None:
-        def _emit_text_deltas(stage: str, text: str) -> None:
-            if not text:
-                return
-            chunk_size = max(128, _parse_int("PIPELINE_STREAM_FALLBACK_CHUNK_SIZE", 600))
-            for i in range(0, len(text), chunk_size):
-                q.put({"type": "delta", "stage": stage, "content": text[i : i + chunk_size]})
-
         task_status: dict[str, bool | None] = {
             "plan": None,
             "research": None,
@@ -1028,315 +1850,28 @@ def run_pipeline_stream(
                     },
                 }
             )
-
-            refusal_query = _build_refusal_query(
-                topic=payload.topic,
-                key_points=payload.key_points,
-                constraints=payload.constraints,
-                audience=payload.audience,
-                style=payload.style,
-                outline=outline.outline,
-            )
-            effective_sources = list(sources)
-            if _refusal_enabled() and effective_sources:
-                refused, effective_sources = _refusal_check_with_fallback(
-                    query=refusal_query,
-                    sources=effective_sources,
-                    services=services,
-                )
-            else:
-                refused = False
-
-            current_stage = "research"
-            q.put({"type": "status", "step": "research"})
-            if effective_sources:
-                notes = services.pipeline.collect_research_notes(payload.topic, outline, effective_sources)
-            else:
-                notes = []
-            if github_context and not any(note.doc_id == "github:mcp" for note in notes):
-                notes.append(_github_note(github_context))
-            task_status["research"] = None if not effective_sources else bool(notes)
-            _log_stage("research")
-            notes_text = services.pipeline.researcher.format_notes(notes)
-            draft_tool_decision, draft_tool_registry = _resolve_stage_tools(
+            current_stage = "tail"
+            response = _run_pipeline_after_outline_stream(
+                q=q,
+                payload=payload,
                 services=services,
-                stage="draft",
-                topic=payload.topic,
-                outline=outline.outline,
-                constraints=constraints,
-                research_notes=notes_text,
-                rag_enforced=apply_labels,
-                source_count=len(effective_sources),
+                outline=outline,
+                sources=sources,
+                github_context=github_context,
+                effective_constraints=constraints,
+                resolved_session_id=payload.session_id,
+                task_status=task_status,
             )
-            q.put(
-                {
-                    "type": "research",
-                    "payload": {
-                        "notes": [
-                            ResearchNoteResponse(
-                                doc_id=note.doc_id,
-                                title=note.title,
-                                summary=note.summary,
-                                url=note.url,
-                            ).model_dump()
-                            for note in notes
-                        ],
-                        "notes_text": notes_text,
-                    },
-                }
-            )
-
-            if apply_labels and refused:
-                refusal_text = _refusal_message()
-                task_status["draft"] = False
-                task_status["review"] = False
-                task_status["rewrite"] = False
-                task_status["citations"] = False
-                q.put({"type": "draft", "payload": {"draft": refusal_text}})
-                q.put({"type": "review", "payload": {"review": refusal_text}})
-                q.put(
-                    {
-                        "type": "rewrite",
-                        "payload": {
-                            "revised": refusal_text,
-                            "final": True,
-                            "coverage": 0.0,
-                            "coverage_detail": CoverageDetail().model_dump(),
-                        },
-                    }
-                )
-                draft_result = DraftResult(
-                    outline=outline.outline,
-                    research_notes=notes_text,
-                    draft=refusal_text,
-                    review=refusal_text,
-                    revised=refusal_text,
-                )
-                result = PipelineResult(outline=outline, research_notes=notes, draft_result=draft_result)
-                response = _serialize_pipeline_result(
-                    payload,
-                    result,
-                    services,
-                    coverage=0.0,
-                    coverage_detail=CoverageDetail(),
-                    citation_enforced=False,
-                )
-                succeeded = True
-                effective_output = False
-                q.put({"type": "result", "payload": response.model_dump()})
-                q.put({"type": "done", "ok": True})
-                return
-
-            current_stage = "draft"
-            q.put({"type": "status", "step": "draft"})
-            draft_chunks: list[str] = []
-            evidence_text = services.drafter.extract_evidence(notes_text)
-            draft_constraints = services.drafter.build_constraints(
-                research_notes=notes_text,
-                constraints=constraints,
-                evidence_text=evidence_text,
-            )
-            for chunk in services.drafter.writing_agent.draft_stream(
-                topic=payload.topic,
-                outline=outline.outline,
-                constraints=draft_constraints,
-                style=payload.style,
-                target_length=payload.target_length,
-                max_tokens=_pipeline_max_tokens("draft"),
-                max_input_chars=_pipeline_max_input_chars("draft"),
-                session_id=payload.session_id,
-                tool_profile_id=_runtime_tool_profile_id(services, draft_tool_decision),
-                tool_registry_override=_runtime_tool_registry(services, draft_tool_registry),
-            ):
-                if not chunk:
-                    continue
-                draft_chunks.append(chunk)
-                q.put({"type": "delta", "stage": "draft", "content": chunk})
-            draft = "".join(draft_chunks)
-            if not draft.strip():
-                logger.warning(
-                    "pipeline stream draft produced empty output, fallback to non-stream draft generation."
-                )
-                draft = services.drafter.create_draft(
-                    topic=payload.topic,
-                    outline=outline.outline,
-                    research_notes=notes_text,
-                    constraints=constraints,
-                    style=payload.style,
-                    target_length=payload.target_length,
-                    max_tokens=_pipeline_max_tokens("draft"),
-                    max_input_chars=_pipeline_max_input_chars("draft"),
-                    session_id=payload.session_id,
-                    tool_profile_id=_runtime_tool_profile_id(services, draft_tool_decision),
-                    tool_registry_override=_runtime_tool_registry(services, draft_tool_registry),
-                )
-                _emit_text_deltas("draft", draft)
-            task_status["draft"] = _is_effective(draft)
-            _log_stage("draft")
-            q.put({"type": "draft", "payload": {"draft": draft}})
-
-            current_stage = "review"
-            q.put({"type": "status", "step": "review"})
-            review_chunks: list[str] = []
-            review_tool_decision, review_tool_registry = _resolve_stage_tools(
-                services=services,
-                stage="review",
-                topic=payload.topic,
-                outline=outline.outline,
-                draft=draft,
-                guidance=payload.review_criteria,
-                research_notes=notes_text,
-                rag_enforced=apply_labels,
-                source_count=len(effective_sources),
-            )
-            # 根据 draft 长度动态设置 max_tokens，避免截断
-            review_max_tokens = min(8000, max(2000, int(len(draft) * 0.8)))
-            for chunk in services.reviewer.agent.review_stream(
-                draft=draft,
-                criteria=payload.review_criteria,
-                sources=notes_text,
-                audience=payload.audience,
-                max_tokens=review_max_tokens,
-                max_input_chars=_pipeline_max_input_chars("review"),
-                session_id=payload.session_id,
-                tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
-                tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
-            ):
-                if not chunk:
-                    continue
-                review_chunks.append(chunk)
-                q.put({"type": "delta", "stage": "review", "content": chunk})
-            review = "".join(review_chunks)
-            if not review.strip():
-                logger.warning(
-                    "pipeline stream review produced empty output, fallback to non-stream review generation."
-                )
-                review = services.reviewer.review(
-                    draft=draft,
-                    criteria=payload.review_criteria,
-                    sources=notes_text,
-                    audience=payload.audience,
-                    max_tokens=review_max_tokens,
-                    max_input_chars=_pipeline_max_input_chars("review"),
-                    session_id=payload.session_id,
-                    tool_profile_id=_runtime_tool_profile_id(services, review_tool_decision),
-                    tool_registry_override=_runtime_tool_registry(services, review_tool_registry),
-                ).review
-                _emit_text_deltas("review", review)
-            task_status["review"] = bool(review.strip())
-            _log_stage("review")
-            q.put({"type": "review", "payload": {"review": review}})
-
-            current_stage = "rewrite"
-            q.put({"type": "status", "step": "rewrite"})
-            rewrite_chunks: list[str] = []
-            rewrite_tool_decision, rewrite_tool_registry = _resolve_stage_tools(
-                services=services,
-                stage="rewrite",
-                topic=payload.topic,
-                outline=outline.outline,
-                draft=draft,
-                guidance=(review + "\n\n" + payload.review_criteria).strip(),
-                constraints=payload.style,
-                research_notes=notes_text,
-                rag_enforced=apply_labels,
-                source_count=len(effective_sources),
-            )
-            # 根据 draft 长度动态设置 max_tokens，避免截断
-            rewrite_max_tokens = min(8000, max(2000, int(len(draft) * 1.5)))
-            rewrite_guidance_parts = [part.strip() for part in [review, payload.review_criteria] if part and part.strip()]
-            rewrite_guidance = "\n\n".join(dict.fromkeys(rewrite_guidance_parts))
-            if evidence_text:
-                rewrite_guidance = (rewrite_guidance + "\n\nOnly use the evidence below:\n" + evidence_text).strip()
-            for chunk in services.rewriter.agent.rewrite_stream(
-                draft=draft,
-                guidance=rewrite_guidance,
-                style=payload.style,
-                target_length=payload.target_length,
-                max_tokens=rewrite_max_tokens,
-                max_input_chars=_pipeline_max_input_chars("rewrite"),
-                session_id=payload.session_id,
-                tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
-                tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
-            ):
-                if not chunk:
-                    continue
-                rewrite_chunks.append(chunk)
-                q.put({"type": "delta", "stage": "rewrite", "content": chunk})
-            revised = "".join(rewrite_chunks)
-            if not revised.strip():
-                logger.warning(
-                    "pipeline stream rewrite produced empty output, fallback to non-stream rewrite generation."
-                )
-                revised = services.rewriter.rewrite(
-                    draft=draft,
-                    guidance=rewrite_guidance,
-                    style=payload.style,
-                    target_length=payload.target_length,
-                    max_tokens=rewrite_max_tokens,
-                    max_input_chars=_pipeline_max_input_chars("rewrite"),
-                    session_id=payload.session_id,
-                    tool_profile_id=_runtime_tool_profile_id(services, rewrite_tool_decision),
-                    tool_registry_override=_runtime_tool_registry(services, rewrite_tool_registry),
-                ).revised
-                _emit_text_deltas("rewrite", revised)
-            apply_labels = _citations_enabled()
-            enforced_text, report = _citation_enforcer.enforce(
-                revised or draft,
-                notes,
-                apply_labels=apply_labels,
-                strict_labels=_strict_citation_labels(),
-                embedder=services.rag.get_embedder(),
-            )
-            if apply_labels and _strict_citation_postcheck_failed(report):
-                enforced_text = _refusal_message()
-                report = _zero_coverage_report()
-            enforced_text = _postprocess_final_text(enforced_text)
-            citation_enforced = apply_labels and enforced_text != revised
-            revised = enforced_text
-            task_status["rewrite"] = _is_effective(revised)
-            _log_stage("rewrite")
-            q.put(
-                {
-                    "type": "rewrite",
-                    "payload": {
-                        "revised": revised,
-                        "final": True,
-                        "coverage": report.coverage,
-                        "coverage_detail": _coverage_detail(report).model_dump(),
-                    },
-                }
-            )
-
-            q.put({"type": "status", "step": "citations"})
-            draft_result = DraftResult(
-                outline=outline.outline,
-                research_notes=notes_text,
-                draft=draft,
-                review=review,
-                revised=revised,
-            )
-            result = PipelineResult(outline=outline, research_notes=notes, draft_result=draft_result)
-            response = _serialize_pipeline_result(
-                payload,
-                result,
-                services,
-                coverage=report.coverage,
-                coverage_detail=_coverage_detail(report),
-                citation_enforced=citation_enforced,
-            )
-            task_status["citations"] = True
             succeeded = True
             effective_output = bool(task_status["rewrite"]) or bool(task_status["draft"])
-            _log_stage("citations")
+            _log_stage("tail")
             logger.info(
                 "pipeline stream done: session_id=%s draft_len=%s revised_len=%s notes=%s",
                 payload.session_id or "__default__",
-                len(draft or ""),
-                len(revised or ""),
-                len(notes or []),
+                len(response.draft or ""),
+                len(response.revised or ""),
+                len(response.research_notes or []),
             )
-            q.put({"type": "result", "payload": response.model_dump()})
             q.put({"type": "done", "ok": True})
         except Exception as exc:  # pragma: no cover
             logger.exception(

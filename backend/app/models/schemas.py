@@ -146,6 +146,52 @@ class PipelineV2Response(BaseModel):
     result: PipelineResponse | None = None
 
 
+class PipelineV2CheckpointSummary(BaseModel):
+    thread_id: str
+    status: str
+    current_stage: str
+    updated_at: str = ""
+
+
+class PipelineV2CheckpointListResponse(BaseModel):
+    checkpoints: list[PipelineV2CheckpointSummary] = Field(default_factory=list)
+
+
+class PipelineV2CheckpointDetailResponse(BaseModel):
+    thread_id: str
+    session_id: str = ""
+    mode: str = "sync"
+    status: str
+    current_stage: str
+    created_at: str = ""
+    updated_at: str = ""
+    can_resume: bool = False
+    outline: str = ""
+    assumptions: str = ""
+    open_questions: str = ""
+    last_error: str = ""
+
+
+class PipelineV2CheckpointCleanupRequest(BaseModel):
+    older_than_hours: int = Field(168, description="清理多少小时前的 checkpoint")
+    status: str = Field("completed", description="completed | failed | all")
+    dry_run: bool = Field(False, description="是否仅预览匹配数量")
+    limit: int = Field(100, description="最多处理多少条")
+
+
+class PipelineV2CheckpointCleanupResponse(BaseModel):
+    dry_run: bool
+    matched: int
+    deleted: int
+    thread_ids: list[str] = Field(default_factory=list)
+    older_than_hours: int
+    status: str
+
+
+class DeletePipelineV2CheckpointResponse(BaseModel):
+    deleted: bool
+
+
 class UploadDocumentsRequest(BaseModel):
     documents: list[SourceDocumentInput] = Field(default_factory=list)
 

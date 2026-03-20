@@ -1,7 +1,12 @@
 import { getApi } from "./api";
 import type {
+  DeletePipelineV2CheckpointResponse,
   PipelineRequest,
   PipelineResponse,
+  PipelineV2CheckpointCleanupRequest,
+  PipelineV2CheckpointCleanupResponse,
+  PipelineV2CheckpointDetailResponse,
+  PipelineV2CheckpointListResponse,
   PipelineV2Request,
   PipelineV2Response,
   PipelineV2ResumeRequest,
@@ -64,6 +69,8 @@ const runEventStream = async (
     let receivedAny = false;
     let receivedError = false;
     let receivedInterrupt = false;
+    let resultPayload: any = undefined;
+    let interruptPayload: any = undefined;
     let errorDetail = "";
     let shouldStop = false;
 
@@ -99,9 +106,11 @@ const runEventStream = async (
               evt?.type === "result" || evt?.type === "error" || evt?.type === "done";
             if (evt?.type === "result") {
               receivedResult = true;
+              resultPayload = evt?.payload;
             }
             if (evt?.type === "interrupt") {
               receivedInterrupt = true;
+              interruptPayload = evt?.payload;
             }
             if (evt?.type === "error") {
               receivedError = true;
@@ -152,9 +161,11 @@ const runEventStream = async (
                 evt?.type === "result" || evt?.type === "error" || evt?.type === "done";
               if (evt?.type === "result") {
                 receivedResult = true;
+                resultPayload = evt?.payload;
               }
               if (evt?.type === "interrupt") {
                 receivedInterrupt = true;
+                interruptPayload = evt?.payload;
               }
               if (evt?.type === "error") {
                 receivedError = true;
@@ -179,7 +190,10 @@ const runEventStream = async (
       throw new Error(errorDetail || "Pipeline stream failed");
     }
     if (allowInterrupt && receivedInterrupt) {
-      return;
+      return {
+        resultPayload,
+        interruptPayload,
+      };
     }
     if (!receivedResult) {
       if (receivedAny) {
@@ -187,6 +201,10 @@ const runEventStream = async (
       }
       throw new Error("Stream ended before receiving any pipeline event");
     }
+    return {
+      resultPayload,
+      interruptPayload,
+    };
   } finally {
     clearTimeout(timeoutId);
   }
@@ -211,4 +229,48 @@ export const resumePipelineV2Stream = async (
   onEvent: (event: any) => void
 ) => {
   return runEventStream("/api/pipeline/v2/resume/stream", payload, onEvent);
+};
+
+
+export const listPipelineV2Checkpoints = async (params?: {
+  limit?: number;
+  status?: string;
+  thread_id?: string;
+}) => {
+  const { data } = await getApi().get<PipelineV2CheckpointListResponse>("/api/pipeline/v2/checkpoints", {
+    params,
+    timeout: 30000,
+  });
+  return data;
+};
+
+export const getPipelineV2Checkpoint = async (threadId: string) => {
+  const { data } = await getApi().get<PipelineV2CheckpointDetailResponse>(
+    `/api/pipeline/v2/checkpoints/${encodeURIComponent(threadId)}`,
+    {
+      timeout: 30000,
+    }
+  );
+  return data;
+};
+
+export const deletePipelineV2Checkpoint = async (threadId: string) => {
+  const { data } = await getApi().delete<DeletePipelineV2CheckpointResponse>(
+    `/api/pipeline/v2/checkpoints/${encodeURIComponent(threadId)}`,
+    {
+      timeout: 30000,
+    }
+  );
+  return data;
+};
+
+export const cleanupPipelineV2Checkpoints = async (payload?: PipelineV2CheckpointCleanupRequest) => {
+  const { data } = await getApi().post<PipelineV2CheckpointCleanupResponse>(
+    "/api/pipeline/v2/checkpoints/cleanup",
+    payload ?? {},
+    {
+      timeout: 30000,
+    }
+  );
+  return data;
 };
