@@ -219,7 +219,6 @@ npm run dev
 ## 📚 更多文档
 
 - [backend/README.md](./backend/README.md)：后端接口、LangGraph v2、配置、评测与运维说明
-- [RAG_EVALUATION_REPORT.md](./RAG_EVALUATION_REPORT.md)：仓库内保留的一次 RAG 评估记录
 - [LANGGRAPH_MIGRATION_ANALYSIS.md](./LANGGRAPH_MIGRATION_ANALYSIS.md)：LangGraph 演进分析材料
 
 ## 📄 License
