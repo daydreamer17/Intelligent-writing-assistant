@@ -61,6 +61,18 @@ def test_github_context_skipped_without_keyword():
     assert not tool.calls
 
 
+def test_github_context_ignores_empty_diagnostic_result():
+    tool = DummyTool(
+        tools=[{"name": "github_search_repositories", "description": "search repos"}],
+        result="根据目前的工具执行结果，GitHub 上没有返回任何相关仓库信息。",
+    )
+
+    text = maybe_fetch_github_context(tool, query="github 大模型微调项目", context="")
+
+    assert tool.calls
+    assert text == ""
+
+
 def test_stage_tool_policy_for_plan_and_draft():
     plan = decide_tools(stage="plan", topic="github repository overview")
     draft = decide_tools(
