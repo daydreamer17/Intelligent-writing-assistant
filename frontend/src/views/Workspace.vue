@@ -190,15 +190,51 @@
       </div>
 
       <div class="field">
-        <label>{{ pipelineV2.status === 'completed' ? 'Resolved Outline' : 'Outline Review' }}</label>
+        <label>
+          {{
+            pipelineV2.interruptStage !== 'outline_review'
+              ? 'Outline Context'
+              : pipelineV2.status === 'completed'
+                ? 'Resolved Outline'
+                : 'Outline Review'
+          }}
+        </label>
         <textarea
           v-model="pipelineV2.outlineDraft"
           rows="8"
+          :readonly="pipelineV2.status !== 'interrupted' || pipelineV2.interruptStage !== 'outline_review'"
+          :placeholder="pipelineV2.status === 'interrupted' && pipelineV2.interruptStage === 'outline_review' ? 'Edit the outline here, then click Resume.' : ''"
+        />
+        <div v-if="pipelineV2.status === 'interrupted' && pipelineV2.interruptStage === 'outline_review'" class="muted">
+          If left empty, Resume will reuse the saved outline instead of deleting it.
+        </div>
+      </div>
+
+      <div v-if="pipelineV2.interruptStage === 'draft_review'" class="field">
+        <label>{{ pipelineV2.status === 'completed' ? 'Resolved Draft' : 'Draft Review' }}</label>
+        <textarea
+          v-model="pipelineV2.draftDraft"
+          rows="10"
           :readonly="pipelineV2.status !== 'interrupted'"
-          :placeholder="pipelineV2.status === 'interrupted' ? 'Edit the outline here, then click Resume.' : ''"
+          :placeholder="pipelineV2.status === 'interrupted' ? 'Edit the draft here, then click Resume.' : ''"
         />
         <div v-if="pipelineV2.status === 'interrupted'" class="muted">
-          If left empty, Resume will reuse the saved outline instead of deleting it.
+          If left empty, Resume will reuse the saved draft instead of deleting it.
+        </div>
+      </div>
+
+      <div v-if="pipelineV2.interruptStage === 'review_confirmation' || hasText(pipelineV2.reviewText)" class="field">
+        <label>{{ pipelineV2.status === 'completed' ? 'Resolved Review Decision' : 'Review Confirmation' }}</label>
+        <div class="v2-panel__text">{{ pipelineV2.reviewText || "-" }}</div>
+        <div class="muted" style="margin-top:8px;">
+          needs_rewrite: {{ pipelineV2.needsRewrite === null ? "-" : (pipelineV2.needsRewrite ? "true" : "false") }}
+          <span v-if="hasText(pipelineV2.reviewReason)"> | reason: {{ pipelineV2.reviewReason }}</span>
+          <span v-if="pipelineV2.reviewScore !== null && pipelineV2.reviewScore !== undefined">
+            | score: {{ pipelineV2.reviewScore.toFixed(2) }}
+          </span>
+        </div>
+        <div v-if="pipelineV2.status === 'interrupted' && pipelineV2.interruptStage === 'review_confirmation'" class="muted">
+          Review feedback is read-only in this interrupt. Click Resume to continue.
         </div>
       </div>
 
@@ -341,7 +377,13 @@ const pipelineV2 = reactive({
   status: "idle" as PipelineV2UiStatus,
   threadId: "",
   lookupThreadId: "",
+  interruptStage: "" as "" | "outline_review" | "draft_review" | "review_confirmation",
   outlineDraft: "",
+  draftDraft: "",
+  reviewText: "",
+  needsRewrite: null as boolean | null,
+  reviewReason: "",
+  reviewScore: null as number | null,
   assumptions: "",
   openQuestions: "",
   note: "",
@@ -413,13 +455,23 @@ const isPrimaryActionDisabled = computed(
 const pipelineV2StatusTextMap: Record<PipelineV2UiStatus, string> = {
   idle: "Idle",
   planning: "Planning",
-  interrupted: "Interrupted - waiting for outline review",
+  interrupted: "Interrupted",
   resuming: "Resuming",
   completed: "Completed",
   error: "Error",
 };
 
-const pipelineV2StatusText = computed(() => pipelineV2StatusTextMap[pipelineV2.status]);
+const pipelineV2StatusText = computed(() => {
+  if (pipelineV2.status === "interrupted") {
+    if (pipelineV2.interruptStage === "review_confirmation") {
+      return "Interrupted - waiting for review confirmation";
+    }
+    return pipelineV2.interruptStage === "draft_review"
+      ? "Interrupted - waiting for draft review"
+      : "Interrupted - waiting for outline review";
+  }
+  return pipelineV2StatusTextMap[pipelineV2.status];
+});
 
 const showPipelineV2Progress = computed(() => pipelineV2.status !== "idle" && pipelineV2.status !== "error");
 
@@ -446,13 +498,35 @@ const resetPipelineV2State = () => {
   pipelineV2.status = "idle";
   pipelineV2.threadId = "";
   pipelineV2.lookupThreadId = "";
+  pipelineV2.interruptStage = "";
   pipelineV2.outlineDraft = "";
+  pipelineV2.draftDraft = "";
+  pipelineV2.reviewText = "";
+  pipelineV2.needsRewrite = null;
+  pipelineV2.reviewReason = "";
+  pipelineV2.reviewScore = null;
   pipelineV2.assumptions = "";
   pipelineV2.openQuestions = "";
   pipelineV2.note = "";
   pipelineV2.error = "";
   currentPipelineV2Step.value = 0;
   loading.pipelineV2 = false;
+};
+
+const pipelineV2InterruptStep = (interruptStage: string) => {
+  if (interruptStage === "draft_review") return pipelineV2StageIndex.draft;
+  if (interruptStage === "review_confirmation") return pipelineV2StageIndex.review;
+  return pipelineV2StageIndex.interrupted;
+};
+
+const pipelineV2InterruptMessage = (interruptStage: string) => {
+  if (interruptStage === "draft_review") {
+    return "LangGraph v2 已在草稿完成后中断，等待人工修订草稿";
+  }
+  if (interruptStage === "review_confirmation") {
+    return "LangGraph v2 已在审阅完成后中断，等待人工确认";
+  }
+  return "LangGraph v2 已中断，等待人工修订大纲";
 };
 
 const openPipelineV2Panel = () => {
@@ -475,20 +549,38 @@ const applyPipelineV2CheckpointDetail = (detail: PipelineV2CheckpointDetailRespo
   pipelineV2.panelOpen = true;
   pipelineV2.threadId = detail.thread_id;
   pipelineV2.lookupThreadId = detail.thread_id;
+  pipelineV2.interruptStage =
+    detail.interrupt_stage === "draft_review"
+      ? "draft_review"
+      : detail.interrupt_stage === "review_confirmation"
+        ? "review_confirmation"
+        : "outline_review";
   pipelineV2.outlineDraft = detail.outline || "";
+  pipelineV2.draftDraft = detail.draft || "";
+  pipelineV2.reviewText = detail.review_text || "";
+  pipelineV2.needsRewrite = detail.needs_rewrite ?? null;
+  pipelineV2.reviewReason = detail.reason || "";
+  pipelineV2.reviewScore = detail.score ?? null;
   pipelineV2.assumptions = detail.assumptions || "";
   pipelineV2.openQuestions = detail.open_questions || "";
   pipelineV2.error = "";
   pipelineV2.note = "";
   form.outline = detail.outline || form.outline;
   output.outline = detail.outline || output.outline;
+  output.draft = detail.draft || output.draft;
+  output.review = detail.review_text || output.review;
   output.assumptions = detail.assumptions || output.assumptions;
   output.open_questions = detail.open_questions || output.open_questions;
 
   if (detail.status === "interrupted") {
     pipelineV2.status = "interrupted";
-    currentPipelineV2Step.value = pipelineV2StageIndex.interrupted;
-    pipelineV2.note = "Loaded an interrupted checkpoint.";
+    currentPipelineV2Step.value = pipelineV2InterruptStep(pipelineV2.interruptStage);
+    pipelineV2.note =
+      detail.interrupt_stage === "draft_review"
+        ? "Loaded a draft review checkpoint."
+        : detail.interrupt_stage === "review_confirmation"
+          ? "Loaded a review confirmation checkpoint."
+        : "Loaded an interrupted checkpoint.";
     return;
   }
 
@@ -555,11 +647,33 @@ const applyPipelineResponse = (res: PipelineResponse) => {
   }
 };
 
-const applyPipelineV2InterruptPayload = (payload: Record<string, unknown> | undefined) => {
+const applyPipelineV2InterruptPayload = (payload: Record<string, unknown> | undefined, kind = "outline_review") => {
+  const interruptStage =
+    String(payload?.interrupt_stage || kind || "outline_review") === "draft_review"
+      ? "draft_review"
+      : String(payload?.interrupt_stage || kind || "outline_review") === "review_confirmation"
+        ? "review_confirmation"
+        : "outline_review";
+  pipelineV2.interruptStage = interruptStage;
   pipelineV2.outlineDraft = payload?.outline ? String(payload.outline) : "";
+  pipelineV2.draftDraft = payload?.draft ? String(payload.draft) : "";
+  pipelineV2.reviewText = payload?.review_text ? String(payload.review_text) : "";
+  pipelineV2.needsRewrite =
+    payload?.needs_rewrite === undefined || payload?.needs_rewrite === null
+      ? null
+      : Boolean(payload.needs_rewrite);
+  pipelineV2.reviewReason = payload?.reason ? String(payload.reason) : "";
+  pipelineV2.reviewScore =
+    payload?.score === undefined || payload?.score === null ? null : Number(payload.score);
   pipelineV2.assumptions = payload?.assumptions ? String(payload.assumptions) : "";
   pipelineV2.openQuestions = payload?.open_questions ? String(payload.open_questions) : "";
   output.outline = pipelineV2.outlineDraft;
+  if (interruptStage === "draft_review") {
+    output.draft = pipelineV2.draftDraft;
+  }
+  if (interruptStage === "review_confirmation") {
+    output.review = pipelineV2.reviewText;
+  }
   output.assumptions = pipelineV2.assumptions;
   output.open_questions = pipelineV2.openQuestions;
   form.outline = pipelineV2.outlineDraft;
@@ -636,7 +750,9 @@ const handlePipelineV2 = async () => {
     currentPipelineV2Step.value = pipelineV2StageIndex.plan;
     pipelineV2.threadId = "";
     pipelineV2.lookupThreadId = "";
+    pipelineV2.interruptStage = "";
     pipelineV2.outlineDraft = "";
+    pipelineV2.draftDraft = "";
     pipelineV2.assumptions = "";
     pipelineV2.openQuestions = "";
     pipelineV2.note = "";
@@ -656,14 +772,15 @@ const handlePipelineV2 = async () => {
         output.outline = pipelineV2.outlineDraft;
       }
       if (evt.type === "outline") {
-        applyPipelineV2InterruptPayload(evt.payload || {});
+        applyPipelineV2InterruptPayload(evt.payload || {}, "outline_review");
       }
       if (evt.type === "interrupt") {
         pipelineV2.status = "interrupted";
-        currentPipelineV2Step.value = pipelineV2StageIndex.interrupted;
+        const interruptKind = String(evt.kind || evt.payload?.interrupt_stage || "outline_review");
+        currentPipelineV2Step.value = pipelineV2InterruptStep(interruptKind);
         pipelineV2.threadId = String(evt.payload?.thread_id || "");
-        applyPipelineV2InterruptPayload(evt.payload || {});
-        showToast("LangGraph v2 已中断，等待人工修订大纲");
+        applyPipelineV2InterruptPayload(evt.payload || {}, interruptKind);
+        showToast(pipelineV2InterruptMessage(interruptKind));
       }
       if (evt.type === "error") {
         const message = evt.detail || "LangGraph v2 执行失败";
@@ -676,10 +793,11 @@ const handlePipelineV2 = async () => {
     if (pipelineV2.status === "planning") {
       if (streamSummary?.interruptPayload) {
         pipelineV2.status = "interrupted";
-        currentPipelineV2Step.value = pipelineV2StageIndex.interrupted;
+        const interruptKind = String(streamSummary.interruptPayload?.interrupt_stage || "outline_review");
+        currentPipelineV2Step.value = pipelineV2InterruptStep(interruptKind);
         pipelineV2.threadId = String(streamSummary.interruptPayload?.thread_id || "");
-        applyPipelineV2InterruptPayload(streamSummary.interruptPayload || {});
-        showToast("LangGraph v2 已中断，等待人工修订大纲");
+        applyPipelineV2InterruptPayload(streamSummary.interruptPayload || {}, interruptKind);
+        showToast(pipelineV2InterruptMessage(interruptKind));
         return;
       }
       throw new Error("LangGraph v2 流式执行结束，但未收到 interrupt 事件");
@@ -711,10 +829,17 @@ const handlePipelineV2Resume = async () => {
     resetPipelineProgress();
     loading.pipelineV2 = true;
     pipelineV2.status = "resuming";
-    currentPipelineV2Step.value = pipelineV2StageIndex.research;
-    output.research_notes = [];
-    output.draft = "";
-    output.review = "";
+    currentPipelineV2Step.value =
+      pipelineV2.interruptStage === "draft_review"
+        ? pipelineV2StageIndex.review
+        : pipelineV2.interruptStage === "review_confirmation"
+          ? pipelineV2StageIndex.rewrite
+          : pipelineV2StageIndex.research;
+    if (pipelineV2.interruptStage !== "review_confirmation") {
+      output.research_notes = [];
+      output.draft = "";
+      output.review = "";
+    }
     output.revised = "";
     output.coverage = undefined;
     output.coverage_detail = undefined;
@@ -723,6 +848,7 @@ const handlePipelineV2Resume = async () => {
       {
         thread_id: pipelineV2.threadId,
         outline_override: pipelineV2.outlineDraft,
+        draft_override: pipelineV2.draftDraft,
       },
       (evt) => {
         if (evt.type === "status" && evt.step && evt.step in pipelineV2StageIndex) {
@@ -730,7 +856,7 @@ const handlePipelineV2Resume = async () => {
             pipelineV2StageIndex[evt.step as keyof typeof pipelineV2StageIndex];
         }
         if (evt.type === "outline") {
-          applyPipelineV2InterruptPayload(evt.payload || {});
+          applyPipelineV2InterruptPayload(evt.payload || {}, "outline_review");
         }
         if (evt.type === "research") {
           output.research_notes = evt.payload?.notes || [];
@@ -748,9 +874,22 @@ const handlePipelineV2Resume = async () => {
         }
         if (evt.type === "draft") {
           output.draft = evt.payload?.draft || output.draft;
+          pipelineV2.draftDraft = evt.payload?.draft || pipelineV2.draftDraft;
         }
         if (evt.type === "review") {
           output.review = evt.payload?.review || output.review;
+        }
+        if (evt.type === "review_decision") {
+          pipelineV2.reviewText = evt.payload?.review_text || pipelineV2.reviewText;
+          pipelineV2.needsRewrite =
+            evt.payload?.needs_rewrite === undefined || evt.payload?.needs_rewrite === null
+              ? pipelineV2.needsRewrite
+              : Boolean(evt.payload.needs_rewrite);
+          pipelineV2.reviewReason = evt.payload?.reason || pipelineV2.reviewReason;
+          pipelineV2.reviewScore =
+            evt.payload?.score === undefined || evt.payload?.score === null
+              ? pipelineV2.reviewScore
+              : Number(evt.payload.score);
         }
         if (evt.type === "rewrite") {
           output.revised = evt.payload?.revised || output.revised;
@@ -763,10 +902,11 @@ const handlePipelineV2Resume = async () => {
         }
         if (evt.type === "interrupt") {
           pipelineV2.status = "interrupted";
-          currentPipelineV2Step.value = pipelineV2StageIndex.interrupted;
+          const interruptKind = String(evt.kind || evt.payload?.interrupt_stage || "outline_review");
+          currentPipelineV2Step.value = pipelineV2InterruptStep(interruptKind);
           pipelineV2.threadId = String(evt.payload?.thread_id || pipelineV2.threadId);
-          applyPipelineV2InterruptPayload(evt.payload || {});
-          showToast("LangGraph v2 仍处于等待修订状态");
+          applyPipelineV2InterruptPayload(evt.payload || {}, interruptKind);
+          showToast(pipelineV2InterruptMessage(interruptKind));
         }
         if (evt.type === "result" && evt.payload) {
           applyPipelineResponse(evt.payload);
@@ -774,6 +914,7 @@ const handlePipelineV2Resume = async () => {
           currentPipelineV2Step.value = pipelineV2Steps.length;
           pipelineV2.threadId = pipelineV2.threadId || String(evt.payload?.thread_id || "");
           pipelineV2.outlineDraft = evt.payload.outline || pipelineV2.outlineDraft;
+          pipelineV2.draftDraft = evt.payload.draft || pipelineV2.draftDraft;
           pipelineV2.assumptions = evt.payload.assumptions || pipelineV2.assumptions;
           pipelineV2.openQuestions = evt.payload.open_questions || pipelineV2.openQuestions;
           form.outline = evt.payload.outline || form.outline;
@@ -789,12 +930,22 @@ const handlePipelineV2Resume = async () => {
     );
 
     if (pipelineV2.status === "resuming") {
+      if (streamSummary?.interruptPayload) {
+        const interruptKind = String(streamSummary.interruptPayload?.interrupt_stage || "outline_review");
+        pipelineV2.status = "interrupted";
+        currentPipelineV2Step.value = pipelineV2InterruptStep(interruptKind);
+        pipelineV2.threadId = pipelineV2.threadId || String(streamSummary.interruptPayload?.thread_id || "");
+        applyPipelineV2InterruptPayload(streamSummary.interruptPayload || {}, interruptKind);
+        showToast(pipelineV2InterruptMessage(interruptKind));
+        return;
+      }
       if (streamSummary?.resultPayload) {
         applyPipelineResponse(streamSummary.resultPayload);
         pipelineV2.status = "completed";
         currentPipelineV2Step.value = pipelineV2Steps.length;
         pipelineV2.threadId = pipelineV2.threadId || String(streamSummary.resultPayload?.thread_id || "");
         pipelineV2.outlineDraft = streamSummary.resultPayload.outline || pipelineV2.outlineDraft;
+        pipelineV2.draftDraft = streamSummary.resultPayload.draft || pipelineV2.draftDraft;
         pipelineV2.assumptions = streamSummary.resultPayload.assumptions || pipelineV2.assumptions;
         pipelineV2.openQuestions = streamSummary.resultPayload.open_questions || pipelineV2.openQuestions;
         form.outline = streamSummary.resultPayload.outline || form.outline;

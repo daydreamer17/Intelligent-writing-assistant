@@ -60,11 +60,18 @@ export interface PipelineV2Request extends PipelineRequest {
 export interface PipelineV2ResumeRequest {
   thread_id: string;
   outline_override?: string;
+  draft_override?: string;
 }
 
 export interface PipelineV2InterruptPayload {
   thread_id?: string;
+  interrupt_stage?: string;
   outline?: string;
+  draft?: string;
+  review_text?: string;
+  needs_rewrite?: boolean;
+  reason?: string;
+  score?: number | null;
   assumptions?: string;
   open_questions?: string;
   [key: string]: unknown;
@@ -99,10 +106,16 @@ export interface PipelineV2CheckpointDetailResponse {
   mode: string;
   status: string;
   current_stage: string;
+  interrupt_stage: string;
   created_at: string;
   updated_at: string;
   can_resume: boolean;
   outline: string;
+  draft: string;
+  review_text: string;
+  needs_rewrite: boolean | null;
+  reason: string;
+  score: number | null;
   assumptions: string;
   open_questions: string;
   last_error: string;

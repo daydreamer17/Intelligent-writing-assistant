@@ -228,7 +228,7 @@ export const resumePipelineV2Stream = async (
   payload: PipelineV2ResumeRequest,
   onEvent: (event: any) => void
 ) => {
-  return runEventStream("/api/pipeline/v2/resume/stream", payload, onEvent);
+  return runEventStream("/api/pipeline/v2/resume/stream", payload, onEvent, { allowInterrupt: true });
 };
 
 

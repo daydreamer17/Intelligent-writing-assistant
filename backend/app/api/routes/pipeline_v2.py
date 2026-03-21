@@ -28,6 +28,7 @@ from ...models.schemas import (
 )
 from ...services.github_context import maybe_fetch_github_context
 from ...services.pipeline_langgraph_v2 import (
+    clear_pipeline_v2_graph_thread,
     cleanup_pipeline_v2_checkpoints,
     delete_pipeline_v2_checkpoint,
     get_pipeline_v2_checkpoint_detail,
@@ -35,6 +36,7 @@ from ...services.pipeline_langgraph_v2 import (
     list_pipeline_v2_checkpoints,
     load_pipeline_v2_resume_state,
     mark_pipeline_v2_checkpoint_failed,
+    resume_pipeline_v2_full_workflow,
     run_pipeline_v2_full_stream,
     run_pipeline_v2_full_sync,
     resume_pipeline_v2_workflow,
@@ -116,6 +118,14 @@ def _completed_v2_response(thread_id: str, response_payload: dict[str, Any]) -> 
     )
 
 
+def _interrupted_v2_response(thread_id: str, *, kind: str, payload: dict[str, Any]) -> PipelineV2Response:
+    return PipelineV2Response(
+        status="interrupted",
+        thread_id=thread_id,
+        interrupt=PipelineV2Interrupt(kind=kind, payload=payload),
+    )
+
+
 def _load_resume_checkpoint(thread_id: str) -> dict[str, Any] | None:
     detail = load_pipeline_v2_resume_state(thread_id)
     if not detail:
@@ -184,7 +194,18 @@ def _extract_resume_context(thread_id: str) -> tuple[dict[str, Any] | None, str]
 
 def _resolve_resume_stage(resume_checkpoint: dict[str, Any]) -> str:
     stage = str(resume_checkpoint.get("current_stage") or "").strip() or "outline_accepted"
-    if stage not in {"outline_accepted", "research_done", "draft_done", "review_done", "completed"}:
+    if stage == "draft_review":
+        return "draft_done"
+    if stage == "review_confirmation":
+        return "review_done"
+    if stage not in {
+        "outline_accepted",
+        "research_done",
+        "draft_done",
+        "review_done",
+        "rewrite_done",
+        "completed",
+    }:
         return "outline_accepted"
     return stage
 
@@ -203,6 +224,9 @@ def _build_full_input(
     draft: str,
     review: str = "",
     needs_rewrite: bool | None = None,
+    review_reason: str = "",
+    review_score: float | None = None,
+    revised: str = "",
     start_stage: str = "outline_accepted",
     source_count: int = 0,
     services: AppServices,
@@ -243,7 +267,12 @@ def _build_full_input(
         "notes_text": notes_text,
         "draft": draft,
         "review": review,
+        "review_text": review,
         "needs_rewrite": needs_rewrite,
+        "reason": review_reason,
+        "score": review_score,
+        "revised": revised,
+        "revised_candidate": revised,
         "review_criteria": request_model.review_criteria,
         "audience": request_model.audience,
         "style": request_model.style,
@@ -267,19 +296,32 @@ def _build_full_input(
 
 def _apply_resume_stage_to_full_input(full_input: dict[str, Any], resume_stage: str) -> dict[str, Any]:
     task_status = dict(full_input.get("task_status") or {})
-    if resume_stage in {"research_done", "draft_done", "review_done"}:
+    if resume_stage in {"research_done", "draft_done", "review_done", "rewrite_done"}:
         task_status["research"] = None if not int(full_input.get("source_count") or 0) else bool(
             full_input.get("research_notes")
         )
-    if resume_stage in {"draft_done", "review_done"}:
+    if resume_stage in {"draft_done", "review_done", "rewrite_done"}:
         task_status["draft"] = bool(str(full_input.get("draft") or "").strip())
-    if resume_stage == "review_done":
+    if resume_stage in {"review_done", "rewrite_done"}:
         task_status["review"] = bool(str(full_input.get("review") or "").strip())
+    if resume_stage == "rewrite_done":
+        task_status["rewrite"] = bool(
+            str(full_input.get("revised_candidate") or full_input.get("revised") or "").strip()
+        )
     return {
         **full_input,
         "start_stage": resume_stage,
         "task_status": task_status,
     }
+
+
+def _extract_graph_interrupt(raw_result: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    interrupts = raw_result.get("__interrupt__") if isinstance(raw_result, dict) else None
+    if not interrupts:
+        return None
+    payload = dict(getattr(interrupts[0], "value", {}) or {})
+    kind = str(payload.pop("kind", payload.get("interrupt_stage") or "draft_review"))
+    return kind, payload
 
 
 def _task_status_from_full_state(full_state: dict[str, Any]) -> dict[str, bool | None]:
@@ -399,6 +441,7 @@ def resume_pipeline_v2(
 ) -> PipelineV2Response:
     thread_id = payload.thread_id.strip()
     resume_checkpoint, restored_session_id = _extract_resume_context(thread_id)
+    checkpoint_detail = get_pipeline_v2_checkpoint_detail(thread_id)
     t0 = time.perf_counter()
     _log_v2_stage(
         "resume_started",
@@ -434,6 +477,21 @@ def resume_pipeline_v2(
                     services=services,
                 )
             )
+            graph_interrupt = _extract_graph_interrupt(full_state)
+            if graph_interrupt is not None:
+                kind, interrupt_payload = graph_interrupt
+                upsert_pipeline_v2_checkpoint(
+                    thread_id=thread_id,
+                    session_id=resolved_session_id,
+                    mode="sync",
+                    status="interrupted",
+                    current_stage=(
+                        "review_confirmation" if kind == "review_confirmation" else "draft_review"
+                    ),
+                    outline_preview=str(interrupt_payload.get("outline") or ""),
+                )
+                _log_v2_stage("interrupted", thread_id=thread_id, resolved_session_id=resolved_session_id, started_at=t0)
+                return _interrupted_v2_response(thread_id, kind=kind, payload=interrupt_payload)
             response = PipelineResponse.model_validate(full_state.get("response") or {})
             task_status = _task_status_from_full_state(full_state)
             _log_task_success_rate(
@@ -451,6 +509,30 @@ def resume_pipeline_v2(
         if str(resume_checkpoint.get("status") or "") == "completed":
             _log_v2_stage("completed", thread_id=thread_id, resolved_session_id=restored_session_id, started_at=t0)
             return _completed_response_from_checkpoint(thread_id, resume_checkpoint)
+
+        if checkpoint_detail and checkpoint_detail.get("status") == "interrupted" and checkpoint_detail.get("current_stage") in {"draft_review", "review_confirmation"}:
+            checkpoint_payload = dict((resume_checkpoint or {}).get("payload") or {})
+            full_state = resume_pipeline_v2_full_workflow(
+                thread_id=thread_id,
+                draft_override=payload.draft_override if checkpoint_detail.get("current_stage") == "draft_review" else "",
+            )
+            graph_interrupt = _extract_graph_interrupt(full_state)
+            if graph_interrupt is not None:
+                kind, interrupt_payload = graph_interrupt
+                _log_v2_stage("interrupted", thread_id=thread_id, resolved_session_id=restored_session_id, started_at=t0)
+                return _interrupted_v2_response(thread_id, kind=kind, payload=interrupt_payload)
+            response = PipelineResponse.model_validate(full_state.get("response") or {})
+            task_status = _task_status_from_full_state(full_state)
+            _log_task_success_rate(
+                task_status,
+                terminate_ok=True,
+                effective_output=bool(task_status["rewrite"]) or bool(task_status["draft"]),
+            )
+            resolved_session_id = str(
+                checkpoint_payload.get("resolved_session_id") or restored_session_id or thread_id
+            )
+            _log_v2_stage("completed", thread_id=thread_id, resolved_session_id=resolved_session_id, started_at=t0)
+            return _completed_v2_response(thread_id, response.model_dump())
 
         checkpoint_payload = dict(resume_checkpoint.get("payload") or {})
         request_model = _request_from_dict(dict(checkpoint_payload.get("request") or {}))
@@ -471,16 +553,25 @@ def resume_pipeline_v2(
                 outline=outline,
                 research_notes=list(checkpoint_payload.get("research_notes") or []),
                 notes_text=str(checkpoint_payload.get("notes_text") or ""),
-                draft=str(checkpoint_payload.get("draft") or ""),
+                draft=str((payload.draft_override or "").strip() or checkpoint_payload.get("draft") or ""),
                 review=str(checkpoint_payload.get("review") or ""),
                 needs_rewrite=bool(checkpoint_payload.get("needs_rewrite")),
+                review_reason=str(checkpoint_payload.get("reason") or ""),
+                review_score=checkpoint_payload.get("score"),
+                revised=str(checkpoint_payload.get("revised") or ""),
                 start_stage=resume_stage,
                 source_count=len(sources),
                 services=services,
             ),
             resume_stage,
         )
+        clear_pipeline_v2_graph_thread(thread_id)
         full_state = run_pipeline_v2_full_sync(full_input)
+        graph_interrupt = _extract_graph_interrupt(full_state)
+        if graph_interrupt is not None:
+            kind, interrupt_payload = graph_interrupt
+            _log_v2_stage("interrupted", thread_id=thread_id, resolved_session_id=resolved_session_id, started_at=t0)
+            return _interrupted_v2_response(thread_id, kind=kind, payload=interrupt_payload)
         response = PipelineResponse.model_validate(full_state.get("response") or {})
         task_status = _task_status_from_full_state(full_state)
         _log_task_success_rate(
@@ -671,6 +762,7 @@ def resume_pipeline_v2_stream(
 
     def worker() -> None:
         resume_checkpoint, restored_session_id = _extract_resume_context(thread_id)
+        checkpoint_detail = get_pipeline_v2_checkpoint_detail(thread_id)
         t0 = time.perf_counter()
         try:
             _log_v2_stage(
@@ -719,6 +811,10 @@ def resume_pipeline_v2_stream(
                         services=services,
                     ),
                 )
+                if full_state.get("interrupted"):
+                    _log_v2_stage("interrupted", thread_id=thread_id, resolved_session_id=resolved_session_id, started_at=t0)
+                    q.put({"type": "done", "ok": True})
+                    return
                 task_status = _task_status_from_full_state(full_state)
                 _log_task_success_rate(
                     task_status,
@@ -742,6 +838,85 @@ def resume_pipeline_v2_stream(
                 q.put({"type": "done", "ok": True})
                 return
 
+            if checkpoint_detail and checkpoint_detail.get("status") == "interrupted" and checkpoint_detail.get("current_stage") in {"draft_review", "review_confirmation"}:
+                checkpoint_payload = dict(resume_checkpoint.get("payload") or {})
+                request_model = _request_from_dict(dict(checkpoint_payload.get("request") or {}))
+                resolved_session_id = str(checkpoint_payload.get("resolved_session_id") or restored_session_id or thread_id)
+                outline = _outline_from_data(checkpoint_payload)
+                github_context = str(checkpoint_payload.get("github_context") or "")
+                effective_constraints = str(checkpoint_payload.get("effective_constraints") or request_model.constraints or "")
+                sources = _build_sources(request_model, github_context)
+                q.put(
+                    {
+                        "type": "outline",
+                        "payload": {
+                            "outline": outline.outline,
+                            "assumptions": outline.assumptions,
+                            "open_questions": outline.open_questions,
+                            "thread_id": thread_id,
+                        },
+                    }
+                )
+                q.put(
+                    {
+                        "type": "draft",
+                        "payload": {
+                            "draft": str((payload.draft_override or "").strip() or checkpoint_payload.get("draft") or ""),
+                            "thread_id": thread_id,
+                        },
+                    }
+                )
+                full_state = run_pipeline_v2_full_stream(
+                    q=q,
+                    full_input=_apply_resume_stage_to_full_input(
+                        _build_full_input(
+                            thread_id=thread_id,
+                            mode="stream",
+                            request_model=request_model,
+                            resolved_session_id=resolved_session_id,
+                            effective_constraints=effective_constraints,
+                            github_context=github_context,
+                            outline=outline,
+                            research_notes=list(checkpoint_payload.get("research_notes") or []),
+                            notes_text=str(checkpoint_payload.get("notes_text") or ""),
+                            draft=str(
+                                (
+                                    (payload.draft_override or "").strip()
+                                    or checkpoint_payload.get("draft")
+                                    or ""
+                                )
+                                if checkpoint_detail.get("current_stage") == "draft_review"
+                                else checkpoint_payload.get("draft")
+                                or ""
+                            ),
+                            review=str(checkpoint_payload.get("review") or ""),
+                            needs_rewrite=bool(checkpoint_payload.get("needs_rewrite")),
+                            review_reason=str(checkpoint_payload.get("reason") or ""),
+                            review_score=checkpoint_payload.get("score"),
+                            revised=str(checkpoint_payload.get("revised") or ""),
+                            start_stage="draft_done"
+                            if checkpoint_detail.get("current_stage") == "draft_review"
+                            else "review_done",
+                            source_count=len(sources),
+                            services=services,
+                        ),
+                        "draft_done" if checkpoint_detail.get("current_stage") == "draft_review" else "review_done",
+                    ),
+                )
+                if full_state.get("interrupted"):
+                    _log_v2_stage("interrupted", thread_id=thread_id, resolved_session_id=resolved_session_id, started_at=t0)
+                    q.put({"type": "done", "ok": True})
+                    return
+                task_status = _task_status_from_full_state(full_state)
+                _log_task_success_rate(
+                    task_status,
+                    terminate_ok=True,
+                    effective_output=bool(task_status["rewrite"]) or bool(task_status["draft"]),
+                )
+                _log_v2_stage("completed", thread_id=thread_id, resolved_session_id=resolved_session_id, started_at=t0)
+                q.put({"type": "done", "ok": True})
+                return
+
             checkpoint_payload = dict(resume_checkpoint.get("payload") or {})
             request_model = _request_from_dict(dict(checkpoint_payload.get("request") or {}))
             resolved_session_id = str(checkpoint_payload.get("resolved_session_id") or restored_session_id or thread_id)
@@ -761,6 +936,7 @@ def resume_pipeline_v2_stream(
                     },
                 }
             )
+            clear_pipeline_v2_graph_thread(thread_id)
             full_state = run_pipeline_v2_full_stream(
                 q=q,
                 full_input=_apply_resume_stage_to_full_input(
@@ -774,9 +950,12 @@ def resume_pipeline_v2_stream(
                         outline=outline,
                         research_notes=list(checkpoint_payload.get("research_notes") or []),
                         notes_text=str(checkpoint_payload.get("notes_text") or ""),
-                        draft=str(checkpoint_payload.get("draft") or ""),
+                        draft=str((payload.draft_override or "").strip() or checkpoint_payload.get("draft") or ""),
                         review=str(checkpoint_payload.get("review") or ""),
                         needs_rewrite=bool(checkpoint_payload.get("needs_rewrite")),
+                        review_reason=str(checkpoint_payload.get("reason") or ""),
+                        review_score=checkpoint_payload.get("score"),
+                        revised=str(checkpoint_payload.get("revised") or ""),
                         start_stage=resume_stage,
                         source_count=len(sources),
                         services=services,
@@ -784,6 +963,10 @@ def resume_pipeline_v2_stream(
                     resume_stage,
                 ),
             )
+            if full_state.get("interrupted"):
+                _log_v2_stage("interrupted", thread_id=thread_id, resolved_session_id=resolved_session_id, started_at=t0)
+                q.put({"type": "done", "ok": True})
+                return
             task_status = _task_status_from_full_state(full_state)
             _log_task_success_rate(
                 task_status,

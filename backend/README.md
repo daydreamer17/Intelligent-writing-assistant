@@ -1,77 +1,219 @@
 # Writing Assistant Backend
 
-基于 FastAPI 的多 Agent 写作后端，提供分步写作、一键 Pipeline、RAG 检索、引用约束、会话记忆和离线检索评测能力。
+基于 FastAPI 的写作后端，负责分步写作、一键 pipeline、LangGraph v2 工作流、RAG 检索、引用补全、版本持久化与离线检索评测。
 
-## 1. 核心能力
+## 核心能力
 
-- 写作流程：`plan -> draft -> review -> rewrite -> citations`
-- 流式接口：分步与 Pipeline 均支持 SSE
-- RAG：文档上传、检索、动态 `top_k`、HyDE（可选）、Rerank（可选）
-- 三态调用模式：`rag_only / hybrid / creative`
-- 引用机制：
-  - `rag_only`：严格证据约束、可拒答
-  - `hybrid`：有证据段落加 `[n]`，无证据段落加 `[推断]`
-  - `creative`：不强制引用，支持运行时开关 MCP
-- 拒答判定增强：拒答查询默认精简（不直接拼接超长大纲/草稿），并按 original/bilingual/HyDE 变体最优分数判定
-- 覆盖率明细增强：区分语义段落覆盖率与词面复用覆盖率（严格辅指标）
-- 记忆机制：会话隔离（`session_id`）、上下文压缩、冷存写入与冷存召回；支持任务前自动重置
-- 评测能力：离线检索评测（Recall/Precision/HitRate/MRR/nDCG）与历史持久化，支持 baseline 对比脚本、重复运行均值/方差、逐 Query 明细报告、按标签分组统计、Agent 行为回归小套件
-- 线上动态检索策略路由（可选）：按 query 类型自动切换 `dense_only / rerank / hyde / bilingual`
-- MCP：可选 GitHub MCP 显式工具调用
+- 写作流程：`plan -> research -> draft -> review -> rewrite -> citations`
+- 分步接口与一键 pipeline：同步 / SSE 两条路径都可用
+- LangGraph v2：`outline_review`、`draft_review`、`review_confirmation` 三个 interrupt 点，支持 checkpoint / resume
+- RAG：文档上传、搜索、文档库、动态 `top_k`、rerank、HyDE、bilingual rewrite
+- 生成模式：`rag_only / hybrid / creative`
+- 引用与覆盖率：citation 补全、语义 / 词面 coverage 明细
+- 会话记忆：`session / global` 两种模式，支持前端主动清空
+- 离线评测：Recall / Precision / HitRate / MRR / nDCG，评测结果可持久化
+- 可选扩展：Qdrant hybrid retrieval、GitHub MCP
 
-## 2. 目录结构（简版）
+## 后端结构
+
+```mermaid
+flowchart LR
+    ROUTES["FastAPI Routes<br/>writing / pipeline / pipeline_v2 / rag / versions / settings"] --> SERVICES["Services<br/>planning / drafting / reviewing / rewriting / rag / citation / storage"]
+    SERVICES --> AGENTS["Hello-Agents<br/>WritingAgent / ReviewerAgent / EditorAgent"]
+    SERVICES --> GRAPH["LangGraph v2<br/>interrupt / checkpoint / resume"]
+    SERVICES --> SQLITE["SQLite<br/>documents / versions / eval runs / checkpoints"]
+    SERVICES --> QDRANT["Qdrant (optional)"]
+    SERVICES --> MCP["GitHub MCP (optional)"]
+```
+
+### 目录结构
 
 ```text
 backend/
-  app/
-    agents/        # Writing / Reviewer / Editor
-    api/routes/    # writing / pipeline / rag / versions / settings / mcp_github
-    services/      # pipeline, rag, citation, retrieval_eval, storage...
-    models/
-    config.py
-  data/
-  main.py
-  requirements.txt
-  .env.example
+├─ app/
+│  ├─ agents/        # Writing / Reviewer / Editor
+│  ├─ api/
+│  │  ├─ main.py
+│  │  └─ routes/     # writing / pipeline / pipeline_v2 / rag / versions / settings / mcp_github
+│  ├─ models/
+│  ├─ services/      # pipeline / rag / citation / retrieval_eval / storage / langgraph_v2
+│  └─ utils/
+├─ data/             # SQLite 数据与 checkpoint 文件
+├─ evals/            # baseline 报告与评测集
+├─ scripts/          # 评测脚本
+├─ tests/
+├─ .env.example
+├─ main.py
+└─ requirements.txt
 ```
 
-## 3. 快速启动
+## LangGraph v2 后端链路
+
+`/api/pipeline/v2*` 是在旧 pipeline 之外演进出来的一条独立路径，用来承载 graph orchestration、interrupt / resume 与 checkpoint 管理。旧 `/api/pipeline`、`/api/pipeline/stream` 仍然保留。
+
+```mermaid
+flowchart LR
+    A["POST /api/pipeline/v2"] --> B["plan"]
+    B --> C["interrupt: outline_review"]
+    C --> D["resume"]
+    D --> E["research"]
+    E --> F["draft"]
+    F --> G["interrupt: draft_review"]
+    G --> H["resume"]
+    H --> I["review"]
+    I --> J["interrupt: review_confirmation"]
+    J --> K["resume"]
+    K --> L["rewrite?"]
+    L --> M["post_process"]
+    M --> N["completed"]
+```
+
+### 当前已落地的 v2 能力
+
+- `outline_review`：outline 生成后中断，等待人工确认或修改
+- `draft_review`：draft 生成后中断，允许人工编辑草稿
+- `review_confirmation`：review 完成后中断，展示结构化 decision，等待确认继续
+- review decision 使用结构化协议：
+
+```json
+{
+  "review_text": "string",
+  "needs_rewrite": true,
+  "reason": "string",
+  "score": 0.82
+}
+```
+
+- best-effort stage resume 当前覆盖：
+  - `outline_accepted`
+  - `research_done`
+  - `draft_done`
+  - `review_done`
+  - `rewrite_done`
+  - `completed`
+- `rewrite_done` 表示 rewrite 已完成，可从 `post_process` 继续
+- v2 同时提供同步与流式接口：
+  - `/api/pipeline/v2`
+  - `/api/pipeline/v2/resume`
+  - `/api/pipeline/v2/stream`
+  - `/api/pipeline/v2/resume/stream`
+
+### v2 的真实边界
+
+- 当前不是多实例 durable workflow 平台
+- `resume` 是阶段边界 best-effort resume，不是任意内部节点精确恢复
+- stream 是阶段级 SSE，不是 token-level whole-graph streaming runtime
+- review decision 结构化解析失败时，会 fallback 到 heuristic `needs_rewrite`
+
+## 评测与定量结果
+
+### 1. 后端内置的离线检索评测
+
+后端提供 `POST /api/rag/evaluate`，支持在给定标注集上计算：
+
+- Recall@K
+- Precision@K
+- HitRate@K
+- MRR@K
+- nDCG@K
+
+`tests/test_retrieval_eval_service.py` 已验证一组确定性样例：
+
+| 样例设置 | Recall | Precision | HitRate | MRR | nDCG |
+| --- | --- | --- | --- | --- | --- |
+| `K=1` | `0.25` | `0.50` | `0.50` | `0.50` | 已计算 |
+| `K=3` | `1.00` | `0.50` | `1.00` | `0.75` | 已计算 |
+
+这部分能力不仅暴露为 API，也会把评测结果持久化到 SQLite，方便后续比较不同配置或 baseline。
+
+### 2. 仓库内保留的一次 RAG 失败样本
+
+根目录 `RAG_EVALUATION_REPORT.md` 记录了一次真实评估样本：
+
+| 指标 | 数值 |
+| --- | --- |
+| 找到文档数 | `7` |
+| 查询词数 | `145` |
+| Best Recall | `0.434` |
+| Avg Recall | `0.298` |
+| 任务成功率 | `33.3%`（`2/6`） |
+
+这份记录的价值在于它保留了失败原因，而不是只保留成功样例。后端的拒答阈值、Top-K、rerank、coverage 设计都可以围绕这类结果继续收敛。
+
+### 3. baseline 报告快照
+
+`backend/evals/baseline_report.md` 中保留了一份基于 `retrieval_eval_small_hard.json` 的 baseline 对比结果，主表如下：
+
+| Baseline | Recall@5 | Precision@5 | HitRate@5 | MRR@5 | nDCG@5 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| dense_only | 95.8% | 21.7% | 100.0% | 0.806 | 0.845 |
+| dense_rerank | 98.3% | 22.7% | 100.0% | 0.861 | 0.888 |
+| dense_hyde_rerank | 97.5% | 22.3% | 100.0% | 0.875 | 0.894 |
+| dense_rerank_bilingual | 96.7% | 22.0% | 100.0% | 0.839 | 0.867 |
+| dense_hyde_rerank_bilingual | 96.7% | 22.0% | 100.0% | 0.856 | 0.879 |
+
+同一份报告还记录了 5 次重复运行的均值 ± 标准差，以及 Agent 行为回归小套件结果：
+
+- Repeats per baseline: `5`
+- Agent 行为回归小套件：`17/17` 通过
+
+需要注意：
+
+- 上述 baseline 数字是仓库内保留的实验快照，不应被当作所有语料和所有业务场景下的通用线上指标。
+- 如果你改动了检索策略、rerank、HyDE 或 bilingual rewrite，建议重新运行评测脚本生成新的报告。
+
+## 快速启动
+
+### Windows
 
 ```bash
 cd backend
-python -m venv venv
-venv\Scripts\activate
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
 python main.py
 ```
 
-服务地址：`http://localhost:8000`
+### macOS / Linux
 
-## 4. 最小配置
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+python main.py
+```
 
-完整配置见 `backend/.env.example`。
+默认服务地址：
 
-### LLM
+- `http://localhost:8000`
+- Swagger: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+- Health: `http://localhost:8000/healthz`
+
+`backend/main.py` 默认以 `0.0.0.0:8000` 启动，`UVICORN_RELOAD=true` 时可开启 reload。
+
+## 最小配置
+
+完整变量见 `.env.example`。如果只是先跑通后端，最小配置如下：
 
 ```env
 LLM_PROVIDER=openai
-LLM_MODEL=YOUR_MODEL
+LLM_MODEL=YOUR_MODEL_NAME
 LLM_API_KEY=YOUR_API_KEY
-LLM_API_BASE=YOUR_BASE_URL
-LLM_TIMEOUT=600
-LLM_MAX_TOKENS=8000
+LLM_API_BASE=YOUR_API_BASE
+
+RETRIEVAL_MODE=sqlite_only
+CONVERSATION_MEMORY_MODE=session
+RAG_GENERATION_MODE=rag_only
+MCP_GITHUB_ENABLED=false
 ```
 
-### 检索与记忆
+### 可选增强配置
 
-```env
-RETRIEVAL_MODE=sqlite_only          # 或 hybrid
-CONVERSATION_MEMORY_MODE=session    # 或 global
-STORAGE_PATH=data/app.db
-```
-
-### Qdrant（可选）
+Qdrant：
 
 ```env
 QDRANT_URL=YOUR_QDRANT_URL
@@ -81,60 +223,37 @@ QDRANT_EMBED_DIM=1024
 QDRANT_DISTANCE=cosine
 ```
 
-### RAG（建议）
+LangGraph v2 checkpoint：
 
 ```env
-RAG_DYNAMIC_TOPK_ENABLED=true
-RAG_RERANK_ENABLED=true
-RAG_HYDE_ENABLED=false
-RAG_QUERY_STRATEGY_ROUTING_ENABLED=false # 线上动态检索策略路由（按 query 类型）
-RAG_GENERATION_MODE=rag_only        # rag_only / hybrid / creative
-RAG_CREATIVE_MCP_ENABLED=true       # creative 模式下是否启用 MCP
-RAG_CREATIVE_MEMORY_ENABLED=false   # creative 模式是否启用会话记忆
-RAG_HYBRID_INFERENCE_TAG=[推断]
-RAG_HYBRID_MIN_PARAGRAPH_CHARS=12
-RAG_COVERAGE_THRESHOLD=0.12         # 词面复用覆盖阈值（默认下调，避免摘要型输出长期显示 0%）
-RAG_REFUSAL_ENABLED=true
-RAG_REFUSAL_QUERY_MAX_CHARS=480
-RAG_REFUSAL_INCLUDE_OUTLINE=false
-RAG_REFUSAL_INCLUDE_DRAFT=false
+LANGGRAPH_V2_CHECKPOINT_DB=data/langgraph_v2_checkpoints.sqlite
 ```
 
-### GitHub MCP（可选）
+GitHub MCP：
 
 ```env
-MCP_GITHUB_ENABLED=false
+MCP_GITHUB_ENABLED=true
 GITHUB_PERSONAL_ACCESS_TOKEN=YOUR_GITHUB_TOKEN
 MCP_GITHUB_TOOL_SCOPE=search
 MCP_GITHUB_MAX_TOOLS=5
 ```
 
-### 分阶段工具路由（可选，建议配合 MCP）
+## API 概览
 
-```env
-LLM_AGENT_TOOL_CALLING_ENABLED=false   # 关闭则仅显式 MCP API 可用
-LLM_STAGE_BASED_TOOLS_ENABLED=true
-LLM_TOOLS_PLAN_STAGE=github_search_repositories,github_search_code
-LLM_TOOLS_DRAFT_STAGE=github_search_repositories,github_search_code,github_get_file_contents
-LLM_TOOLS_REVIEW_STAGE=github_search_repositories,github_search_code
-LLM_TOOLS_REWRITE_STAGE=
-LLM_TOOL_POLICY_MODE=rules
-LLM_TOOL_POLICY_SEARCH_KEYWORDS=github,repo,repository,issue,pr,commit,code,readme
-LLM_TOOL_POLICY_READ_KEYWORDS=owner/repo,path,README,.md,.py
-LLM_TOOL_POLICY_DISABLE_WHEN_RAG_STRONG=true
-```
-
-## 5. API 概览
-
-所有接口前缀：`/api`
+所有接口统一以 `/api` 为前缀。
 
 ### 写作分步
+
 - `POST /api/plan`
-- `POST /api/draft` / `POST /api/draft/stream`
-- `POST /api/review` / `POST /api/review/stream`
-- `POST /api/rewrite` / `POST /api/rewrite/stream`
+- `POST /api/draft`
+- `POST /api/draft/stream`
+- `POST /api/review`
+- `POST /api/review/stream`
+- `POST /api/rewrite`
+- `POST /api/rewrite/stream`
 
 ### 一键流程
+
 - `POST /api/pipeline`
 - `POST /api/pipeline/stream`
 - `POST /api/pipeline/v2`
@@ -142,270 +261,103 @@ LLM_TOOL_POLICY_DISABLE_WHEN_RAG_STRONG=true
 - `POST /api/pipeline/v2/stream`
 - `POST /api/pipeline/v2/resume/stream`
 
-### LangGraph v2（最小接入）
+### RAG / Citation / Evaluation
 
-`/api/pipeline/v2` 不是对旧 Pipeline 的重写，而是在现有后端外层增加一条最小控制流入口，用来验证 LangGraph 的 interrupt / resume 能力，并且不影响旧 `/api/pipeline` 与 `/api/pipeline/stream`。目前同时提供同步版与 SSE 版，前端 Workspace 已接入最小演示闭环。
-
-#### v1 / v2 区别
-
-| 路径 | 控制流 | 中断能力 | 恢复能力 | 当前用途 |
-|---|---|---|---|---|
-| `/api/pipeline` | 旧同步全链路 | 无 | 无 | 生产主链路 |
-| `/api/pipeline/stream` | 旧 SSE 全链路 | 无 | 无 | 生产流式主链路 |
-| `/api/pipeline/v2` | LangGraph 最小工作流（同步） | 大纲后 interrupt | 通过 `/api/pipeline/v2/resume` | LangGraph 接入验证与后续扩展入口 |
-| `/api/pipeline/v2/stream` | LangGraph 最小工作流（SSE） | 大纲后 interrupt | 通过 `/api/pipeline/v2/resume/stream` | LangGraph 流式演示路径 |
-
-#### 当前 v2 做什么
-
-- `plan`
-- `outline` 生成后 interrupt
-- `resume`
-- `resume` 后进入 full-stage graph：
-  - `research`
-  - `draft`
-  - `review`
-  - `rewrite`（可跳过）
-  - `post_process`
-- 同一条控制流同时支持：
-  - 同步：`/api/pipeline/v2`、`/api/pipeline/v2/resume`
-  - 流式：`/api/pipeline/v2/stream`、`/api/pipeline/v2/resume/stream`
-- 文本生成阶段在流式路径下支持真实流式输出：
-  - `plan`
-  - `draft`
-  - `review`
-  - `rewrite`
-
-#### 当前限制
-
-- 只有一个 interrupt 点：大纲生成后
-- checkpointer 当前使用 SQLite 持久化存储
-- 只要 checkpoint 文件仍存在，服务重启后仍可使用同一个 `thread_id` 继续 resume
-- v2 前端演示重点是 interrupt / outline review / resume 闭环；不是完整的 LangGraph 可视化控制台
-
-#### v2 checkpoint 存储位置
-
-- 环境变量：`LANGGRAPH_V2_CHECKPOINT_DB`
-- 默认值：`data/langgraph_v2_checkpoints.sqlite`
-- 若未设置，则会在后端目录下的 `data/` 目录自动创建该 SQLite 文件
-
-#### 最小调用示例
-
-1. 启动并拿到 interrupt：
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/pipeline/v2 ^
-  -H "Content-Type: application/json" ^
-  -d "{\"topic\":\"测试主题\",\"audience\":\"初学者\",\"style\":\"说明文\",\"target_length\":\"800\",\"constraints\":\"不要跑题\",\"key_points\":\"要点A\",\"review_criteria\":\"准确\",\"sources\":[]}"
-```
-
-典型返回：
-
-```json
-{
-  "status": "interrupted",
-  "thread_id": "9d2c...",
-  "interrupt": {
-    "kind": "outline_review",
-    "payload": {
-      "thread_id": "9d2c...",
-      "outline": "1) Outline ...",
-      "assumptions": "...",
-      "open_questions": "..."
-    }
-  },
-  "result": null
-}
-```
-
-2. 使用同一个 `thread_id` 继续：
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/pipeline/v2/resume ^
-  -H "Content-Type: application/json" ^
-  -d "{\"thread_id\":\"9d2c...\",\"outline_override\":\"1) Outline\\n- 人工修订版大纲\"}"
-```
-
-如果你希望像旧 `/api/pipeline/stream` 一样看到 LLM 实时输出，可改用：
-
-```bash
-curl -N -X POST http://127.0.0.1:8000/api/pipeline/v2/stream ^
-  -H "Content-Type: application/json" ^
-  -d "{\"topic\":\"测试主题\",\"audience\":\"初学者\",\"style\":\"说明文\",\"target_length\":\"800\",\"constraints\":\"不要跑题\",\"key_points\":\"要点A\",\"review_criteria\":\"准确\",\"sources\":[]}"
-```
-
-以及：
-
-```bash
-curl -N -X POST http://127.0.0.1:8000/api/pipeline/v2/resume/stream ^
-  -H "Content-Type: application/json" ^
-  -d "{\"thread_id\":\"9d2c...\",\"outline_override\":\"1) Outline\\n- 人工修订版大纲\"}"
-```
-
-#### 前端演示状态
-
-Workspace 中的 LangGraph v2 Demo 已接入上述流式路径，页面上可以完整演示：
-
-- `Planning`
-- `Interrupted - waiting for outline review`
-- `Resuming`
-- `Completed`
-
-并带有与旧 pipeline 同风格的子阶段进度条：
-
-- `生成大纲`
-- `等待人工修订`
-- `收集研究笔记`
-- `创作初稿`
-- `审阅反馈`
-- `修改润色`
-- `生成引用`
-
-#### 旧链路 vs 新链路
-
-```mermaid
-flowchart LR
-    A["/api/pipeline"] --> B["旧 full pipeline"]
-    C["/api/pipeline/stream"] --> D["旧 SSE full pipeline"]
-
-    E["/api/pipeline/v2 or /api/pipeline/v2/stream"] --> F["plan"]
-    F --> G["interrupt(outline_review)"]
-    H["/api/pipeline/v2/resume or /api/pipeline/v2/resume/stream"] --> I["resume"]
-    I --> J["research"]
-    J --> K["draft"]
-    K --> L["review"]
-    L --> M["rewrite?"]
-    M --> N["post_process"]
-    N --> O["completed"]
-```
-
-### RAG
 - `POST /api/rag/upload`
-- `POST /api/rag/upload-file`（`.txt / .pdf / .docx / .md / .markdown`）
+- `POST /api/rag/upload-file`
 - `POST /api/rag/search`
 - `GET /api/rag/documents`
 - `DELETE /api/rag/documents/{doc_id}`
-
-### 离线评测
 - `POST /api/rag/evaluate`
 - `GET /api/rag/evaluations`
 - `GET /api/rag/evaluations/{run_id}`
 - `DELETE /api/rag/evaluations/{run_id}`
+- `POST /api/citations`
 
-### 离线检索 baseline 对比（脚本）
+### 版本与设置
 
-1. 启动后端（保持 `POST /api/rag/evaluate` 可访问）：
+- `GET /api/versions`
+- `GET /api/versions/{version_id}`
+- `GET /api/versions/{version_id}/diff`
+- `DELETE /api/versions/{version_id}`
+- `GET /api/settings/generation-mode`
+- `POST /api/settings/generation-mode`
+- `POST /api/settings/session-memory/clear`
+
+### MCP
+
+- `GET /api/mcp/github/tools`
+- `POST /api/mcp/github/call`
+
+## checkpoint、存储与运维
+
+### SQLite 数据
+
+后端默认使用 SQLite 持久化：
+
+- 文档库与版本历史
+- 检索评测结果
+- LangGraph v2 checkpoint
+
+默认数据目录：
+
+- `backend/data/`
+
+### LangGraph v2 checkpoint
+
+- 环境变量：`LANGGRAPH_V2_CHECKPOINT_DB`
+- 默认文件：`data/langgraph_v2_checkpoints.sqlite`
+- 只要 checkpoint 文件仍在，服务重启后仍可以继续使用同一个 `thread_id` resume
+
+### 运行注意项
+
+- `session` 记忆模式下，请保持同一个 `session_id`
+- `hybrid` 模式下，如果 Qdrant 不可用，会降级到 SQLite 检索
+- SSE 依赖 `text/event-stream`，反向代理需要允许长连接
+- `review_confirmation` 当前是只读确认，不提供 review 文本编辑
+
+## 评测脚本
+
+后端内置 baseline 对比脚本：
+
+- `scripts/run_retrieval_baselines.py`
+
+默认输入 / 输出：
+
+- Eval set：`evals/retrieval_eval_small.json`
+- Report：`evals/baseline_report.md`
+- Detail report：`evals/baseline_report_details.md`
+
+### 运行方式
+
+先启动后端，再运行：
 
 ```bash
 cd backend
-python main.py
-```
-
-2. 运行默认 3 个 baseline（A/B/C），生成并保存结果文档：
-   - `evals/baseline_report.md`（`@1/@3/@5` 指标表、可选标签分组统计、Agent 行为回归小套件）
-   - `evals/baseline_report_details.md`（逐 Query 对比、失败样本、首命中位置、Top5 doc_id）
-
-```bash
 python scripts/run_retrieval_baselines.py
 ```
 
-3. 加入 bilingual rewrite 对比（D/E）：
+加入 bilingual baseline：
 
 ```bash
 python scripts/run_retrieval_baselines.py --include-bilingual-baselines
 ```
 
-4. 使用更难评测集（含中英混合 / 多概念 / 多标签 query）：
-
-```bash
-python scripts/run_retrieval_baselines.py --eval evals/retrieval_eval_small_hard.json --timeout 600
-```
-
-5. 重复运行并输出均值/标准差（推荐用于做策略决策，降低单次波动影响）：
+使用 harder eval set 并重复运行 5 次：
 
 ```bash
 python scripts/run_retrieval_baselines.py --eval evals/retrieval_eval_small_hard.json --include-bilingual-baselines --repeats 5 --timeout 600
 ```
 
-6. 自定义输入/输出路径、超时与后端地址：
+脚本会通过 `/api/rag/evaluate` 调用后端，并生成主报告与详情报告。
 
-```bash
-python scripts/run_retrieval_baselines.py ^
-  --eval evals/retrieval_eval_small.json ^
-  --out evals/baseline_report.md ^
-  --base-url http://127.0.0.1:8000 ^
-  --timeout 300
-```
+## 测试
 
-7. 结果文档保存流程说明：
-   - 默认输出：`--out` 未指定时写入 `evals/baseline_report.md`
-   - 详情报告会自动保存为同目录同名后缀：`evals/baseline_report_details.md`
-   - 若使用 `--out xxx.md`，则详情报告自动保存为 `xxx_details.md`
+后端已经包含与 v2、RAG 相关的测试文件，例如：
 
-8. 用 `/api/rag/search` 获取真实 `doc_id` 替换 `evals/retrieval_eval_small.json` / `evals/retrieval_eval_small_hard.json` 中的占位值（评测集与 `RetrievalEvalRequest` 同结构；脚本支持额外 `tags` 字段用于分组统计）：
+- `tests/test_reviewing_service.py`
+- `tests/test_pipeline_v2_api.py`
+- `tests/test_retrieval_eval_service.py`
+- `tests/test_rag_evaluate_api.py`
 
-```bash
-curl -X POST http://127.0.0.1:8000/api/rag/search ^
-  -H "Content-Type: application/json" ^
-  -d "{\"query\":\"你的查询\",\"top_k\":5}"
-```
-
-9. `POST /api/rag/evaluate` 支持可选 `rag_config_override`（仅本次请求生效，不改默认配置、不需要重启后端）：
-   - `rerank_enabled`
-   - `hyde_enabled`
-   - `bilingual_rewrite_enabled`
-
-10. 脚本默认直连本机后端（忽略系统代理环境变量），可避免本地 `127.0.0.1` 请求被代理导致的 `502 Bad Gateway`。
-
-11. 注意：线上动态检索策略路由（`RAG_QUERY_STRATEGY_ROUTING_ENABLED`）主要影响 `/api/rag/search`、Pipeline、写作接口；baseline 脚本默认通过 `rag_config_override` 固定策略组合，不直接使用该自动路由。
-
-当前评测结果快照（`evals/retrieval_eval_small_hard.json`，`--include-bilingual-baselines --repeats 5`）：
-
-| Baseline | Recall@5 | Precision@5 | HitRate@5 | MRR@5 | nDCG@5 |
-|---|---:|---:|---:|---:|---:|
-| dense_only | 95.8% ± 0.0% | 21.7% ± 0.0% | 100.0% ± 0.0% | 0.806 ± 0.000 | 0.845 ± 0.000 |
-| dense_rerank | 98.3% ± 2.0% | 22.7% ± 0.8% | 100.0% ± 0.0% | 0.861 ± 0.035 | 0.888 ± 0.027 |
-| dense_hyde_rerank | 97.5% ± 2.0% | 22.3% ± 0.8% | 100.0% ± 0.0% | 0.875 ± 0.052 | 0.894 ± 0.038 |
-| dense_rerank_bilingual | 96.7% ± 1.7% | 22.0% ± 0.7% | 100.0% ± 0.0% | 0.839 ± 0.027 | 0.867 ± 0.021 |
-| dense_hyde_rerank_bilingual | 96.7% ± 1.7% | 22.0% ± 0.7% | 100.0% ± 0.0% | 0.856 ± 0.044 | 0.879 ± 0.034 |
-
-> Agent 行为回归小套件：17/17 通过。
-
-### 引用与设置
-- `POST /api/citations`
-- `GET /api/settings/generation-mode`
-- `POST /api/settings/generation-mode`
-- `GET /api/settings/citation`
-- `POST /api/settings/citation`
-- `POST /api/settings/session-memory/clear`
-
-### 版本管理
-- `GET /api/versions`
-- `GET /api/versions/{version_id}`
-- `GET /api/versions/{version_id}/diff`
-- `DELETE /api/versions/{version_id}`
-
-### MCP（GitHub）
-- `GET /api/mcp/github/tools`
-- `POST /api/mcp/github/call`
-
-## 6. 健康检查与文档
-
-- `GET /healthz`
-- `GET /healthz/detail`
-- `GET /healthz/llm`
-- Swagger: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
-
-## 7. 运维注意项
-
-- `session` 记忆模式下，请从前端持续传同一个 `session_id`，避免会话历史丢失。
-- `POST /api/settings/generation-mode` 支持 `creative_mcp_enabled`，用于运行时切换 creative 模式 MCP。
-- 会话重置会同时清理内存历史与 SQLite 冷存（按会话作用域，包含 `session_id::tool_profile` 变体）。
-- `hybrid` 模式下，Qdrant 不可用会自动降级到 SQLite 检索。
-- `hybrid` 模式会优先注入可匹配的 `[n]`，仅对无证据段落补 `[推断]`。
-- 覆盖率展示建议优先看语义段落覆盖率；“词面复用覆盖率（严格）”只是辅指标，在中英混合、强改写、摘要型输出下仍可能偏低。
-- 当前默认 `RAG_COVERAGE_THRESHOLD=0.12`，相比旧值 `0.3` 更适合摘要型 RAG 输出；如希望更严格的词面复用判定，可再调高。
-- 拒答日志会显示 `base:<variant>` / `fallback@k:<variant>`，用于定位本轮命中的查询变体。
-- 若开启 `RAG_QUERY_STRATEGY_ROUTING_ENABLED=true`，日志会出现 `RAG query strategy route: ...`，用于确认本轮 query 命中的线上策略组合。
-- 流式链路依赖 SSE，代理层需允许 `text/event-stream`。
-- 离线评测结果持久化在 SQLite 表 `retrieval_eval_runs`。
+如果你改动了 review decision、resume 语义、RAG 评测逻辑或 v2 接口，建议优先补这些测试。

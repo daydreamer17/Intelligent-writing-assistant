@@ -132,6 +132,7 @@ class PipelineV2Request(PipelineRequest):
 class PipelineV2ResumeRequest(BaseModel):
     thread_id: str = Field(..., description="LangGraph 运行线程ID")
     outline_override: str = Field("", description="人工修订后的大纲；为空时沿用原大纲")
+    draft_override: str = Field("", description="人工修订后的草稿；为空时沿用原草稿")
 
 
 class PipelineV2Interrupt(BaseModel):
@@ -163,10 +164,16 @@ class PipelineV2CheckpointDetailResponse(BaseModel):
     mode: str = "sync"
     status: str
     current_stage: str
+    interrupt_stage: str = ""
     created_at: str = ""
     updated_at: str = ""
     can_resume: bool = False
     outline: str = ""
+    draft: str = ""
+    review_text: str = ""
+    needs_rewrite: bool | None = None
+    reason: str = ""
+    score: float | None = None
     assumptions: str = ""
     open_questions: str = ""
     last_error: str = ""

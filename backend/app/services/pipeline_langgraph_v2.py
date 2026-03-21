@@ -128,6 +128,11 @@ class SQLitePersistentSaver(InMemorySaver):
             self._persist_to_disk()
         self.delete_checkpoint(thread_id)
 
+    def clear_graph_thread(self, thread_id: str) -> None:
+        with self._lock:
+            super().delete_thread(thread_id)
+            self._persist_to_disk()
+
     def upsert_checkpoint_index(
         self,
         *,
@@ -499,6 +504,10 @@ def delete_pipeline_v2_checkpoint(thread_id: str) -> bool:
     return deleted
 
 
+def clear_pipeline_v2_graph_thread(thread_id: str) -> None:
+    _get_checkpointer().clear_graph_thread(thread_id)
+
+
 def cleanup_pipeline_v2_checkpoints(
     *,
     older_than_hours: int = 168,
@@ -521,30 +530,76 @@ def get_pipeline_v2_checkpoint_detail(thread_id: str) -> dict[str, Any] | None:
     if not index_row and not resume_state and not interrupt_payload:
         return None
     payload = dict(resume_state.get("payload") or {}) if resume_state else {}
+    index_stage = str((index_row or {}).get("current_stage") or "")
+    index_status = str((index_row or {}).get("status") or "")
+    needs_rewrite_raw = payload.get("needs_rewrite")
+    needs_rewrite = None if needs_rewrite_raw is None else bool(needs_rewrite_raw)
+    score_raw = payload.get("score")
+    score = None if score_raw is None else float(score_raw)
     if interrupt_payload:
         outline = str(interrupt_payload.get("outline") or "")
         assumptions = str(interrupt_payload.get("assumptions") or "")
         open_questions = str(interrupt_payload.get("open_questions") or "")
         can_resume = True
-        status = str((index_row or {}).get("status") or "interrupted")
-        current_stage = str((index_row or {}).get("current_stage") or "outline_review")
+        status = index_status or "interrupted"
+        current_stage = index_stage or "outline_review"
+        interrupt_stage = "outline_review"
+        draft = ""
+        review_text = ""
+        reason = ""
+        score = None
+        needs_rewrite = None
+    elif index_stage == "draft_review":
+        outline = str(payload.get("outline") or (index_row or {}).get("outline_preview") or "")
+        assumptions = str(payload.get("assumptions") or "")
+        open_questions = str(payload.get("open_questions") or "")
+        draft = str(payload.get("draft") or "")
+        can_resume = True
+        status = index_status or "interrupted"
+        current_stage = "draft_review"
+        interrupt_stage = "draft_review"
+        review_text = ""
+        reason = ""
+        score = None
+        needs_rewrite = None
+    elif index_stage == "review_confirmation":
+        outline = str(payload.get("outline") or (index_row or {}).get("outline_preview") or "")
+        assumptions = str(payload.get("assumptions") or "")
+        open_questions = str(payload.get("open_questions") or "")
+        draft = str(payload.get("draft") or "")
+        can_resume = True
+        status = index_status or "interrupted"
+        current_stage = "review_confirmation"
+        interrupt_stage = "review_confirmation"
+        review_text = str(payload.get("review_text") or payload.get("review") or "")
+        reason = str(payload.get("reason") or "")
     else:
         outline = str(payload.get("outline") or (index_row or {}).get("outline_preview") or "")
         assumptions = str(payload.get("assumptions") or "")
         open_questions = str(payload.get("open_questions") or "")
-        status = str((resume_state or {}).get("status") or (index_row or {}).get("status") or "unknown")
-        current_stage = str((resume_state or {}).get("current_stage") or (index_row or {}).get("current_stage") or "unknown")
+        draft = str(payload.get("draft") or "")
+        review_text = str(payload.get("review_text") or payload.get("review") or "")
+        reason = str(payload.get("reason") or "")
+        status = str((resume_state or {}).get("status") or index_status or "unknown")
+        current_stage = str((resume_state or {}).get("current_stage") or index_stage or "unknown")
         can_resume = status != "completed" and bool(resume_state)
+        interrupt_stage = ""
     return {
         "thread_id": thread_id,
         "session_id": str((index_row or {}).get("session_id") or payload.get("resolved_session_id") or ""),
         "mode": str((index_row or {}).get("mode") or "sync"),
         "status": status,
         "current_stage": current_stage,
+        "interrupt_stage": interrupt_stage,
         "created_at": str((resume_state or {}).get("created_at") or (index_row or {}).get("created_at") or ""),
         "updated_at": str((resume_state or {}).get("updated_at") or (index_row or {}).get("updated_at") or ""),
         "can_resume": can_resume,
         "outline": outline,
+        "draft": draft,
+        "review_text": review_text,
+        "needs_rewrite": needs_rewrite,
+        "reason": reason,
+        "score": score,
         "assumptions": assumptions,
         "open_questions": open_questions,
         "last_error": str((index_row or {}).get("last_error") or ""),
@@ -574,6 +629,7 @@ def _restore_tail_notes(raw_notes: Any) -> list[ResearchNote]:
 
 
 def _base_tail_resume_payload(state: dict[str, Any]) -> dict[str, Any]:
+    review_text = str(state.get("review_text") or state.get("review") or "")
     return {
         "request": dict(state.get("request") or {}),
         "resolved_session_id": str(state.get("resolved_session_id") or ""),
@@ -585,6 +641,11 @@ def _base_tail_resume_payload(state: dict[str, Any]) -> dict[str, Any]:
         "research_notes": list(state.get("research_notes") or []),
         "notes_text": str(state.get("notes_text") or ""),
         "draft": str(state.get("draft") or ""),
+        "review": review_text,
+        "review_text": review_text,
+        "needs_rewrite": state.get("needs_rewrite"),
+        "reason": str(state.get("reason") or ""),
+        "score": state.get("score"),
     }
 
 
@@ -605,6 +666,48 @@ def _save_tail_resume_boundary(
         status=status,
         current_stage=current_stage,
         payload=payload,
+    )
+
+
+def _mark_draft_review_interrupt(state: dict[str, Any]) -> None:
+    payload = _base_tail_resume_payload(state)
+    save_pipeline_v2_resume_state(
+        thread_id=str(state.get("thread_id") or ""),
+        session_id=str(state.get("resolved_session_id") or ""),
+        mode=str(state.get("mode") or "sync"),
+        status="interrupted",
+        current_stage="draft_done",
+        payload=payload,
+    )
+    upsert_pipeline_v2_checkpoint(
+        thread_id=str(state.get("thread_id") or ""),
+        session_id=str(state.get("resolved_session_id") or ""),
+        mode=str(state.get("mode") or "sync"),
+        status="interrupted",
+        current_stage="draft_review",
+        outline_preview=str(state.get("outline") or ""),
+        last_error="",
+    )
+
+
+def _mark_review_confirmation_interrupt(state: dict[str, Any]) -> None:
+    payload = _base_tail_resume_payload(state)
+    save_pipeline_v2_resume_state(
+        thread_id=str(state.get("thread_id") or ""),
+        session_id=str(state.get("resolved_session_id") or ""),
+        mode=str(state.get("mode") or "sync"),
+        status="interrupted",
+        current_stage="review_done",
+        payload=payload,
+    )
+    upsert_pipeline_v2_checkpoint(
+        thread_id=str(state.get("thread_id") or ""),
+        session_id=str(state.get("resolved_session_id") or ""),
+        mode=str(state.get("mode") or "sync"),
+        status="interrupted",
+        current_stage="review_confirmation",
+        outline_preview=str(state.get("outline") or ""),
+        last_error="",
     )
 
 
@@ -816,17 +919,23 @@ def _review_tail_step(state: dict[str, Any]) -> dict[str, Any]:
         **state,
         "task_status": {
             **_graph_task_status(state),
-            "review": bool(str(decision.review or "").strip()),
+            "review": bool(str(decision.review_text or "").strip()),
         },
-        "review": decision.review,
+        "review": decision.review_text,
+        "review_text": decision.review_text,
         "needs_rewrite": decision.needs_rewrite,
+        "reason": decision.reason,
+        "score": decision.score,
     }
     _save_tail_resume_boundary(
         next_state,
         current_stage="review_done",
         extra_payload={
-            "review": decision.review,
+            "review": decision.review_text,
+            "review_text": decision.review_text,
             "needs_rewrite": decision.needs_rewrite,
+            "reason": decision.reason,
+            "score": decision.score,
         },
     )
     return next_state
@@ -881,7 +990,7 @@ def _review_tail_stream_step(*, state: dict[str, Any], q: Queue[dict[str, Any] |
             tool_registry_override=review_registry,
         ).review
         route._emit_text_deltas(q, "review", review)
-    needs_rewrite = services.reviewer.decide_rewrite(
+    decision = services.reviewer.review_decision_from_review(
         review=review,
         criteria=str(state.get("review_criteria") or ""),
         audience=str(state.get("audience") or ""),
@@ -895,27 +1004,35 @@ def _review_tail_stream_step(*, state: dict[str, Any], q: Queue[dict[str, Any] |
             **_graph_task_status(state),
             "review": bool(review.strip()),
         },
-        "review": review,
-        "needs_rewrite": needs_rewrite,
+        "review": decision.review_text,
+        "review_text": decision.review_text,
+        "needs_rewrite": decision.needs_rewrite,
+        "reason": decision.reason,
+        "score": decision.score,
     }
     _save_tail_resume_boundary(
         next_state,
         current_stage="review_done",
         extra_payload={
-            "review": review,
-            "needs_rewrite": needs_rewrite,
+            "review": decision.review_text,
+            "review_text": decision.review_text,
+            "needs_rewrite": decision.needs_rewrite,
+            "reason": decision.reason,
+            "score": decision.score,
         },
     )
     q.put(
         {
             "type": "review_decision",
             "payload": {
-                "review": review,
-                "needs_rewrite": needs_rewrite,
+                "review_text": decision.review_text,
+                "needs_rewrite": decision.needs_rewrite,
+                "reason": decision.reason,
+                "score": decision.score,
             },
         }
     )
-    q.put({"type": "review", "payload": {"review": review}})
+    q.put({"type": "review", "payload": {"review": decision.review_text}})
     return next_state
 
 
@@ -955,11 +1072,19 @@ def _rewrite_tail_step(state: dict[str, Any]) -> dict[str, Any]:
     ).revised
     task_status = _graph_task_status(state)
     task_status["rewrite"] = route._is_effective(revised)
-    return {
+    next_state = {
         **state,
         "task_status": task_status,
         "revised_candidate": revised,
     }
+    _save_tail_resume_boundary(
+        next_state,
+        current_stage="rewrite_done",
+        extra_payload={
+            "revised": revised,
+        },
+    )
+    return next_state
 
 
 def _rewrite_tail_stream_step(*, state: dict[str, Any], q: Queue[dict[str, Any] | None]) -> dict[str, Any]:
@@ -1019,11 +1144,19 @@ def _rewrite_tail_stream_step(*, state: dict[str, Any], q: Queue[dict[str, Any] 
         route._emit_text_deltas(q, "rewrite", revised)
     task_status = _graph_task_status(state)
     task_status["rewrite"] = route._is_effective(revised)
-    return {
+    next_state = {
         **state,
         "task_status": task_status,
         "revised_candidate": revised,
     }
+    _save_tail_resume_boundary(
+        next_state,
+        current_stage="rewrite_done",
+        extra_payload={
+            "revised": revised,
+        },
+    )
+    return next_state
 
 
 def _post_process_tail_step(state: dict[str, Any]) -> dict[str, Any]:
@@ -1071,7 +1204,10 @@ def _post_process_tail_step(state: dict[str, Any]) -> dict[str, Any]:
         status="completed",
         extra_payload={
             "review": str(state.get("review") or ""),
+            "review_text": str(state.get("review_text") or state.get("review") or ""),
             "needs_rewrite": bool(state.get("needs_rewrite")),
+            "reason": str(state.get("reason") or ""),
+            "score": state.get("score"),
             "revised": enforced_text,
             "coverage": report.coverage,
             "coverage_detail": (route._coverage_detail(report) or route.CoverageDetail()).model_dump(),
@@ -1101,6 +1237,31 @@ def draft_node(state: dict[str, Any]) -> dict[str, Any]:
 
 
 @task
+def apply_draft_resume_task(draft_state: dict[str, Any], resume_payload: dict[str, Any] | None) -> dict[str, Any]:
+    payload = resume_payload or {}
+    draft_override = str(payload.get("draft_override") or "").strip()
+    final_draft = draft_override or str(draft_state.get("draft") or "")
+    task_status = _graph_task_status(draft_state)
+    task_status["draft"] = _pipeline_route_helpers()._is_effective(final_draft)
+    return {
+        **draft_state,
+        "task_status": task_status,
+        "draft": final_draft,
+    }
+
+
+@task
+def apply_review_confirmation_resume_task(
+    review_state: dict[str, Any],
+    resume_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        **review_state,
+        "_review_resume_payload": dict(resume_payload or {}),
+    }
+
+
+@task
 def review_node(state: dict[str, Any]) -> dict[str, Any]:
     return _review_tail_step(state)
 
@@ -1115,7 +1276,7 @@ def post_process_node(state: dict[str, Any]) -> dict[str, Any]:
     return _post_process_tail_step(state)
 
 
-@entrypoint()
+@entrypoint(checkpointer=_get_checkpointer())
 def pipeline_v2_full_workflow(full_input: dict[str, Any]) -> dict[str, Any]:
     start_stage = str(full_input.get("start_stage") or "outline_accepted")
     state = dict(full_input)
@@ -1124,14 +1285,76 @@ def pipeline_v2_full_workflow(full_input: dict[str, Any]) -> dict[str, Any]:
         if state.get("response"):
             return state
         state = draft_node(state).result()
+        _mark_draft_review_interrupt(state)
+        state = apply_draft_resume_task(
+            state,
+            interrupt(
+                {
+                    "kind": "draft_review",
+                    "interrupt_stage": "draft_review",
+                    "thread_id": str(state.get("thread_id") or ""),
+                    "draft": str(state.get("draft") or ""),
+                    "outline": str(state.get("outline") or ""),
+                    "assumptions": str(state.get("assumptions") or ""),
+                    "open_questions": str(state.get("open_questions") or ""),
+                }
+            ),
+        ).result()
     elif start_stage == "research_done":
         state = draft_node(state).result()
+        _mark_draft_review_interrupt(state)
+        state = apply_draft_resume_task(
+            state,
+            interrupt(
+                {
+                    "kind": "draft_review",
+                    "interrupt_stage": "draft_review",
+                    "thread_id": str(state.get("thread_id") or ""),
+                    "draft": str(state.get("draft") or ""),
+                    "outline": str(state.get("outline") or ""),
+                    "assumptions": str(state.get("assumptions") or ""),
+                    "open_questions": str(state.get("open_questions") or ""),
+                }
+            ),
+        ).result()
     if state.get("response"):
         return state
+    if start_stage == "rewrite_done":
+        task_status = _graph_task_status(state)
+        task_status["rewrite"] = _pipeline_route_helpers()._is_effective(
+            str(state.get("revised_candidate") or state.get("revised") or state.get("draft") or "")
+        )
+        rewritten = {
+            **state,
+            "task_status": task_status,
+            "revised_candidate": str(
+                state.get("revised_candidate") or state.get("revised") or state.get("draft") or ""
+            ),
+        }
+        return post_process_node(rewritten).result()
     if start_stage == "review_done":
         reviewed = dict(state)
     else:
         reviewed = review_node(state).result()
+        _mark_review_confirmation_interrupt(reviewed)
+        reviewed = apply_review_confirmation_resume_task(
+            reviewed,
+            interrupt(
+                {
+                    "kind": "review_confirmation",
+                    "interrupt_stage": "review_confirmation",
+                    "thread_id": str(reviewed.get("thread_id") or ""),
+                    "review_text": str(reviewed.get("review_text") or reviewed.get("review") or ""),
+                    "needs_rewrite": bool(reviewed.get("needs_rewrite")),
+                    "reason": str(reviewed.get("reason") or ""),
+                    "score": reviewed.get("score"),
+                    "draft": str(reviewed.get("draft") or ""),
+                    "outline": str(reviewed.get("outline") or ""),
+                    "assumptions": str(reviewed.get("assumptions") or ""),
+                    "open_questions": str(reviewed.get("open_questions") or ""),
+                }
+            ),
+        ).result()
     if bool(reviewed.get("needs_rewrite")):
         rewritten = rewrite_node(reviewed).result()
     else:
@@ -1155,7 +1378,17 @@ def run_pipeline_v2_full_sync(full_input: dict[str, Any]) -> dict[str, Any]:
             current_stage="outline_accepted",
             extra_payload={},
         )
-    return pipeline_v2_full_workflow.invoke(full_input)
+    return pipeline_v2_full_workflow.invoke(
+        full_input,
+        config=_thread_config(str(full_input.get("thread_id") or "")),
+    )
+
+
+def resume_pipeline_v2_full_workflow(*, thread_id: str, draft_override: str = "") -> dict[str, Any]:
+    return pipeline_v2_full_workflow.invoke(
+        Command(resume={"draft_override": draft_override}),
+        config=_thread_config(thread_id),
+    )
 
 
 def run_pipeline_v2_full_stream(
@@ -1260,25 +1493,87 @@ def run_pipeline_v2_full_stream(
                 "draft": draft,
             },
         )
-        start_stage = "draft_done"
+        _mark_draft_review_interrupt(state)
+        q.put(
+            {
+                "type": "interrupt",
+                "kind": "draft_review",
+                "payload": {
+                    "thread_id": str(state.get("thread_id") or ""),
+                    "interrupt_stage": "draft_review",
+                    "draft": draft,
+                    "outline": str(state.get("outline") or ""),
+                    "assumptions": str(state.get("assumptions") or ""),
+                    "open_questions": str(state.get("open_questions") or ""),
+                },
+            }
+        )
+        return {
+            **state,
+            "interrupted": True,
+            "interrupt_stage": "draft_review",
+        }
 
-    if start_stage != "review_done":
+    if start_stage not in {"review_done", "rewrite_done"}:
         q.put({"type": "status", "step": "review"})
         state = _review_tail_stream_step(state=state, q=q)
+        _mark_review_confirmation_interrupt(state)
+        q.put(
+            {
+                "type": "interrupt",
+                "kind": "review_confirmation",
+                "payload": {
+                    "thread_id": str(state.get("thread_id") or ""),
+                    "interrupt_stage": "review_confirmation",
+                    "review_text": str(state.get("review_text") or state.get("review") or ""),
+                    "needs_rewrite": bool(state.get("needs_rewrite")),
+                    "reason": str(state.get("reason") or ""),
+                    "score": state.get("score"),
+                    "draft": str(state.get("draft") or ""),
+                    "outline": str(state.get("outline") or ""),
+                    "assumptions": str(state.get("assumptions") or ""),
+                    "open_questions": str(state.get("open_questions") or ""),
+                },
+            }
+        )
+        return {
+            **state,
+            "interrupted": True,
+            "interrupt_stage": "review_confirmation",
+        }
     else:
         q.put(
             {
                 "type": "review_decision",
                 "payload": {
-                    "review": str(state.get("review") or ""),
+                    "review_text": str(state.get("review_text") or state.get("review") or ""),
                     "needs_rewrite": bool(state.get("needs_rewrite")),
+                    "reason": str(state.get("reason") or ""),
+                    "score": state.get("score"),
                     "resumed": True,
                 },
             }
         )
-        q.put({"type": "review", "payload": {"review": str(state.get("review") or "")}})
+        q.put(
+            {
+                "type": "review",
+                "payload": {"review": str(state.get("review_text") or state.get("review") or "")},
+            }
+        )
 
-    if bool(state.get("needs_rewrite")):
+    if start_stage == "rewrite_done":
+        task_status = _graph_task_status(state)
+        task_status["rewrite"] = route._is_effective(
+            str(state.get("revised_candidate") or state.get("revised") or state.get("draft") or "")
+        )
+        state = {
+            **state,
+            "task_status": task_status,
+            "revised_candidate": str(
+                state.get("revised_candidate") or state.get("revised") or state.get("draft") or ""
+            ),
+        }
+    elif bool(state.get("needs_rewrite")):
         q.put({"type": "status", "step": "rewrite"})
         state = _rewrite_tail_stream_step(state=state, q=q)
     else:

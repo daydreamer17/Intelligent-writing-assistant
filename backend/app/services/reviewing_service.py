@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from hello_agents.tools import ToolRegistry
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, model_validator
 
 from ..agents.reviewer_agent import ReviewerAgent
 
@@ -21,12 +21,31 @@ class ReviewResult:
 
 @dataclass(frozen=True)
 class ReviewDecisionResult:
-    review: str
+    review_text: str
     needs_rewrite: bool
+    reason: str
+    score: float | None
+
+    @property
+    def review(self) -> str:
+        return self.review_text
 
 
 class _ReviewDecisionPayload(BaseModel):
+    review_text: str
     needs_rewrite: bool
+    reason: str
+    score: float | None = None
+
+    @model_validator(mode="after")
+    def _validate_fields(self) -> "_ReviewDecisionPayload":
+        if not self.review_text.strip():
+            raise ValueError("review_text is empty")
+        if not self.reason.strip():
+            raise ValueError("reason is empty")
+        if self.score is not None and not 0.0 <= self.score <= 1.0:
+            raise ValueError("score must be within [0.0, 1.0]")
+        return self
 
 
 class ReviewingService:
@@ -72,7 +91,7 @@ class ReviewingService:
         tool_profile_id: str | None = None,
         tool_registry_override: ToolRegistry | None = None,
     ) -> ReviewDecisionResult:
-        review = self.review(
+        review_text = self.review(
             draft=draft,
             criteria=criteria,
             sources=sources,
@@ -83,9 +102,31 @@ class ReviewingService:
             tool_profile_id=tool_profile_id,
             tool_registry_override=tool_registry_override,
         ).review
-        return ReviewDecisionResult(
-            review=review,
-            needs_rewrite=self.decide_rewrite(
+        return self.review_decision_from_review(
+            review=review_text,
+            criteria=criteria,
+            audience=audience,
+            max_tokens=max_tokens,
+            max_input_chars=max_input_chars,
+            session_id=session_id,
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
+        )
+
+    def review_decision_from_review(
+        self,
+        *,
+        review: str,
+        criteria: str = "",
+        audience: str = "",
+        max_tokens: int | None = None,
+        max_input_chars: int | None = None,
+        session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
+    ) -> ReviewDecisionResult:
+        try:
+            payload = self._classify_review_decision(
                 review=review,
                 criteria=criteria,
                 audience=audience,
@@ -94,8 +135,24 @@ class ReviewingService:
                 session_id=session_id,
                 tool_profile_id=tool_profile_id,
                 tool_registry_override=tool_registry_override,
-            ),
-        )
+            )
+            return ReviewDecisionResult(
+                review_text=payload.review_text.strip(),
+                needs_rewrite=payload.needs_rewrite,
+                reason=payload.reason.strip(),
+                score=payload.score,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "review_decision structured parse failed; falling back to heuristic review. error=%s",
+                exc,
+            )
+            return ReviewDecisionResult(
+                review_text=(review or "").strip(),
+                needs_rewrite=_needs_rewrite_from_review(review),
+                reason="fallback_heuristic",
+                score=None,
+            )
 
     def decide_rewrite(
         self,
@@ -109,27 +166,43 @@ class ReviewingService:
         tool_profile_id: str | None = None,
         tool_registry_override: ToolRegistry | None = None,
     ) -> bool:
+        return self.review_decision_from_review(
+            review=review,
+            criteria=criteria,
+            audience=audience,
+            max_tokens=max_tokens,
+            max_input_chars=max_input_chars,
+            session_id=session_id,
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
+        ).needs_rewrite
+
+    def _classify_review_decision(
+        self,
+        *,
+        review: str,
+        criteria: str = "",
+        audience: str = "",
+        max_tokens: int | None = None,
+        max_input_chars: int | None = None,
+        session_id: str = "",
+        tool_profile_id: str | None = None,
+        tool_registry_override: ToolRegistry | None = None,
+    ) -> _ReviewDecisionPayload:
         decision_method = getattr(self.agent, "review_decision", None)
-        if callable(decision_method):
-            raw = decision_method(
-                review=review,
-                criteria=criteria,
-                audience=audience,
-                max_tokens=max_tokens,
-                max_input_chars=max_input_chars,
-                session_id=session_id,
-                tool_profile_id=tool_profile_id,
-                tool_registry_override=tool_registry_override,
-            )
-            try:
-                payload = _parse_review_decision(raw)
-                return payload.needs_rewrite
-            except ValueError as exc:
-                logger.warning(
-                    "review_decision structured parse failed; falling back to heuristic review. error=%s",
-                    exc,
-                )
-        return _needs_rewrite_from_review(review)
+        if not callable(decision_method):
+            raise ValueError("review_decision method is unavailable")
+        raw = decision_method(
+            review=review,
+            criteria=criteria,
+            audience=audience,
+            max_tokens=max_tokens,
+            max_input_chars=max_input_chars,
+            session_id=session_id,
+            tool_profile_id=tool_profile_id,
+            tool_registry_override=tool_registry_override,
+        )
+        return _parse_review_decision(raw)
 
 
 _NO_REWRITE_PATTERNS = (
@@ -155,6 +228,11 @@ def _needs_rewrite_from_review(review: str) -> bool:
 
 
 def _parse_review_decision(raw: Any) -> _ReviewDecisionPayload:
+    if isinstance(raw, dict):
+        try:
+            return _ReviewDecisionPayload.model_validate(raw)
+        except ValidationError as exc:
+            raise ValueError(f"invalid review decision payload: {exc}") from exc
     text = str(raw or "").strip()
     if not text:
         raise ValueError("empty review decision output")

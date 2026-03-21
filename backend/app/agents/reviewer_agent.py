@@ -161,17 +161,23 @@ class ReviewerAgent(BaseWritingAgent):
             parts.append(f"Review criteria:\n{criteria}")
         if audience:
             parts.append(f"Audience:\n{audience}")
-        schema = '{"needs_rewrite":true}'
+        schema = (
+            '{"review_text":"text","needs_rewrite":true,'
+            '"reason":"why","score":0.82}'
+        )
         return (
-            "Classify whether the existing review feedback requires a rewrite. "
+            "Convert the existing review feedback into a structured decision object. "
             "Return exactly one JSON object. "
             "Do not add markdown fences, prose, or extra keys.\n"
             "Use this schema exactly: "
             f"{schema}\n"
             "Rules:\n"
+            "- `review_text` must be a concise plain-text restatement of the review feedback.\n"
             "- `needs_rewrite` must be true when the feedback requires content changes before publication.\n"
             "- Set `needs_rewrite` to false only when the feedback says the draft is publishable as-is, aside from optional polish.\n"
             "- Missing citations or unsupported claims count as needing rewrite.\n\n"
+            "- `reason` must briefly explain the decision in one sentence.\n"
+            "- `score` must be a confidence score between 0.0 and 1.0.\n\n"
             + "\n\n".join(parts)
         )
 
