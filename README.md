@@ -1,3 +1,5 @@
+中文 | [English](./README_EN.md)
+
 # Intelligent Writing Assistant
 
 一个面向文档写作场景的智能写作助手，使用 Vue 3 + FastAPI 构建完整前后端工程，围绕 `plan -> research -> draft -> review -> rewrite -> citations` 提供传统写作 pipeline，并在不破坏旧链路的前提下，引入支持 multi-HITL、checkpoint、interrupt / resume 的 LangGraph v2 full-stage graph。

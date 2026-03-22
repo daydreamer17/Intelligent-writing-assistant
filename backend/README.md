@@ -1,3 +1,5 @@
+中文 | [English](./README_EN.md)
+
 # Writing Assistant Backend
 
 基于 FastAPI 的写作后端，负责分步写作、一键 pipeline、LangGraph v2 工作流、RAG 检索、引用补全、版本持久化与离线检索评测。
